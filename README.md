@@ -1,10 +1,12 @@
-# Telegram Voice → Google Calendar
+# Telegram Voice/Text → Google Calendar
 
-Бот `@mk_voice_text_bot` только для владельца и двух его аккаунтов. Он получает
-голосовое через Bot API, сопоставляет его с исходящим сообщением в выбранной
-пользовательской сессии и вызывает Telegram MTProto
-`messages.transcribeAudio`. Голосовой файл не скачивается; распознавание
-выполняется на серверах Telegram. Затем Gemini Developer API вызывает
+Бот `@mk_voice_text_bot` только для владельца и двух его аккаунтов. Он принимает
+обычную текстовую календарную команду либо голосовое через Bot API. Голосовое
+сопоставляется с исходящим сообщением в выбранной пользовательской сессии и
+расшифровывается вызовом Telegram MTProto `messages.transcribeAudio`; файл не
+скачивается, распознавание выполняется на серверах Telegram. Текст сразу
+переходит к планированию без Telegram user session. Затем Gemini Developer API
+вызывает
 `gemini-3.7-flash` через Interactions API с high thinking и по строгой JSON
 Schema планирует чтение, создание, изменение или удаление календарных событий.
 Официальный Google Antigravity CLI остаётся резервным провайдером. Операция

@@ -65,20 +65,22 @@ from .webhook import WebhookRuntime
 LOGGER = logging.getLogger("tg_voice_transcriber_bot")
 
 START_TEXT = (
-    "Пришлите мне голосовое сообщение. Я найду его через вашу пользовательскую "
-    "Telegram-сессию, запрошу серверную расшифровку Telegram, а Gemini 3.7 "
-    "Flash High выделит из текста событие и покажет предпросмотр. После проверки "
-    "нажмите «Добавить», и событие попадёт в основной Google Calendar. "
-    "Без этого подтверждения календарь не изменяется. Аудиофайл не скачивается."
+    "Пришлите голосовое сообщение или напишите календарную команду текстом. "
+    "Для голосового я найду исходное сообщение через вашу пользовательскую "
+    "Telegram-сессию и запрошу серверную расшифровку Telegram. Gemini 3.7 "
+    "Flash High выделит событие и покажет предпросмотр. После проверки нажмите "
+    "«Добавить», и событие попадёт в основной Google Calendar. Аудиофайл не "
+    "скачивается. Без этого подтверждения календарь не изменяется."
 )
 
 START_TEXT_V2 = (
-    "Пришлите голосовое сообщение. Telegram расшифрует его на своих серверах, "
-    "а Gemini 3.7 Flash High с учётом последних команд сразу добавит, изменит "
-    "или удалит событие в основном Google Calendar. Вы увидите ход обработки "
-    "в одном обновляемом сообщении и итоговую карточку со временем выполнения. "
-    "Если результат не подходит, нажмите кнопку отмены или исправьте его новым "
-    "голосовым. Аудиофайл бот не скачивает."
+    "Пришлите голосовое сообщение или напишите календарную команду текстом. "
+    "Голосовое Telegram расшифрует на своих серверах, а Gemini 3.7 Flash High "
+    "с учётом последних команд сразу добавит, изменит или удалит событие в "
+    "основном Google Calendar. Вы увидите ход обработки в одном обновляемом "
+    "сообщении и итоговую карточку со временем выполнения. Если результат не "
+    "подходит, нажмите кнопку отмены или исправьте его новым сообщением. "
+    "Аудиофайл бот не скачивает."
 )
 
 
@@ -464,7 +466,8 @@ class VoiceBotService:
             LOGGER.warning("Ignored an update from an unauthorized user")
             return
 
-        text = str(message.get("text", ""))
+        raw_text = message.get("text")
+        text = raw_text if isinstance(raw_text, str) else ""
         command = message_command(text)
         if command == "/start":
             await self.bot.send_text(
@@ -498,12 +501,28 @@ class VoiceBotService:
                 f"Доступ подтверждён: {label} аккаунт. {telegram_status}. "
                 f"{gemini_status}. {calendar_status}."
                 + (
-                    " Пришлите голосовое сообщение."
+                    " Пришлите голосовое сообщение или текстовую команду."
                     if self.enabled_accounts is None
                     or account in self.enabled_accounts
-                    else ""
+                    else " Текстовые команды доступны без Telegram-сессии."
                 ),
                 reply_to_message_id=bot_message_id,
+            )
+            return
+
+        if text.strip():
+            process_text = (
+                self._process_text_v2
+                if self.calendar_operations is not None
+                else self._process_text
+            )
+            await process_text(
+                update_id=update_id,
+                account=account,
+                chat_id=chat_id,
+                bot_message_id=bot_message_id,
+                sent_at=int(message.get("date", 0) or 0),
+                text=text,
             )
             return
 
@@ -511,7 +530,8 @@ class VoiceBotService:
         if not isinstance(voice, dict):
             await self.bot.send_text(
                 chat_id,
-                "Пришлите именно голосовое сообщение, записанное в Telegram.",
+                "Пришлите голосовое сообщение, записанное в Telegram, или "
+                "напишите календарную команду текстом.",
                 reply_to_message_id=bot_message_id,
             )
             return
@@ -781,6 +801,49 @@ class VoiceBotService:
         job["status"] = "sent"
         self.state.save_job(update_id, job)
 
+    async def _process_text_v2(
+        self,
+        *,
+        update_id: int,
+        account: str,
+        chat_id: int,
+        bot_message_id: int,
+        sent_at: int,
+        text: str,
+    ) -> None:
+        """Enter the durable v2 pipeline after voice transcription."""
+
+        job = self.state.job(update_id)
+        if job is None:
+            job = {
+                "account": account,
+                # Text must not advance the MTProto voice matching cursor.
+                "user_message_id": 0,
+                "sent_at": sent_at,
+                "started_at": time.time(),
+                "started_monotonic": time.monotonic(),
+                "input_kind": "text",
+                "transcript": text,
+                "status": "transcribed",
+            }
+            self.state.save_job(update_id, job)
+        elif (
+            job.get("account") != account
+            or job.get("input_kind") != "text"
+            or job.get("transcript") != text
+        ):
+            raise RuntimeError("Persisted text job contradicts its Telegram update")
+
+        await self._process_voice_v2(
+            update_id=update_id,
+            account=account,
+            chat_id=chat_id,
+            bot_message_id=bot_message_id,
+            sent_at=sent_at,
+            duration=0,
+            file_size=None,
+        )
+
     async def _process_voice_v2(
         self,
         *,
@@ -805,11 +868,20 @@ class VoiceBotService:
                 "sent_at": sent_at,
                 "started_at": time.time(),
                 "started_monotonic": time.monotonic(),
+                "input_kind": "voice",
                 "status": "starting",
             }
             self.state.save_job(update_id, job)
+        elif "input_kind" not in job:
+            # Jobs created before text support were necessarily voice jobs.
+            job["input_kind"] = "voice"
+            self.state.save_job(update_id, job)
+        input_kind = "text" if job.get("input_kind") == "text" else "voice"
         if int(job.get("status_message_id", 0) or 0) <= 0:
-            matching_html = format_progress_card("matching")
+            matching_html = format_progress_card(
+                "gemini" if input_kind == "text" else "matching",
+                input_kind=input_kind,
+            )
             job["status_message_id"] = await self.bot.send_html(
                 chat_id,
                 matching_html,
@@ -858,7 +930,9 @@ class VoiceBotService:
             await self._edit_progress_best_effort(
                 chat_id=chat_id,
                 job=job,
-                html_text=format_progress_card("transcribing"),
+                html_text=format_progress_card(
+                    "transcribing", input_kind=input_kind
+                ),
             )
             self.state.save_job(update_id, job)
             result = await self.gateway.write(
@@ -894,12 +968,12 @@ class VoiceBotService:
             await self._edit_progress_best_effort(
                 chat_id=chat_id,
                 job=job,
-                html_text=format_progress_card("gemini"),
+                html_text=format_progress_card("gemini", input_kind=input_kind),
             )
             self.state.save_job(update_id, job)
             if not self.gemini_available:
                 job["final_html"] = format_error_card(
-                    "Gemini сейчас недоступна. Расшифровка сохранена в этой карточке.",
+                    "Gemini сейчас недоступна. Команда сохранена в этой карточке.",
                     transcript=transcript,
                     elapsed_seconds=self._elapsed(job),
                 )
@@ -928,7 +1002,8 @@ class VoiceBotService:
                         update_id,
                     )
                     job["final_html"] = format_error_card(
-                        "Gemini не смогла надёжно разобрать календарную команду. Попробуйте уточнить её новым голосовым.",
+                        "Gemini не смогла надёжно разобрать календарную команду. "
+                        "Попробуйте уточнить её новым сообщением.",
                         transcript=transcript,
                         elapsed_seconds=self._elapsed(job),
                     )
@@ -950,7 +1025,9 @@ class VoiceBotService:
                 await self._edit_progress_best_effort(
                     chat_id=chat_id,
                     job=job,
-                    html_text=format_progress_card("calendar_lookup"),
+                    html_text=format_progress_card(
+                        "calendar_lookup", input_kind=input_kind
+                    ),
                 )
                 self.state.save_job(update_id, job)
                 try:
@@ -1081,7 +1158,9 @@ class VoiceBotService:
             await self._edit_progress_best_effort(
                 chat_id=chat_id,
                 job=job,
-                html_text=format_progress_card("gemini_match"),
+                html_text=format_progress_card(
+                    "gemini_match", input_kind=input_kind
+                ),
             )
             self.state.save_job(update_id, job)
             sent_time = datetime.fromtimestamp(
@@ -1125,7 +1204,8 @@ class VoiceBotService:
                     update_id,
                 )
                 job["final_html"] = format_error_card(
-                    "Gemini не смогла выбрать точное событие. Уточните название или время новым голосовым.",
+                    "Gemini не смогла выбрать точное событие. Уточните название "
+                    "или время новым сообщением.",
                     transcript=transcript,
                     elapsed_seconds=self._elapsed(job),
                 )
@@ -1185,7 +1265,9 @@ class VoiceBotService:
                     chat_id=chat_id,
                     job=job,
                     html_text=format_progress_card(
-                        "calendar", action=progress_action  # type: ignore[arg-type]
+                        "calendar",
+                        action=progress_action,  # type: ignore[arg-type]
+                        input_kind=input_kind,
                     ),
                 )
                 self.state.save_job(update_id, job)
@@ -1328,6 +1410,46 @@ class VoiceBotService:
                 bot_message_id=bot_message_id,
                 job=job,
             )
+
+    async def _process_text(
+        self,
+        *,
+        update_id: int,
+        account: str,
+        chat_id: int,
+        bot_message_id: int,
+        sent_at: int,
+        text: str,
+    ) -> None:
+        """Enter the legacy confirmation pipeline after transcription."""
+
+        job = self.state.job(update_id)
+        if job is None:
+            job = {
+                "account": account,
+                "user_message_id": 0,
+                "sent_at": sent_at,
+                "input_kind": "text",
+                "transcript": text,
+                "status": "transcribed",
+            }
+            self.state.save_job(update_id, job)
+        elif (
+            job.get("account") != account
+            or job.get("input_kind") != "text"
+            or job.get("transcript") != text
+        ):
+            raise RuntimeError("Persisted text job contradicts its Telegram update")
+
+        await self._process_voice(
+            update_id=update_id,
+            account=account,
+            chat_id=chat_id,
+            bot_message_id=bot_message_id,
+            sent_at=sent_at,
+            duration=0,
+            file_size=None,
+        )
 
     async def _process_voice(
         self,

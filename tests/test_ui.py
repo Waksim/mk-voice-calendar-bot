@@ -40,6 +40,7 @@ def test_progress_cards_are_single_safe_html_messages():
     matching = format_progress_card("matching")
     transcribing = format_progress_card("transcribing")
     gemini = format_progress_card("gemini")
+    text_gemini = format_progress_card("gemini", input_kind="text")
     lookup = format_progress_card("calendar_lookup")
     matching_candidates = format_progress_card("gemini_match")
     calendar = format_progress_card("calendar", action="update")
@@ -48,6 +49,9 @@ def test_progress_cards_are_single_safe_html_messages():
     assert "Ищу сообщение в Telegram" in matching
     assert "Получаю расшифровку" in transcribing
     assert "Gemini разбирает" in gemini
+    assert "Расшифровка Telegram получена" in gemini
+    assert "Текстовая команда получена" in text_gemini
+    assert "Обрабатываю текстовую команду" in text_gemini
     assert "Ищу события в Google Calendar" in lookup
     assert "Gemini выбирает точную запись" in matching_candidates
     assert "Gemini: изменить событие" in calendar
@@ -57,6 +61,7 @@ def test_progress_cards_are_single_safe_html_messages():
         matching,
         transcribing,
         gemini,
+        text_gemini,
         lookup,
         matching_candidates,
         calendar,
@@ -65,6 +70,8 @@ def test_progress_cards_are_single_safe_html_messages():
 
     with pytest.raises(ValueError, match="phase"):
         format_progress_card("unknown")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="input kind"):
+        format_progress_card("gemini", input_kind="unknown")  # type: ignore[arg-type]
 
 
 def test_create_card_is_localized_linked_and_escaped():
@@ -91,10 +98,57 @@ def test_create_card_is_localized_linked_and_escaped():
     assert "&lt;/b&gt;&lt;a href=&quot;" in card
     assert "&lt;script&gt;metro&lt;/script&gt;" in card
     assert "Поставь &lt;b&gt;встречу&lt;/b&gt; &amp; позвони" in card
+    assert "💬 Команда" in card
     assert (
         'href="https://calendar.google.com/calendar/event?eid=a&amp;x=1"'
         in card
     )
+
+
+def test_event_time_is_rendered_in_its_named_timezone():
+    card = format_create_card(
+        [
+            event(
+                start_at="2026-08-24T10:30:00+02:00",
+                end_at="2026-08-24T11:00:00+02:00",
+                timezone="Europe/Moscow",
+            )
+        ],
+        transcript="Поставь встречу с 11:30 до 12:00",
+        elapsed_seconds=1,
+    )
+
+    assert "🕒 11:30–12:00" in card
+    assert "10:30–11:00" not in card
+
+
+def test_event_timezone_conversion_updates_date_and_unknown_zone_falls_back():
+    converted = format_create_card(
+        [
+            event(
+                start_at="2026-08-24T23:30:00+00:00",
+                end_at="2026-08-25T00:30:00+00:00",
+                timezone="Asia/Tokyo",
+            )
+        ],
+        transcript="Поставь встречу",
+        elapsed_seconds=1,
+    )
+    fallback = format_create_card(
+        [
+            event(
+                start_at="2026-08-24T10:30:00+02:00",
+                end_at="2026-08-24T11:00:00+02:00",
+                timezone="Unknown/Calendar-Zone",
+            )
+        ],
+        transcript="Поставь встречу",
+        elapsed_seconds=1,
+    )
+
+    assert "вторник, 25 августа 2026" in converted
+    assert "🕒 08:30–09:30" in converted
+    assert "🕒 10:30–11:00" in fallback
 
 
 def test_update_delete_clarify_error_and_undo_cards_have_distinct_outcomes():

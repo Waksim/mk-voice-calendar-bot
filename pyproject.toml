@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tg-voice-transcriber-bot"
 version = "0.1.0"
-description = "Owner-only Telegram bot using Telegram's user-side server transcription"
+description = "Owner-only Telegram voice/text bot for Google Calendar"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.12.15,<4",

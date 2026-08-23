@@ -708,7 +708,7 @@ def format_calendar_preview(
     create_footer: str | None = None,
 ) -> str:
     """Build a plain-text preview; this function never performs a calendar write."""
-    parts = [f"Расшифровка:\n{transcript}"]
+    parts = [f"Команда:\n{transcript}"]
     action = intent["action"]
     if action == "create":
         parts.append("Gemini 3.7 распознал событие:")

@@ -342,16 +342,17 @@ class BotApi:
             "setMyDescription",
             {
                 "description": (
-                    "Пришлите голосовое сообщение — Telegram расшифрует его, а "
-                    "Gemini 3.7 Flash High сразу добавит, изменит или удалит событие "
-                    "в Google Calendar. Любое действие можно отменить кнопкой. "
-                    "Доступ ограничен двумя аккаунтами владельца."
+                    "Пришлите голосовое сообщение или напишите календарную "
+                    "команду текстом. Gemini 3.7 Flash High сразу добавит, "
+                    "изменит или удалит событие в Google Calendar. Любое "
+                    "действие можно отменить кнопкой. Доступ ограничен двумя "
+                    "аккаунтами владельца."
                 )
             },
         )
         await self.call(
             "setMyShortDescription",
-            {"short_description": "Голосовое → Gemini → Google Calendar"},
+            {"short_description": "Голос или текст → Gemini → Google Calendar"},
         )
 
     async def configure_polling(self) -> None:

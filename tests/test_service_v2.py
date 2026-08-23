@@ -422,6 +422,99 @@ async def process_voice(service, *, update_id=77, bot_message_id=456, sent_at=SE
     )
 
 
+async def process_text(
+    service,
+    text,
+    *,
+    update_id=78,
+    bot_message_id=457,
+    sent_at=SENT_AT,
+    owner=OWNER,
+):
+    await service.handle_update(
+        {
+            "update_id": update_id,
+            "message": {
+                "message_id": bot_message_id,
+                "date": sent_at,
+                "from": {"id": owner},
+                "chat": {"id": owner, "type": "private"},
+                "text": text,
+            },
+        }
+    )
+
+
+def test_text_enters_shared_calendar_pipeline_without_telegram_gateway(tmp_path):
+    command = (
+        "Добавь встречу завтра в 17:30\n"
+        "Ссылка: https://meet.example.test/room"
+    )
+
+    async def scenario():
+        bot = FakeBot()
+        gateway = FakeGateway()
+        calendar = FakeCalendar()
+        gemini = FakeGemini([create_plan()])
+        service, state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=gateway,
+            gemini=gemini,
+            calendar=calendar,
+        )
+        # Text processing must not depend on an active MTProto session.
+        service.enabled_accounts = frozenset()
+        await process_text(service, command)
+        await process_text(service, command)
+        return bot, gateway, calendar, gemini, state
+
+    bot, gateway, calendar, gemini, state = asyncio.run(scenario())
+
+    assert gateway.read_calls == []
+    assert gateway.write_calls == []
+    assert [call[0] for call in calendar.calls].count("create") == 1
+    assert [transcript for transcript, _kwargs in gemini.calls] == [command]
+    assert len(bot.sent_html) == 1
+    assert "Gemini разбирает команду" in bot.sent_html[0]["html"]
+    assert "Текстовая команда получена" in bot.sent_html[0]["html"]
+    assert "Ищу сообщение в Telegram" not in bot.sent_html[0]["html"]
+    assert bot.sent_html[0]["reply_to_message_id"] == 457
+    assert "Добавлено в календарь" in bot.edited_html[-1]["html"]
+    assert "💬 Команда" in bot.edited_html[-1]["html"]
+    assert command in bot.edited_html[-1]["html"]
+    assert state.job(78)["status"] == "sent"
+    assert state.job(78)["input_kind"] == "text"
+    assert state.after_message_id("personal") == 0
+
+
+def test_unauthorized_text_is_silently_ignored(tmp_path):
+    async def scenario():
+        bot = FakeBot()
+        gateway = FakeGateway()
+        calendar = FakeCalendar()
+        gemini = FakeGemini([create_plan()])
+        service, _state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=gateway,
+            gemini=gemini,
+            calendar=calendar,
+        )
+        await process_text(service, "Добавь встречу", owner=OWNER + 999)
+        return bot, gateway, calendar, gemini
+
+    bot, gateway, calendar, gemini = asyncio.run(scenario())
+
+    assert bot.sent_html == []
+    assert bot.edited_html == []
+    assert bot.chat_actions == []
+    assert gateway.read_calls == []
+    assert gateway.write_calls == []
+    assert calendar.calls == []
+    assert gemini.calls == []
+
+
 def test_v2_sends_one_status_then_edits_each_phase_and_applies_create_immediately(
     tmp_path, monkeypatch
 ):
@@ -506,17 +599,20 @@ def test_v2_passes_known_events_recent_turn_and_native_steps_to_next_plan(tmp_pa
         service, _state, _pipeline = make_service(
             tmp_path,
             bot=bot,
-            gateway=FakeGateway(
-                ["Запиши планёрку", "Добавь ему место переговорная А"]
-            ),
+            gateway=FakeGateway(["Запиши планёрку"]),
             gemini=gemini,
             calendar=calendar,
         )
         await process_voice(service, update_id=80, bot_message_id=500)
-        await process_voice(service, update_id=81, bot_message_id=501)
-        return gemini, calendar
+        await process_text(
+            service,
+            "Добавь ему место переговорная А",
+            update_id=81,
+            bot_message_id=501,
+        )
+        return gemini, calendar, service.gateway
 
-    gemini, calendar = asyncio.run(scenario())
+    gemini, calendar, gateway = asyncio.run(scenario())
     transcript, context = gemini.calls[1]
 
     assert transcript == "Добавь ему место переговорная А"
@@ -532,6 +628,8 @@ def test_v2_passes_known_events_recent_turn_and_native_steps_to_next_plan(tmp_pa
     ]
     assert [call[0] for call in calendar.calls].count("create") == 1
     assert [call[0] for call in calendar.calls].count("update") == 1
+    assert len(gateway.read_calls) == 1
+    assert len(gateway.write_calls) == 1
     active = next(event for event in calendar.events.values() if event.status == "confirmed")
     assert active.location == "переговорная А"
 

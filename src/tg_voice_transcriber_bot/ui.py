@@ -15,6 +15,7 @@ import math
 import re
 from typing import Any, Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .text import utf16_units
 
@@ -22,6 +23,7 @@ from .text import utf16_units
 CalendarAction = Literal["create", "read", "update", "delete"]
 MutationAction = Literal["create", "update", "delete"]
 UndoAction = Literal["create", "update", "delete", "mixed"]
+InputKind = Literal["voice", "text"]
 ProgressPhase = Literal[
     "matching",
     "transcribing",
@@ -205,10 +207,23 @@ def format_progress_card(
     phase: ProgressPhase,
     *,
     action: CalendarAction | None = None,
+    input_kind: InputKind = "voice",
 ) -> str:
     """Render the current processing phase as a small editable status card."""
     if action is not None and action not in _ACTION_LABELS:
         raise ValueError("invalid calendar action")
+    if input_kind not in {"voice", "text"}:
+        raise ValueError("invalid input kind")
+    processing_header = (
+        "🎙️ <b>Обрабатываю голосовое</b>"
+        if input_kind == "voice"
+        else "💬 <b>Обрабатываю текстовую команду</b>"
+    )
+    command_received = (
+        "✅ Расшифровка Telegram получена"
+        if input_kind == "voice"
+        else "✅ Текстовая команда получена"
+    )
     cards = {
         "matching": (
             "🎙️ <b>Обрабатываю голосовое</b>\n\n"
@@ -225,8 +240,8 @@ def format_progress_card(
             "▫️ Google Calendar"
         ),
         "gemini": (
-            "🎙️ <b>Обрабатываю голосовое</b>\n\n"
-            "✅ Расшифровка Telegram получена\n"
+            f"{processing_header}\n\n"
+            f"{command_received}\n"
             "⏳ Gemini разбирает команду и контекст…\n"
             "▫️ Google Calendar"
         ),
@@ -240,22 +255,22 @@ def format_progress_card(
             "delete": "Удаляю событие из Google Calendar…",
         }.get(action, "Синхронизирую данные с Google Calendar…")
         return _bounded(
-            "🎙️ <b>Обрабатываю голосовое</b>\n\n"
-            "✅ Расшифровка Telegram получена\n"
+            f"{processing_header}\n\n"
+            f"{command_received}\n"
             f"✅ Gemini: {operation}\n"
             f"⏳ {verb}"
         )
     if phase == "calendar_lookup":
         return _bounded(
-            "🎙️ <b>Обрабатываю голосовое</b>\n\n"
-            "✅ Расшифровка Telegram получена\n"
+            f"{processing_header}\n\n"
+            f"{command_received}\n"
             "✅ Gemini определила период поиска\n"
             "⏳ Ищу события в Google Calendar…"
         )
     if phase == "gemini_match":
         return _bounded(
-            "🎙️ <b>Обрабатываю голосовое</b>\n\n"
-            "✅ Расшифровка Telegram получена\n"
+            f"{processing_header}\n\n"
+            f"{command_received}\n"
             "✅ Подходящие события найдены\n"
             "⏳ Gemini выбирает точную запись…"
         )
@@ -302,6 +317,17 @@ def _when_lines(event: Mapping[str, Any]) -> list[str]:
         start = _parse_datetime(start_raw)
         end = _parse_datetime(end_raw)
         if start is not None and end is not None and end > start:
+            timezone_name = event.get("timezone")
+            if isinstance(timezone_name, str) and timezone_name:
+                try:
+                    display_zone = ZoneInfo(timezone_name)
+                except (ValueError, ZoneInfoNotFoundError):
+                    # Provider snapshots can omit or expose an unknown zone.
+                    # Their RFC3339 offsets are still safe to display as-is.
+                    pass
+                else:
+                    start = start.astimezone(display_zone)
+                    end = end.astimezone(display_zone)
             if start.date() == end.date():
                 date_line = f"📅 {_format_date(start.date())}"
             else:
@@ -401,7 +427,7 @@ def _transcript_block(transcript: object, *, limit: int) -> str | None:
     if not cleaned:
         return None
     return (
-        "<blockquote expandable><b>🎙 Расшифровка</b>\n"
+        "<blockquote expandable><b>💬 Команда</b>\n"
         f"{_dynamic(cleaned, limit=limit, multiline=True)}</blockquote>"
     )
 
@@ -606,7 +632,7 @@ def format_lookup_clarify_card(
             )
         )
     parts.append(
-        "<i>Уточните название или время следующим голосовым сообщением.</i>"
+        "<i>Уточните название или время следующим сообщением.</i>"
     )
     transcript_block = _transcript_block(transcript, limit=400)
     if transcript_block:
@@ -676,7 +702,7 @@ def format_clarify_card(
     parts = [
         "🤔 <b>Нужно уточнение</b>",
         _dynamic(cleaned_question, limit=900, multiline=True),
-        "<i>Ответьте следующим голосовым сообщением — я продолжу эту операцию.</i>",
+        "<i>Ответьте следующим сообщением — я продолжу эту операцию.</i>",
     ]
     transcript_block = _transcript_block(transcript, limit=650)
     if transcript_block:

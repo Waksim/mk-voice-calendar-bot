@@ -164,6 +164,71 @@ def test_status_does_not_invite_disabled_owner_to_send_voice(tmp_path):
     assert "Пришлите голосовое" not in bot.messages[0][1]
 
 
+def test_text_uses_legacy_gemini_path_without_telegram_gateway(tmp_path):
+    class FakeBot:
+        def __init__(self):
+            self.messages = []
+
+        async def send_chat_action(self, chat_id):
+            return None
+
+        async def send_text(self, chat_id, text, *, reply_to_message_id=None):
+            self.messages.append((chat_id, text, reply_to_message_id))
+
+    class FakeGateway:
+        async def read(self, *_args, **_kwargs):
+            raise AssertionError("text reached Telegram gateway")
+
+        async def write(self, *_args, **_kwargs):
+            raise AssertionError("text reached Telegram gateway")
+
+    class FakeGemini:
+        def __init__(self):
+            self.transcripts = []
+
+        async def extract_event(self, transcript, **kwargs):
+            self.transcripts.append(transcript)
+            return {
+                "action": "ignore",
+                "events": [],
+                "clarification_question": None,
+                "confidence": 1,
+            }
+
+    async def scenario():
+        config = Config(state_path=tmp_path / "state.json")
+        bot = FakeBot()
+        gemini = FakeGemini()
+        service = VoiceBotService(
+            config,
+            bot,
+            FakeGateway(),
+            StateStore(config.state_path),
+            gemini,
+        )
+        service.enabled_accounts = frozenset()
+        await service.handle_update(
+            {
+                "update_id": 902,
+                "message": {
+                    "message_id": 46,
+                    "date": 1787400000,
+                    "from": {"id": 100000001},
+                    "chat": {"id": 100000001, "type": "private"},
+                    "text": "Что у меня завтра?",
+                },
+            }
+        )
+        return bot, gemini
+
+    bot, gemini = asyncio.run(scenario())
+
+    assert gemini.transcripts == ["Что у меня завтра?"]
+    assert len(bot.messages) == 1
+    assert "Команда:" in bot.messages[0][1]
+    assert bot.messages[0][2] == 46
+
+
 def test_transcript_is_persisted_before_gemini_and_reply_is_not_duplicated(tmp_path):
     class FakeBot:
         def __init__(self):
