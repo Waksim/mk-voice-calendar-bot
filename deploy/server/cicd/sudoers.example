@@ -1,0 +1,1 @@
+botdeploy ALL=(root) NOPASSWD: /usr/local/sbin/mk-voice-calendar-deploy-dispatch *

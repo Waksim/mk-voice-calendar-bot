@@ -1,0 +1,231 @@
+name: mk-voice-calendar-bot
+
+services:
+  bot:
+    image: mk-voice-calendar-bot:${BOT_IMAGE_TAG:-dev}
+    build:
+      context: ${RELEASE_DIR:-../..}
+      dockerfile: deploy/server/Dockerfile
+    container_name: mk-voice-calendar-bot
+    restart: unless-stopped
+    init: true
+    depends_on:
+      warp:
+        condition: service_healthy
+        restart: true
+      gemini-proxy:
+        condition: service_healthy
+        restart: true
+    user: "1000:1000"
+    environment:
+      TELEGRAM_BOT_UPDATE_MODE: webhook
+      TELEGRAM_WEBHOOK_LISTEN_HOST: 0.0.0.0
+      TELEGRAM_WEBHOOK_LISTEN_PORT: "8080"
+      TELEGRAM_WEBHOOK_REGISTER: "false"
+      TELEGRAM_WEBHOOK_PATH: /telegram/mk-voice-text-bot/webhook
+      TELEGRAM_WEBHOOK_SECRET_FILE: /run/secrets/telegram-webhook-secret
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram-bot-token
+      TELEGRAM_BOT_STATE_PATH: /app/.runtime/state.json
+      TELEGRAM_BOT_CONFIRMATION_STATE_PATH: /app/.runtime/calendar-confirmations.json
+      TELEGRAM_BOT_OPERATION_STATE_PATH: /app/.runtime/calendar-operations.json
+      GEMINI_API_KEY_FILE: /run/secrets/gemini-api-key
+      TELEGRAM_GATEWAY_LAUNCHER: /app/deploy/server/telegram-gateway
+      TELEGRAM_API_ID_FILE: /run/secrets/telegram-api-id
+      TELEGRAM_API_HASH_FILE: /run/secrets/telegram-api-hash
+      TELEGRAM_SESSION_WORK_FILE: /run/secrets/telegram-session-work
+      TELEGRAM_SESSION_PERSONAL_FILE: /run/secrets/telegram-session-personal
+      TELEGRAM_PERSONAL_USER_ID_FILE: /run/secrets/telegram-personal-user-id
+      TELEGRAM_WORK_USER_ID_FILE: /run/secrets/telegram-work-user-id
+      CALENDAR_MCP_WORKING_DIRECTORY: /app/calendar-mcp
+      CALENDAR_MCP_BINARY_PATH: /app/calendar-mcp/node_modules/.bin/google-calendar-mcp
+      GOOGLE_CALENDAR_OAUTH_CREDENTIALS_PATH: /app/.runtime/google-calendar-oauth.json
+      GOOGLE_CALENDAR_TOKEN_PATH: /app/.runtime/google-calendar-tokens.json
+      CALENDAR_MCP_PROCESS_PATH: /usr/local/bin:/usr/bin:/bin
+      HTTPS_PROXY: http://127.0.0.1:1080
+      NO_PROXY: 127.0.0.1,localhost,mk-voice-calendar-bot
+      HOME: /tmp
+      TZ: Europe/Moscow
+    volumes:
+      - /srv/mk-voice-calendar-bot/runtime:/app/.runtime
+      - /etc/mk-voice-calendar-bot/secrets:/run/secrets:ro
+      - /srv/mk-voice-calendar-bot/runtime/telegram-mcp-errors.log:/app/vendor/telegram-mcp/mcp_errors.log
+      - /etc/mk-voice-calendar-bot/resolv.conf:/etc/resolv.conf:ro
+    network_mode: service:warp
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+    stop_grace_period: 30s
+    pids_limit: 256
+    mem_limit: 768m
+    cpus: 1.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  webhook-tunnel:
+    image: mk-webhook-tunnel:${WEBHOOK_IMAGE_TAG:-dev}
+    build:
+      context: ${RELEASE_DIR:-../..}/deploy/server/webhook-tunnel
+      dockerfile: Dockerfile
+    container_name: mk-voice-calendar-bot-webhook-tunnel
+    restart: unless-stopped
+    init: true
+    depends_on:
+      bot:
+        condition: service_healthy
+      warp:
+        condition: service_healthy
+        restart: true
+    environment:
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram-bot-token
+      TELEGRAM_WEBHOOK_SECRET_FILE: /run/secrets/telegram-webhook-secret
+      TELEGRAM_WEBHOOK_PATH: /telegram/mk-voice-text-bot/webhook
+      ORIGIN_HEALTH_URL: http://127.0.0.1:8080/healthz
+      CHECK_INTERVAL_SECONDS: "15"
+      RETRY_INTERVAL_SECONDS: "3"
+      REQUEST_TIMEOUT_SECONDS: "15"
+      READY_FILE: /tmp/webhook-tunnel.ready
+      HTTPS_PROXY: http://127.0.0.1:1080
+      NO_PROXY: 127.0.0.1,localhost,.trycloudflare.com
+      TZ: Europe/Moscow
+    volumes:
+      - /etc/mk-voice-calendar-bot/secrets/telegram-bot-token:/run/secrets/telegram-bot-token:ro
+      - /etc/mk-voice-calendar-bot/secrets/telegram-webhook-secret:/run/secrets/telegram-webhook-secret:ro
+      - /etc/mk-voice-calendar-bot/resolv.conf:/etc/resolv.conf:ro
+    network_mode: service:warp
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=8m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,time; assert time.time() - os.stat('/tmp/webhook-tunnel.ready').st_mtime < 60"
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 45s
+    stop_grace_period: 20s
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+  warp:
+    image: mk-telegram-warp:${WARP_IMAGE_TAG:-dev}
+    build:
+      context: ${RELEASE_DIR:-../..}/deploy/server/warp
+      dockerfile: Dockerfile
+    container_name: mk-voice-calendar-bot-warp
+    restart: unless-stopped
+    init: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /etc/mk-voice-calendar-bot/warp/wg0.conf:/etc/wireguard/wg0.conf:ro
+    networks:
+      ingress:
+        aliases:
+          - mk-voice-calendar-bot
+      egress:
+        gw_priority: 1
+    read_only: true
+    tmpfs:
+      - /run:rw,nosuid,nodev,mode=0755,size=16m
+      - /tmp:rw,noexec,nosuid,nodev,mode=0700,size=8m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'now="$$(date +%s)"; last="$$(wg show wg0 latest-handshakes | awk ''NR == 1 {print $$2}'')"; test "$${last:-0}" -gt 0 && test "$$((now - last))" -lt 120'
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 45s
+    stop_grace_period: 15s
+    pids_limit: 64
+    mem_limit: 64m
+    cpus: 0.25
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+  gemini-proxy:
+    image: ghcr.io/sagernet/sing-box:v1.13.14@sha256:c8b67944345dc84a226b648a71f854818606eae0813c4e6a452f192ef821b5b8
+    container_name: mk-voice-calendar-bot-gemini-proxy
+    restart: unless-stopped
+    init: true
+    command:
+      - run
+      - -c
+      - /etc/sing-box/config.json
+    depends_on:
+      warp:
+        condition: service_healthy
+        restart: true
+    volumes:
+      - /etc/mk-voice-calendar-bot/gemini-proxy/config.json:/etc/sing-box/config.json:ro
+      - /etc/mk-voice-calendar-bot/resolv.conf:/etc/resolv.conf:ro
+    network_mode: service:warp
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=0700,size=8m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - nc -z 127.0.0.1 1080
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    stop_grace_period: 15s
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+networks:
+  ingress:
+    external: true
+    name: zozh-prod_ingress
+  egress:
+    name: mk-voice-calendar-bot_egress
+    driver: bridge

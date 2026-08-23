@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if (( $# != 1 )) || [[ ! "$1" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'Usage: mk-voice-calendar-deploy-dispatch <40-hex-sha>\n' >&2
+  exit 64
+fi
+
+readonly deploy_sha="$1"
+
+exec /usr/bin/systemd-run \
+  --quiet \
+  --collect \
+  --wait \
+  --pipe \
+  --service-type=exec \
+  --unit="mk-voice-calendar-deploy-${deploy_sha}" \
+  --property=RuntimeMaxSec=30min \
+  /usr/local/sbin/mk-voice-calendar-deploy "$deploy_sha"

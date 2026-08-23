@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly original_command="${SSH_ORIGINAL_COMMAND:-}"
+
+if [[ ! "$original_command" =~ ^deploy\ ([0-9a-f]{40})$ ]]; then
+  printf 'Only an exact production deployment is allowed.\n' >&2
+  exit 64
+fi
+
+readonly deploy_sha="${BASH_REMATCH[1]}"
+exec /usr/bin/sudo -n -- /usr/local/sbin/mk-voice-calendar-deploy-dispatch "$deploy_sha"

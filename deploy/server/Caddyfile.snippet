@@ -1,0 +1,12 @@
+	@mk_voice_calendar_bot_webhook path /telegram/mk-voice-text-bot/webhook
+	handle @mk_voice_calendar_bot_webhook {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy mk-voice-calendar-bot:8080 {
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 10s
+			}
+		}
+	}

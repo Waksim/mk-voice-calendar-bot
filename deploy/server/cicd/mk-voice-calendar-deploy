@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly base_dir=/opt/mk-voice-calendar-bot
+readonly releases_dir="$base_dir/releases"
+readonly repository_dir="$base_dir/repository.git"
+readonly current_link="$base_dir/current"
+readonly lock_file=/run/lock/mk-voice-calendar-deploy.lock
+readonly trusted_compose=/etc/mk-voice-calendar-bot/compose.yaml
+readonly github_key=/etc/mk-voice-calendar-bot/github-deploy/id_ed25519
+readonly github_known_hosts=/etc/mk-voice-calendar-bot/github-deploy/known_hosts
+readonly repository_url=git@github.com:Waksim/mk-voice-calendar-bot.git
+readonly compose_project=mk-voice-calendar-bot
+readonly legacy_image_tag=20260822
+
+if (( $# != 1 )) || [[ ! "$1" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'Usage: mk-voice-calendar-deploy <40-hex-sha>\n' >&2
+  exit 64
+fi
+readonly deploy_sha="$1"
+
+stage_dir=
+next_link=
+cleanup() {
+  if [[ -n "$next_link" ]]; then
+    rm -f -- "$next_link"
+  fi
+  if [[ -n "$stage_dir" && -d "$stage_dir" ]]; then
+    rm -rf -- "$stage_dir"
+  fi
+}
+trap cleanup EXIT
+
+log() {
+  printf '[deploy %s] %s\n' "${deploy_sha:0:12}" "$*"
+}
+
+fail() {
+  printf '[deploy %s] ERROR: %s\n' "${deploy_sha:0:12}" "$*" >&2
+  exit 1
+}
+
+compose_for() {
+  local release_path="$1"
+  local -a image_tags
+  shift
+  mapfile -t image_tags < <(component_tags_for_release "$release_path")
+  (( ${#image_tags[@]} == 3 )) || return 1
+  RELEASE_DIR="$release_path" \
+    BOT_IMAGE_TAG="${image_tags[0]}" \
+    WARP_IMAGE_TAG="${image_tags[1]}" \
+    WEBHOOK_IMAGE_TAG="${image_tags[2]}" \
+    /usr/bin/docker compose \
+      --project-name "$compose_project" \
+      --file "$trusted_compose" \
+      "$@"
+}
+
+component_tags_for_release() {
+  local release_name tag
+  local -a stored_tags
+  release_name="$(basename -- "$1")"
+
+  if [[ -f "$1/.image-tags" ]]; then
+    mapfile -t stored_tags <"$1/.image-tags"
+    (( ${#stored_tags[@]} == 3 )) || return 1
+    for tag in "${stored_tags[@]}"; do
+      [[ "$tag" =~ ^[0-9a-f]{40}$ ]] || return 1
+      printf '%s\n' "$tag"
+    done
+  elif [[ "$release_name" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s\n%s\n%s\n' \
+      "$release_name" \
+      "$release_name" \
+      "$release_name"
+  else
+    printf '%s\n%s\n%s\n' \
+      "$legacy_image_tag" \
+      "$legacy_image_tag" \
+      "$legacy_image_tag"
+  fi
+}
+
+verify_runtime() {
+  local release_path="$1"
+  local container status expected_image expected_tag actual_image
+  local -a image_tags
+  local -a containers=(
+    mk-voice-calendar-bot
+    mk-voice-calendar-bot-warp
+    mk-voice-calendar-bot-gemini-proxy
+    mk-voice-calendar-bot-webhook-tunnel
+  )
+
+  mapfile -t image_tags < <(component_tags_for_release "$release_path")
+  (( ${#image_tags[@]} == 3 )) || return 1
+
+  for container in "${containers[@]}"; do
+    status="$(/usr/bin/docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)"
+    [[ "$status" == healthy ]] || {
+      printf 'Container %s is %s, expected healthy.\n' "$container" "${status:-missing}" >&2
+      return 1
+    }
+  done
+
+  while IFS=' ' read -r container expected_image expected_tag; do
+    actual_image="$(/usr/bin/docker inspect --format '{{.Config.Image}}' "$container")"
+    [[ "$actual_image" == "$expected_image:$expected_tag" ]] || {
+      printf 'Container %s uses %s, expected %s:%s.\n' \
+        "$container" "$actual_image" "$expected_image" "$expected_tag" >&2
+      return 1
+    }
+  done <<EOF
+mk-voice-calendar-bot mk-voice-calendar-bot ${image_tags[0]}
+mk-voice-calendar-bot-warp mk-telegram-warp ${image_tags[1]}
+mk-voice-calendar-bot-webhook-tunnel mk-webhook-tunnel ${image_tags[2]}
+EOF
+
+  /usr/bin/docker exec mk-voice-calendar-bot /opt/venv/bin/python -c '
+import sys
+from urllib.parse import urlsplit
+import httpx
+
+try:
+    token = open("/run/secrets/telegram-bot-token", encoding="utf-8").read().strip()
+    response = httpx.post(
+        "https://api.telegram.org/bot" + token + "/getWebhookInfo",
+        timeout=15,
+    )
+    payload = response.json()
+    info = payload.get("result") or {}
+    webhook_url = urlsplit(info.get("url") or "")
+    valid = (
+        response.status_code == 200
+        and payload.get("ok") is True
+        and webhook_url.scheme == "https"
+        and (webhook_url.hostname or "").endswith(".trycloudflare.com")
+        and webhook_url.path == "/telegram/mk-voice-text-bot/webhook"
+        and info.get("max_connections") == 1
+    )
+except Exception:
+    valid = False
+    info = {}
+
+if not valid:
+    sys.exit("Telegram webhook configuration is not ready")
+
+print("Telegram webhook is ready; pending updates:", info.get("pending_update_count", "?"))
+'
+}
+
+build_target_images() {
+  local -a image_tags
+  mapfile -t image_tags < <(component_tags_for_release "$target_release")
+  (( ${#image_tags[@]} == 3 )) || return 1
+
+  compose_for "$target_release" build bot
+
+  if ! /usr/bin/docker image inspect "mk-telegram-warp:${image_tags[1]}" >/dev/null 2>&1; then
+    compose_for "$target_release" build warp
+  else
+    log 'reusing unchanged WARP image'
+  fi
+
+  if ! /usr/bin/docker image inspect "mk-webhook-tunnel:${image_tags[2]}" >/dev/null 2>&1; then
+    compose_for "$target_release" build webhook-tunnel
+  else
+    log 'reusing unchanged webhook tunnel image'
+  fi
+}
+
+rollback_to() {
+  local previous_release="$1"
+
+  log "rolling back containers to $(basename -- "$previous_release")"
+  if ! compose_for "$previous_release" \
+    up -d --no-build --remove-orphans --wait --wait-timeout 300; then
+    printf 'ROLLBACK FAILED while restoring %s.\n' "$previous_release" >&2
+    return 1
+  fi
+  if ! verify_runtime "$previous_release"; then
+    printf 'ROLLBACK FAILED health verification for %s.\n' "$previous_release" >&2
+    return 1
+  fi
+  log "rollback completed"
+}
+
+start_new_release() {
+  local attempt warp_status recovery all_healthy container status
+
+  for attempt in 1 2; do
+    if compose_for "$target_release" \
+      up -d --no-build --remove-orphans --wait --wait-timeout 300; then
+      return 0
+    fi
+
+    # Compose exits immediately when an already-running dependency is observed
+    # in the transient `unhealthy` state.  The webhook controller needs one
+    # loop after a stopped bot returns before it refreshes its readiness file.
+    # Give every container a short recovery window before treating that
+    # observation as a failed release and rolling a healthy bot back.
+    for (( recovery = 1; recovery <= 45; recovery++ )); do
+      all_healthy=1
+      for container in \
+        mk-voice-calendar-bot \
+        mk-voice-calendar-bot-warp \
+        mk-voice-calendar-bot-gemini-proxy \
+        mk-voice-calendar-bot-webhook-tunnel; do
+        status="$(/usr/bin/docker inspect \
+          --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+          "$container" 2>/dev/null || true)"
+        if [[ "$status" != healthy ]]; then
+          all_healthy=0
+          break
+        fi
+      done
+      if (( all_healthy )); then
+        log 'all containers recovered after a transient health failure'
+        return 0
+      fi
+      /usr/bin/sleep 2
+    done
+
+    warp_status="$(/usr/bin/docker inspect \
+      --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+      mk-voice-calendar-bot-warp 2>/dev/null || true)"
+    if (( attempt == 1 )) && [[ "$warp_status" != healthy ]]; then
+      log 'WARP did not handshake on the first start; restarting it once'
+      /usr/bin/docker restart mk-voice-calendar-bot-warp >/dev/null || return 1
+      continue
+    fi
+    return 1
+  done
+
+  return 1
+}
+
+exec 9>"$lock_file"
+if ! /usr/bin/flock -w 1800 9; then
+  fail 'another deployment did not finish within 30 minutes'
+fi
+
+for required_file in "$trusted_compose" "$github_key" "$github_known_hosts"; do
+  [[ -f "$required_file" ]] || fail "required file is missing: $required_file"
+done
+[[ -d /srv/mk-voice-calendar-bot/runtime ]] || fail 'runtime directory is missing'
+/usr/bin/docker network inspect zozh-prod_ingress >/dev/null 2>&1 || fail 'zozh-prod_ingress network is missing'
+
+available_kb="$(/usr/bin/df -Pk /var/lib/docker | /usr/bin/awk 'NR == 2 {print $4}')"
+[[ "$available_kb" =~ ^[0-9]+$ ]] || fail 'could not determine free Docker disk space'
+(( available_kb >= 2097152 )) || fail 'less than 2 GiB is free for Docker builds'
+
+/usr/bin/install -d -m 0700 -o root -g root "$base_dir" "$releases_dir"
+if [[ ! -d "$repository_dir" ]]; then
+  log 'initializing the read-only production repository mirror'
+  /usr/bin/git init --bare "$repository_dir" >/dev/null
+  /usr/bin/git --git-dir="$repository_dir" remote add origin "$repository_url"
+fi
+/usr/bin/git --git-dir="$repository_dir" remote set-url origin "$repository_url"
+
+export GIT_SSH_COMMAND="/usr/bin/ssh -i $github_key -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$github_known_hosts"
+log 'fetching origin/main through the read-only GitHub deploy key'
+/usr/bin/git --git-dir="$repository_dir" fetch \
+  --force \
+  --prune \
+  --no-tags \
+  origin \
+  refs/heads/main:refs/remotes/origin/main
+
+readonly main_sha="$(/usr/bin/git --git-dir="$repository_dir" rev-parse refs/remotes/origin/main)"
+if [[ "$main_sha" != "$deploy_sha" ]]; then
+  if /usr/bin/git --git-dir="$repository_dir" cat-file -e "$deploy_sha^{commit}" 2>/dev/null \
+    && /usr/bin/git --git-dir="$repository_dir" merge-base --is-ancestor "$deploy_sha" "$main_sha"; then
+    log "commit was superseded by ${main_sha:0:12}; nothing to deploy"
+    exit 0
+  fi
+  fail "requested commit is not the current origin/main (${main_sha:0:12})"
+fi
+
+readonly target_release="$releases_dir/$deploy_sha"
+if [[ ! -d "$target_release" ]]; then
+  log 'creating immutable release'
+  stage_dir="$(/usr/bin/mktemp -d "$releases_dir/.incoming.${deploy_sha}.XXXXXX")"
+  /usr/bin/git --git-dir="$repository_dir" archive "$deploy_sha" | /usr/bin/tar -x -C "$stage_dir"
+  printf '%s\n' "$deploy_sha" >"$stage_dir/.git-revision"
+  {
+    printf '%s\n' "$deploy_sha"
+    /usr/bin/git --git-dir="$repository_dir" rev-parse "$deploy_sha:deploy/server/warp"
+    /usr/bin/git --git-dir="$repository_dir" rev-parse "$deploy_sha:deploy/server/webhook-tunnel"
+  } >"$stage_dir/.image-tags"
+  /usr/bin/chown -R root:root "$stage_dir"
+  /usr/bin/chmod -R a-w "$stage_dir"
+  /usr/bin/mv -- "$stage_dir" "$target_release"
+  stage_dir=
+fi
+
+[[ "$(<"$target_release/.git-revision")" == "$deploy_sha" ]] || fail 'release revision marker is invalid'
+if ! /usr/bin/cmp -s "$target_release/deploy/server/compose.yaml" "$trusted_compose"; then
+  fail 'production Compose changed; approve and install it on the server before deployment'
+fi
+
+compose_for "$target_release" config --quiet
+
+previous_release="$(/usr/bin/readlink -f "$current_link" 2>/dev/null || true)"
+if [[ -n "$previous_release" && "$previous_release" != "$releases_dir/"* ]]; then
+  fail "current release points outside $releases_dir"
+fi
+
+if [[ "$previous_release" == "$target_release" ]]; then
+  verify_runtime "$target_release" || fail 'the active release failed verification'
+  log 'release is already active and healthy'
+  exit 0
+fi
+
+log 'building content-addressed images'
+build_target_images
+
+log 'starting the new release and waiting for health checks'
+if ! start_new_release; then
+  if [[ -n "$previous_release" ]]; then
+    rollback_to "$previous_release" || true
+  fi
+  fail 'new release failed to start'
+fi
+
+if ! verify_runtime "$target_release"; then
+  if [[ -n "$previous_release" ]]; then
+    rollback_to "$previous_release" || true
+  fi
+  fail 'new release failed runtime verification'
+fi
+
+next_link="$base_dir/.current.${deploy_sha}.$$"
+/usr/bin/ln -s "releases/$deploy_sha" "$next_link"
+if ! /usr/bin/mv -Tf -- "$next_link" "$current_link"; then
+  if [[ -n "$previous_release" ]]; then
+    rollback_to "$previous_release" || true
+  fi
+  fail 'could not switch the current release symlink'
+fi
+next_link=
+
+log 'deployment completed successfully'

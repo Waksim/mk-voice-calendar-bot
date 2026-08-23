@@ -1,0 +1,99 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.11.29"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev
+
+      - name: Run test suite
+        run: uv run pytest -q
+
+      - name: Validate deployment files
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/server/compose.yaml config --quiet
+          python -m py_compile deploy/server/webhook-tunnel/controller.py
+          bash -n deploy/server/cicd/mk-voice-calendar-deploy
+          bash -n deploy/server/cicd/mk-voice-calendar-deploy-dispatch
+          bash -n deploy/server/cicd/mk-voice-calendar-deploy-trigger
+
+  deploy:
+    name: Deploy production
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: https://t.me/mk_voice_text_bot
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+      DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+    steps:
+      - name: Deploy the exact main commit
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?DEPLOY_HOST is not configured}"
+          : "${DEPLOY_PORT:?DEPLOY_PORT is not configured}"
+          : "${DEPLOY_USER:?DEPLOY_USER is not configured}"
+          : "${DEPLOY_KNOWN_HOSTS:?DEPLOY_KNOWN_HOSTS is not configured}"
+          : "${DEPLOY_SSH_PRIVATE_KEY:?DEPLOY_SSH_PRIVATE_KEY is not configured}"
+
+          umask 077
+          key_path="$(mktemp)"
+          known_hosts_path="$(mktemp)"
+          cleanup() {
+            rm -f -- "$key_path" "$known_hosts_path"
+          }
+          trap cleanup EXIT
+
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" >"$key_path"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" >"$known_hosts_path"
+          ssh-keygen -y -f "$key_path" >/dev/null
+
+          ssh \
+            -p "$DEPLOY_PORT" \
+            -i "$key_path" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o IdentitiesOnly=yes \
+            -o IdentityAgent=none \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=8 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known_hosts_path" \
+            "$DEPLOY_USER@$DEPLOY_HOST" "deploy $DEPLOY_SHA"

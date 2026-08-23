@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+
+read_secret() {
+    secret_file="$1"
+    if [ ! -s "$secret_file" ]; then
+        echo "Required secret file is missing or empty: $secret_file" >&2
+        exit 1
+    fi
+    tr -d '\r\n' < "$secret_file"
+}
+
+read_optional_secret() {
+    secret_file="$1"
+    if [ ! -s "$secret_file" ]; then
+        return 0
+    fi
+    tr -d '\r\n' < "$secret_file"
+}
+
+export TELEGRAM_API_ID="$(read_secret "${TELEGRAM_API_ID_FILE:-/run/secrets/telegram-api-id}")"
+export TELEGRAM_API_HASH="$(read_secret "${TELEGRAM_API_HASH_FILE:-/run/secrets/telegram-api-hash}")"
+
+unset TELEGRAM_SESSION_STRING TELEGRAM_SESSION_STRINGS
+unset TELEGRAM_SESSION_STRING_WORK TELEGRAM_SESSION_STRING_PERSONAL
+session_work="$(read_optional_secret "${TELEGRAM_SESSION_WORK_FILE:-/run/secrets/telegram-session-work}")"
+session_personal="$(read_optional_secret "${TELEGRAM_SESSION_PERSONAL_FILE:-/run/secrets/telegram-session-personal}")"
+if [ -z "$session_work" ] && [ -z "$session_personal" ]; then
+    echo "At least one Telegram production session is required" >&2
+    exit 1
+fi
+if [ -n "$session_work" ]; then
+    export TELEGRAM_SESSION_STRING_WORK="$session_work"
+fi
+if [ -n "$session_personal" ]; then
+    export TELEGRAM_SESSION_STRING_PERSONAL="$session_personal"
+fi
+unset session_work session_personal
+
+export TELEGRAM_MCP_ROOT="/app/vendor/telegram-mcp"
+export TELEGRAM_GATEWAY_ALLOWED_ROOT="/tmp/telegram-gateway-files"
+mkdir -p "$TELEGRAM_GATEWAY_ALLOWED_ROOT"
+export TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK="1"
+export TELEGRAM_DEVICE_MODEL="Voice Calendar Bot (server)"
+export TELEGRAM_SYSTEM_VERSION="Linux"
+export TELEGRAM_APP_VERSION="3.2.14-gateway-server"
+export MCP_TRANSPORT="stdio"
+
+exec /opt/venv/bin/python /app/deploy/server/telegram_gateway.py
