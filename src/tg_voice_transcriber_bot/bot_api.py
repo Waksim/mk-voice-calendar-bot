@@ -343,7 +343,8 @@ class BotApi:
             {
                 "description": (
                     "Пришлите голосовое сообщение или напишите календарную "
-                    "команду текстом. Gemini 3.7 Flash High сразу добавит, "
+                    "команду текстом. Muse Spark 1.2 через OpenRouter "
+                    "сразу добавит, "
                     "изменит или удалит событие в Google Calendar. Любое "
                     "действие можно отменить кнопкой. Доступ ограничен двумя "
                     "аккаунтами владельца."
@@ -352,7 +353,12 @@ class BotApi:
         )
         await self.call(
             "setMyShortDescription",
-            {"short_description": "Голос или текст → Gemini → Google Calendar"},
+            {
+                "short_description": (
+                    "Голос или текст → Muse Spark 1.2 (OpenRouter) "
+                    "→ Google Calendar"
+                )
+            },
         )
 
     async def configure_polling(self) -> None:

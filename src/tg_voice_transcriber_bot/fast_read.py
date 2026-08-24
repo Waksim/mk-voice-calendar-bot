@@ -1,6 +1,6 @@
 """Deterministic planner for a small set of safe calendar read requests.
 
-The fast path is deliberately narrower than the Gemini planner.  It recognizes
+The fast path is deliberately narrower than the LLM planner.  It recognizes
 only unambiguous requests to list calendar events in a bounded time window and
 never emits a Calendar mutation or a title query.
 """

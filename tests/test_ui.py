@@ -9,6 +9,7 @@ from tg_voice_transcriber_bot.ui import (
     format_delete_card,
     format_duration,
     format_error_card,
+    format_ignore_card,
     format_lookup_clarify_card,
     format_mixed_operation_card,
     format_progress_card,
@@ -48,13 +49,14 @@ def test_progress_cards_are_single_safe_html_messages():
 
     assert "Ищу сообщение в Telegram" in matching
     assert "Получаю расшифровку" in transcribing
-    assert "Gemini разбирает" in gemini
+    assert "Muse Spark 1.2 разбирает" in gemini
+    assert "OpenRouter" in gemini
     assert "Расшифровка Telegram получена" in gemini
     assert "Текстовая команда получена" in text_gemini
     assert "Обрабатываю текстовую команду" in text_gemini
     assert "Ищу события в Google Calendar" in lookup
-    assert "Gemini выбирает точную запись" in matching_candidates
-    assert "Gemini: изменить событие" in calendar
+    assert "Muse Spark 1.2 выбирает точную запись" in matching_candidates
+    assert "Muse Spark 1.2: изменить событие" in calendar
     assert "Обновляю событие" in calendar
     assert "Читаю события" in reading
     assert all(utf16_units(ui._visible_text(card)) <= 4096 for card in (
@@ -189,6 +191,13 @@ def test_update_delete_clarify_error_and_undo_cards_have_distinct_outcomes():
     assert "↩️ <b>Действие отменено</b>" in undone
     assert "возвращены прежние данные" in undone
     assert "&lt;важно&gt;" in undone
+
+
+def test_ignore_card_names_current_model():
+    card = format_ignore_card(transcript="Привет", elapsed_seconds=1)
+
+    assert "Muse Spark 1.2 не нашла" in card
+    assert "Gemini" not in card
 
 
 def test_mixed_batch_has_one_bounded_card_and_generic_undo():
