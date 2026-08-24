@@ -756,7 +756,7 @@ def format_calendar_preview(
     parts = [f"Команда:\n{transcript}"]
     action = intent["action"]
     if action == "create":
-        parts.append("Gemini 3.7 распознал событие:")
+        parts.append("Muse Spark 1.2 распознала событие:")
         lines: list[str] = []
         multiple = len(intent["events"]) > 1
         for index, event in enumerate(intent["events"], start=1):
@@ -777,5 +777,7 @@ def format_calendar_preview(
     elif action == "clarify":
         parts.append(f'Нужно уточнить: {intent["clarification_question"]}')
     else:
-        parts.append("Gemini не нашёл в сообщении события для календаря.")
+        parts.append(
+            "Muse Spark 1.2 не нашла в сообщении события для календаря."
+        )
     return "\n\n".join(parts)

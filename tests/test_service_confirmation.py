@@ -158,6 +158,8 @@ def callback_update(update_id, data, *, user_id=OWNER_ID, callback_id="cb-1"):
 
 def test_start_copy_requires_confirmation_before_google_calendar_write():
     assert "основной Google Calendar" in START_TEXT
+    assert "Muse Spark 1.2" in START_TEXT
+    assert "OpenRouter" in START_TEXT
     assert "нажмите «Добавить»" in START_TEXT
     assert "Без этого подтверждения календарь не изменяется" in START_TEXT
 
@@ -189,6 +191,7 @@ def test_status_reports_connected_calendar_confirmation_pipeline(tmp_path):
 
     messages = asyncio.run(scenario())
     assert len(messages) == 1
+    assert "Muse Spark 1.2 через OpenRouter доступна" in messages[0][1]
     assert "Google Calendar подключён" in messages[0][1]
     assert "только после подтверждения" in messages[0][1]
 

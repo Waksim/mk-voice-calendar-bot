@@ -37,12 +37,27 @@ class GeminiRateLimitError(GeminiApiError):
     """A sanitized Gemini rate/quota failure safe for logs and user mapping."""
 
 
+class ProviderPermanentError(GeminiError):
+    """A provider rejection that cannot be repaired by retrying this request."""
+
+
+class ProviderCreditError(ProviderPermanentError):
+    """Marker for a provider account or API-key credit exhaustion."""
+
+
+class ProviderAuthenticationError(ProviderPermanentError):
+    """Marker for a rejected provider credential or access policy."""
+
+
 class GeminiCliError(GeminiError):
     """Google Antigravity CLI request or response failure."""
 
 
 _RATE_LIMIT_OBSERVED: ContextVar[bool | None] = ContextVar(
     "gemini_rate_limit_observed", default=None
+)
+_RATE_LIMIT_ERROR_OBSERVED: ContextVar[GeminiRateLimitError | None] = ContextVar(
+    "gemini_rate_limit_error_observed", default=None
 )
 
 
@@ -789,15 +804,31 @@ class GeminiFallback:
         self._primary_available = True
         self._primary_validation_error: GeminiError | None = None
 
+    @property
+    def primary_available(self) -> bool:
+        return self._primary_available
+
+    @property
+    def primary_validation_error(self) -> GeminiError | None:
+        return self._primary_validation_error
+
     @staticmethod
     def _combined_error(
         primary_error: GeminiError,
         fallback_error: GeminiError,
     ) -> GeminiError:
-        if isinstance(primary_error, GeminiRateLimitError) or isinstance(
-            fallback_error, GeminiRateLimitError
-        ):
-            return GeminiRateLimitError("Gemini API rate limit exceeded")
+        # A local fallback failure must not hide the actionable fact that the
+        # paid primary provider rejected the request for lack of credit.
+        if isinstance(primary_error, ProviderPermanentError):
+            return primary_error
+        if isinstance(fallback_error, ProviderPermanentError):
+            return fallback_error
+        # Keep a provider-specific subtype so the UI can name the service and
+        # offer the right recovery action after the fallback also fails.
+        if isinstance(primary_error, GeminiRateLimitError):
+            return primary_error
+        if isinstance(fallback_error, GeminiRateLimitError):
+            return fallback_error
         # Provider messages can contain response details. Error class names are
         # enough to diagnose which stages failed without exposing those details.
         return GeminiError(
@@ -831,6 +862,9 @@ class GeminiFallback:
             async with asyncio.timeout(primary_budget):
                 return await operation
         except TimeoutError:
+            rate_limit_error = _RATE_LIMIT_ERROR_OBSERVED.get()
+            if rate_limit_error is not None:
+                raise rate_limit_error from None
             if _RATE_LIMIT_OBSERVED.get():
                 raise GeminiRateLimitError(
                     "Gemini API rate limit exceeded"
@@ -841,17 +875,22 @@ class GeminiFallback:
         """Run the complete primary-to-fallback chain under one time budget."""
 
         rate_limit_token = _RATE_LIMIT_OBSERVED.set(False)
+        rate_limit_error_token = _RATE_LIMIT_ERROR_OBSERVED.set(None)
         try:
             try:
                 async with asyncio.timeout(self.timeout_seconds):
                     return await operation
             except TimeoutError:
+                rate_limit_error = _RATE_LIMIT_ERROR_OBSERVED.get()
+                if rate_limit_error is not None:
+                    raise rate_limit_error from None
                 if _RATE_LIMIT_OBSERVED.get():
                     raise GeminiRateLimitError(
                         "Gemini API rate limit exceeded"
                     ) from None
                 raise GeminiError("Gemini provider chain timed out") from None
         finally:
+            _RATE_LIMIT_ERROR_OBSERVED.reset(rate_limit_error_token)
             _RATE_LIMIT_OBSERVED.reset(rate_limit_token)
 
     async def validate(self) -> None:
@@ -860,6 +899,8 @@ class GeminiFallback:
         except GeminiError as primary_error:
             self._primary_available = False
             self._primary_validation_error = primary_error
+            if isinstance(primary_error, ProviderPermanentError):
+                raise primary_error
             if not self._fallback_available():
                 raise primary_error
             try:
@@ -901,6 +942,10 @@ class GeminiFallback:
                     reserve_for_fallback=fallback_available,
                 )
             except GeminiError as primary_error:
+                if isinstance(primary_error, ProviderPermanentError):
+                    raise primary_error
+                if isinstance(primary_error, GeminiRateLimitError):
+                    _RATE_LIMIT_ERROR_OBSERVED.set(primary_error)
                 if not fallback_available:
                     raise primary_error
                 try:
@@ -972,6 +1017,10 @@ class GeminiFallback:
                     reserve_for_fallback=fallback_available,
                 )
             except GeminiError as primary_error:
+                if isinstance(primary_error, ProviderPermanentError):
+                    raise primary_error
+                if isinstance(primary_error, GeminiRateLimitError):
+                    _RATE_LIMIT_ERROR_OBSERVED.set(primary_error)
                 if not fallback_available:
                     raise primary_error
                 try:

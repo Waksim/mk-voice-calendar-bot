@@ -33,6 +33,8 @@ def test_valid_event_is_normalized_and_previewed():
     preview = format_calendar_preview("В понедельник встреча", intent)
 
     assert intent["confidence"] == 0.96
+    assert "Muse Spark 1.2 распознала событие" in preview
+    assert "Gemini" not in preview
     assert "Встреча с Анной" in preview
     assert "2026-08-24T15:00:00+03:00" in preview
     assert "предпросмотр" in preview

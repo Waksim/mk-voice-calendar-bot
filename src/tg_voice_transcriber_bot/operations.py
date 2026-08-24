@@ -983,7 +983,7 @@ class OperationStore:
     def append_turn(self, record: Mapping[str, Any]) -> None:
         """Persist only compact application memory for the next user turn.
 
-        Complete snapshots and native Gemini interaction payloads remain in
+        Complete snapshots and provider-specific interaction payloads remain in
         the operation journal. They are deliberately not copied into the
         conversation because replaying them duplicates provider state and
         carries opaque thought signatures into unrelated user commands.

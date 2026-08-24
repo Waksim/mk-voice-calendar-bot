@@ -29,7 +29,26 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
     def fake_read_secret(*, environment, account=None, service=None):
         if environment == config.bot_token_environment:
             return "fake-bot-token"
-        raise RuntimeError("Gemini key intentionally absent in this unit test")
+        if environment == config.openrouter_api_key_environment:
+            assert account == config.openrouter_keychain_account
+            assert service == config.openrouter_keychain_service
+            return "fake-openrouter-key"
+        raise RuntimeError("Unexpected secret request")
+
+    class FakeOpenRouterApi:
+        def __init__(self, api_key, **kwargs):
+            assert api_key == "fake-openrouter-key"
+            captured["openrouter_kwargs"] = kwargs
+
+        async def aclose(self):
+            sequence.append("openrouter_close")
+
+    class FakePlannerFallback:
+        def __init__(self, primary, fallback, *, timeout_seconds):
+            captured["fallback_provider"] = self
+            captured["openrouter_primary"] = primary
+            captured["cli_fallback"] = fallback
+            captured["planner_timeout_seconds"] = timeout_seconds
 
     class FakeBotApi:
         def __init__(self, token):
@@ -79,6 +98,7 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
             assert calendar_confirmation is not None
             assert calendar_confirmation.calendar is calendar
             captured["confirmation"] = calendar_confirmation
+            captured["planner"] = gemini
 
         async def initialize(self):
             sequence.append("service_initialize")
@@ -91,6 +111,8 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         service_module, "read_secret", fake_read_secret
     )
     monkeypatch.setattr(service_module, "BotApi", FakeBotApi)
+    monkeypatch.setattr(service_module, "OpenRouterApi", FakeOpenRouterApi)
+    monkeypatch.setattr(service_module, "GeminiFallback", FakePlannerFallback)
     monkeypatch.setattr(service_module, "open_gateway", fake_open_gateway)
     monkeypatch.setattr(
         service_module, "open_calendar_mcp", fake_open_calendar_mcp
@@ -114,6 +136,16 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
             "DEBUG": "false",
         },
     }
+    assert captured["openrouter_kwargs"] == {
+        "model": "meta/muse-spark-1.2-contributor",
+        "timeout_seconds": 45,
+        "timezone": "Europe/Moscow",
+        "reasoning_effort": "high",
+        "max_tokens": 8192,
+    }
+    assert captured["planner"] is captured["fallback_provider"]
+    assert captured["planner_timeout_seconds"] == 45
+    assert captured["cli_fallback"].model == "gemini-3.7-flash-high"
     assert sequence == [
         "bot_open",
         "gateway_open",
@@ -124,6 +156,7 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         "calendar_close",
         "gateway_close",
         "bot_close",
+        "openrouter_close",
     ]
 
 
@@ -147,13 +180,14 @@ def test_webhook_listener_registration_ownership(
         calendar_mcp_token_path=tmp_path / "tokens.json",
     )
     sequence = []
+    planners = []
 
     def fake_read_secret(*, environment, account=None, service=None):
         if environment == config.bot_token_environment:
             return "fake-bot-token"
         if environment == config.webhook_secret_environment:
             return "webhook_secret-123"
-        raise RuntimeError("Gemini key intentionally absent")
+        raise RuntimeError("OpenRouter key intentionally absent")
 
     class FakeBotApi:
         def __init__(self, token):
@@ -191,6 +225,7 @@ def test_webhook_listener_registration_ownership(
     class FakeVoiceBotService:
         def __init__(self, *args, **kwargs):
             self.calendar_operations = None
+            planners.append(args[4])
 
         async def initialize(self):
             sequence.append("service_initialize")
@@ -226,4 +261,6 @@ def test_webhook_listener_registration_ownership(
         assert "set_webhook" not in sequence
     assert "webhook_run" in sequence
     assert "webhook_close" in sequence
+    assert len(planners) == 1
+    assert isinstance(planners[0], service_module.GeminiCli)
     assert sequence[-3:] == ["calendar_close", "gateway_close", "bot_close"]

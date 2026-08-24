@@ -302,6 +302,19 @@ def test_webhook_configuration_is_authenticated_and_does_not_delete_webhook():
 
     requests = asyncio.run(scenario())
     assert not any(path.endswith("/deleteWebhook") for path, _payload in requests)
+    description = next(
+        payload["description"]
+        for path, payload in requests
+        if path.endswith("/setMyDescription")
+    )
+    short_description = next(
+        payload["short_description"]
+        for path, payload in requests
+        if path.endswith("/setMyShortDescription")
+    )
+    assert "Muse Spark 1.2 через OpenRouter" in description
+    assert "Gemini" not in description
+    assert "Muse Spark 1.2 (OpenRouter)" in short_description
     webhook_path, webhook_payload = requests[-1]
     assert webhook_path.endswith("/setWebhook")
     assert webhook_payload == {

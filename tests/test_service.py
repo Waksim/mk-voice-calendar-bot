@@ -1,6 +1,10 @@
 import asyncio
 
+import pytest
+
 from tg_voice_transcriber_bot.config import Config
+from tg_voice_transcriber_bot.gemini import GeminiApiError, GeminiFallback
+from tg_voice_transcriber_bot.openrouter import OpenRouterCreditError
 from tg_voice_transcriber_bot.service import (
     VoiceBotService,
     message_command,
@@ -79,6 +83,159 @@ def test_initialize_accepts_one_configured_production_account(tmp_path):
     assert service.enabled_accounts == frozenset({"personal"})
     assert gateway.read_accounts == ["personal"]
     assert bot.configured is True
+
+
+def test_calendar_bot_startup_fails_when_planner_validation_fails(tmp_path):
+    class FakeBot:
+        async def call(self, method):
+            assert method == "getMe"
+            return {"username": "mk_voice_text_bot"}
+
+        async def configure(self):
+            return None
+
+    class FakeGateway:
+        async def validate_operations(self):
+            return frozenset({"personal"})
+
+        async def read(self, account, operation, arguments):
+            return {"id": 100000001}
+
+    class OutOfCreditPlanner:
+        async def validate(self):
+            raise OpenRouterCreditError("OpenRouter API credits are exhausted")
+
+    async def scenario():
+        service = VoiceBotService(
+            Config(state_path=tmp_path / "state.json"),
+            FakeBot(),
+            FakeGateway(),
+            StateStore(tmp_path / "state.json"),
+            OutOfCreditPlanner(),
+        )
+        service.calendar_operations = object()  # type: ignore[assignment]
+        await service.initialize()
+
+    with pytest.raises(OpenRouterCreditError):
+        asyncio.run(scenario())
+
+
+def test_calendar_bot_rejects_silent_cli_fallback_after_primary_outage(tmp_path):
+    class FakeBot:
+        async def call(self, method):
+            return {"username": "mk_voice_text_bot"}
+
+        async def configure(self):
+            return None
+
+    class FakeGateway:
+        async def validate_operations(self):
+            return frozenset({"personal"})
+
+        async def read(self, account, operation, arguments):
+            return {"id": 100000001}
+
+    primary_error = GeminiApiError("primary startup outage")
+
+    class FailedPrimary:
+        async def validate(self):
+            raise primary_error
+
+    class WorkingFallback:
+        @staticmethod
+        def is_available():
+            return True
+
+        async def validate(self):
+            return None
+
+    async def scenario():
+        planner = GeminiFallback(
+            FailedPrimary(),  # type: ignore[arg-type]
+            WorkingFallback(),  # type: ignore[arg-type]
+            timeout_seconds=1,
+        )
+        service = VoiceBotService(
+            Config(state_path=tmp_path / "state.json"),
+            FakeBot(),
+            FakeGateway(),
+            StateStore(tmp_path / "state.json"),
+            planner,
+        )
+        service.calendar_operations = object()  # type: ignore[assignment]
+        await service.initialize()
+
+    with pytest.raises(GeminiApiError) as raised:
+        asyncio.run(scenario())
+    assert raised.value is primary_error
+
+
+def test_legacy_status_names_cli_fallback_instead_of_claiming_muse(tmp_path):
+    class FakeBot:
+        def __init__(self):
+            self.messages = []
+
+        async def call(self, method):
+            return {"username": "mk_voice_text_bot"}
+
+        async def configure(self):
+            return None
+
+        async def send_text(self, chat_id, text, *, reply_to_message_id=None):
+            self.messages.append(text)
+
+    class FakeGateway:
+        async def validate_operations(self):
+            return frozenset({"personal"})
+
+        async def read(self, account, operation, arguments):
+            return {"id": 100000001}
+
+    class FailedPrimary:
+        async def validate(self):
+            raise GeminiApiError("primary startup outage")
+
+    class WorkingFallback:
+        @staticmethod
+        def is_available():
+            return True
+
+        async def validate(self):
+            return None
+
+    async def scenario():
+        bot = FakeBot()
+        planner = GeminiFallback(
+            FailedPrimary(),  # type: ignore[arg-type]
+            WorkingFallback(),  # type: ignore[arg-type]
+            timeout_seconds=1,
+        )
+        service = VoiceBotService(
+            Config(state_path=tmp_path / "state.json"),
+            bot,
+            FakeGateway(),
+            StateStore(tmp_path / "state.json"),
+            planner,
+        )
+        await service.initialize()
+        await service.handle_update(
+            {
+                "update_id": 902,
+                "message": {
+                    "message_id": 46,
+                    "date": 1787400000,
+                    "from": {"id": 100000001},
+                    "chat": {"id": 100000001, "type": "private"},
+                    "text": "/status",
+                },
+            }
+        )
+        return bot
+
+    bot = asyncio.run(scenario())
+    assert "Muse/OpenRouter недоступна" in bot.messages[-1]
+    assert "активен резервный Gemini CLI" in bot.messages[-1]
+    assert "Muse Spark 1.2 через OpenRouter доступна" not in bot.messages[-1]
 
 
 def test_voice_from_temporarily_disabled_owner_does_not_call_gateway(tmp_path):
@@ -161,6 +318,7 @@ def test_status_does_not_invite_disabled_owner_to_send_voice(tmp_path):
     bot = asyncio.run(scenario())
 
     assert "временно не подключена" in bot.messages[0][1]
+    assert "Muse Spark 1.2 через OpenRouter доступна" in bot.messages[0][1]
     assert "Пришлите голосовое" not in bot.messages[0][1]
 
 

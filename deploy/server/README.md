@@ -16,7 +16,8 @@ are mounted read-only from `/etc/mk-voice-calendar-bot/secrets`. Required values
 must use mode `0600`:
 
 - `telegram-bot-token`
-- `gemini-api-key`
+- `openrouter-api-key`
+- `gemini-api-key` (temporarily retained for rollback to the previous image)
 - `telegram-api-id`
 - `telegram-api-hash`
 - `telegram-session-work`
@@ -25,16 +26,37 @@ must use mode `0600`:
 - `telegram-work-user-id`
 - `telegram-webhook-secret`
 
+The bot reads the OpenRouter credential only through
+`OPENROUTER_API_KEY_FILE=/run/secrets/openrouter-api-key`; do not put the key in
+Compose, an image layer, or the release checkout.
+The legacy Gemini credential remains mounted but is ignored by the new image;
+it keeps a rollback to the previous release operational without changing the
+trusted Compose manifest during an incident.
+
 At least one of the two `telegram-session-*` files must contain a dedicated
 production `StringSession`; the other may be absent or empty while that account
 is disabled. Never reuse a production value in a local Telegram MCP/Telethon
 process: Telegram treats one auth key used concurrently from different IPs as
 duplicated and permanently revokes that session.
 
-The bot, Gemini proxy, and webhook controller share the WARP network namespace.
-They use `/etc/mk-voice-calendar-bot/resolv.conf` with explicit public resolvers;
-this avoids Docker's embedded DNS becoming unavailable after namespace
-recreation. All inter-sidecar traffic stays on loopback.
+Calendar planning uses OpenRouter Chat Completions with
+`meta/muse-spark-1.2-contributor`. As of 2026-08-25, OpenRouter lists it at
+$0.10 per million input tokens and $0.20 per million output tokens. The
+Contributor price permits Meta to use prompts and completions to improve its
+products; do not enable a no-training/data-collection-denied routing policy for
+this model. The application retries transient throttling and provider failures
+with bounded backoff, while permanent credit/authentication failures fail
+immediately. Keep enough OpenRouter credit available and configure a per-key
+spending limit.
+Startup performs read-only checks of the API key, remaining key limit, account
+balance, model availability, structured-output support, and reasoning effort.
+The calendar bot exits before opening a healthy deployment if any check fails.
+
+The bot, outbound API proxy (the legacy `gemini-proxy` service name), and
+webhook controller share the WARP network namespace. They use
+`/etc/mk-voice-calendar-bot/resolv.conf` with explicit public resolvers; this
+avoids Docker's embedded DNS becoming unavailable after namespace recreation.
+All inter-sidecar traffic stays on loopback.
 
 Build and start from a release directory:
 

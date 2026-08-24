@@ -6,6 +6,11 @@ from tg_voice_transcriber_bot.config import PROJECT_ROOT, Config
 def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     config = Config()
 
+    assert config.openrouter_api_key_environment == "OPENROUTER_API_KEY"
+    assert config.openrouter_model == "meta/muse-spark-1.2-contributor"
+    assert config.openrouter_timeout_seconds == 45
+    assert config.openrouter_reasoning_effort == "high"
+    assert config.openrouter_max_tokens == 8192
     assert config.calendar_mcp_package_version == "2.6.2"
     assert config.calendar_mcp_working_directory == PROJECT_ROOT / "calendar-mcp"
     assert config.calendar_mcp_binary_path == (
@@ -57,6 +62,10 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("TELEGRAM_WEBHOOK_REGISTER", "false")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_PATH", "/telegram/managed/webhook")
     monkeypatch.setenv("CALENDAR_MCP_PROCESS_PATH", "/usr/local/bin:/usr/bin:/bin")
+    monkeypatch.setenv("OPENROUTER_MODEL", "meta/muse-spark-1.2")
+    monkeypatch.setenv("OPENROUTER_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("OPENROUTER_MAX_TOKENS", "4096")
 
     config = Config()
 
@@ -67,6 +76,29 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.webhook_listen_host == "0.0.0.0"
     assert config.webhook_listen_port == 8090
     assert config.calendar_mcp_env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+    assert config.openrouter_model == "meta/muse-spark-1.2"
+    assert config.openrouter_timeout_seconds == 60
+    assert config.openrouter_reasoning_effort == "medium"
+    assert config.openrouter_max_tokens == 4096
+
+
+@pytest.mark.parametrize(
+    "environment,value,error",
+    [
+        ("OPENROUTER_MODEL", "", "MODEL"),
+        ("OPENROUTER_TIMEOUT_SECONDS", "0", "TIMEOUT"),
+        ("OPENROUTER_REASONING_EFFORT", "maximum", "REASONING"),
+        ("OPENROUTER_MAX_TOKENS", "0", "MAX_TOKENS"),
+        ("OPENROUTER_MAX_TOKENS", "65537", "MAX_TOKENS"),
+    ],
+)
+def test_invalid_openrouter_configuration_fails_closed(
+    monkeypatch, environment, value, error
+):
+    monkeypatch.setenv(environment, value)
+
+    with pytest.raises(ValueError, match=error):
+        Config()
 
 
 def test_webhook_configuration_requires_plain_https_url():
