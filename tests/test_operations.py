@@ -22,6 +22,7 @@ from tg_voice_transcriber_bot.operations import (
     CalendarOperationPipeline,
     OperationStateError,
     OperationStore,
+    _conversation_turn,
     _materially_equivalent,
     _snapshot,
 )
@@ -238,6 +239,7 @@ def apply(
     *,
     account="personal",
     chat_id=OWNER,
+    transcript="Голосовая команда целиком",
     allowed_event_ids=None,
     displayed_candidates=None,
 ):
@@ -260,7 +262,7 @@ def apply(
         account=account,
         owner_user_id=chat_id,
         chat_id=chat_id,
-        transcript="Голосовая команда целиком",
+        transcript=transcript,
         reference_time=NOW,
         plan=operation_plan,
         interaction_input={"type": "user_input", "content": [{"type": "text", "text": "x"}]},
@@ -486,6 +488,274 @@ def test_last_two_created_events_are_compact_editable_aliases(tmp_path):
     # The durable operation journal remains complete for recovery/debugging.
     assert store.get(first.operation_id)["interaction_input"] is not None
     assert store.get(first.operation_id)["items"][0]["after"]["event_id"] == first_id
+
+
+def test_ignored_smalltalk_does_not_evict_two_recent_mutation_turns(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        store = OperationStore(tmp_path / "ops.json")
+        pipeline = CalendarOperationPipeline(store, calendar)
+        first = await apply(
+            pipeline,
+            120,
+            plan(create_op(event(title="Дейлик ЗОЖ-МЛ"))),
+            transcript="Создай дейлик ЗОЖ-МЛ",
+        )
+        second = await apply(
+            pipeline,
+            121,
+            plan(
+                create_op(
+                    event(
+                        title="Дейлик K2+RnD",
+                        start_at="2026-08-24T11:30:00+03:00",
+                        end_at="2026-08-24T12:00:00+03:00",
+                    )
+                )
+            ),
+            transcript="Создай дейлик K2+RnD",
+        )
+        ignored = await apply(
+            pipeline,
+            122,
+            {
+                "action": "ignore",
+                "operations": [],
+                "lookup": None,
+                "clarification_question": None,
+                "confidence": 1.0,
+            },
+            transcript="Привет, как дела?",
+        )
+        return first, second, ignored, store, pipeline.context(
+            account="personal", chat_id=OWNER, now=NOW
+        )
+
+    first, second, ignored, store, context = asyncio.run(scenario())
+    first_id = first.record["items"][0]["after"]["event_id"]
+    second_id = second.record["items"][0]["after"]["event_id"]
+
+    assert ignored.stage == "ignored"
+    assert context.allowed_event_ids == (second_id, first_id)
+    assert context.event_id_by_ref == {"e1": second_id, "e2": first_id}
+    assert [event["title"] for event in context.application_state["candidate_events"]] == [
+        "Дейлик K2+RnD",
+        "Дейлик ЗОЖ-МЛ",
+    ]
+    assert [turn["user_message"] for turn in context.recent_conversation] == [
+        "Создай дейлик ЗОЖ-МЛ",
+        "Создай дейлик K2+RnD",
+    ]
+    assert "Привет" not in json.dumps(context.recent_conversation, ensure_ascii=False)
+    persisted = store._data["conversations"][f"personal:{OWNER}"]["turns"]
+    assert [turn["source_key"] for turn in persisted] == [
+        "telegram-update:120",
+        "telegram-update:121",
+    ]
+
+
+def test_truncated_conversation_recovers_two_owned_mutations_from_journal(tmp_path):
+    async def seed():
+        calendar = FakeCalendar()
+        store = OperationStore(tmp_path / "ops.json")
+        pipeline = CalendarOperationPipeline(store, calendar)
+        first = await apply(
+            pipeline,
+            130,
+            plan(create_op(event(title="Дейлик A"))),
+            transcript="Создай дейлик A",
+        )
+        second = await apply(
+            pipeline,
+            131,
+            plan(
+                create_op(
+                    event(
+                        title="Дейлик B",
+                        start_at="2026-08-24T11:30:00+03:00",
+                        end_at="2026-08-24T12:00:00+03:00",
+                    )
+                )
+            ),
+            transcript="Создай дейлик B",
+        )
+        ignored = await apply(
+            pipeline,
+            132,
+            {
+                "action": "ignore",
+                "operations": [],
+                "lookup": None,
+                "clarification_question": None,
+                "confidence": 1.0,
+            },
+            transcript="Привет",
+        )
+
+        # Reproduce the production state written by the old retention rule:
+        # create A has fallen out, while create B and ignored smalltalk remain.
+        conversation_key = f"personal:{OWNER}"
+        second_turn = _conversation_turn(second.record)
+        ignored_turn = _conversation_turn(ignored.record)
+        store._data["conversations"][conversation_key]["turns"] = [
+            second_turn,
+            ignored_turn,
+        ]
+
+        # A broad cache observation must never become an implicit model alias.
+        store.observe_events(
+            "personal", [provider_event("unrelated-secret", title="Чужой кэш")]
+        )
+        foreign = json.loads(json.dumps(first.record))
+        foreign_snapshot = store.observe_events(
+            "personal", [provider_event("foreign-secret", title="Другой владелец")]
+        )[0]
+        foreign.update(
+            operation_id="foreign-operation",
+            source_key="telegram-update:999999",
+            owner_user_id=OWNER + 1,
+        )
+        foreign["items"][0]["after"] = foreign_snapshot
+        foreign["displayed_candidates"] = [foreign_snapshot]
+        store.put(foreign)
+        store._save()
+        return first, second, OperationStore(tmp_path / "ops.json")
+
+    first, second, reloaded = asyncio.run(seed())
+    context = reloaded.context("personal", OWNER, NOW, "Europe/Moscow")
+    first_id = first.record["items"][0]["after"]["event_id"]
+    second_id = second.record["items"][0]["after"]["event_id"]
+    serialized = json.dumps(
+        {
+            "state": context.application_state,
+            "conversation": context.recent_conversation,
+        },
+        ensure_ascii=False,
+    )
+
+    assert context.allowed_event_ids == (second_id, first_id)
+    assert context.event_id_by_ref == {"e1": second_id, "e2": first_id}
+    assert [turn["user_message"] for turn in context.recent_conversation] == [
+        "Создай дейлик A",
+        "Создай дейлик B",
+    ]
+    assert len(context.recent_conversation) == 2
+    assert len(context.application_state["candidate_events"]) == 2
+    assert "Привет" not in serialized
+    assert "unrelated-secret" not in serialized
+    assert "foreign-secret" not in serialized
+
+
+def test_undo_turn_deduplicates_original_operation_and_keeps_other_alias(tmp_path):
+    async def scenario():
+        store = OperationStore(tmp_path / "ops.json")
+        pipeline = CalendarOperationPipeline(store, FakeCalendar())
+        first = await apply(
+            pipeline,
+            140,
+            plan(create_op(event(title="Дейлик A"))),
+            transcript="Создай дейлик A",
+        )
+        second = await apply(
+            pipeline,
+            141,
+            plan(
+                create_op(
+                    event(
+                        title="Дейлик B",
+                        start_at="2026-08-24T11:30:00+03:00",
+                        end_at="2026-08-24T12:00:00+03:00",
+                    )
+                )
+            ),
+            transcript="Создай дейлик B",
+        )
+        undone = await pipeline.undo(
+            operation_id=first.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return first, second, undone, store, pipeline.context(
+            account="personal", chat_id=OWNER, now=NOW
+        )
+
+    first, second, undone, store, context = asyncio.run(scenario())
+    second_id = second.record["items"][0]["after"]["event_id"]
+    persisted = store._data["conversations"][f"personal:{OWNER}"]["turns"]
+
+    assert undone.outcome == "undone"
+    assert len({turn["operation_id"] for turn in persisted}) == 2
+    assert context.allowed_event_ids == (second_id,)
+    assert context.event_id_by_ref == {"e1": second_id}
+    assert [event["title"] for event in context.application_state["candidate_events"]] == [
+        "Дейлик B"
+    ]
+    assert [turn["status"] for turn in context.recent_conversation] == [
+        "applied",
+        "undone",
+    ]
+    assert [turn["user_message"] for turn in context.recent_conversation] == [
+        "Создай дейлик B",
+        "Пользователь нажал кнопку отмены операции.",
+    ]
+    assert sum(
+        turn["operation_id"] == first.operation_id for turn in persisted
+    ) == 1
+
+
+def test_stale_applied_compact_turn_uses_authoritative_undone_journal(tmp_path):
+    async def scenario():
+        store = OperationStore(tmp_path / "ops.json")
+        pipeline = CalendarOperationPipeline(store, FakeCalendar())
+        first = await apply(
+            pipeline,
+            150,
+            plan(create_op(event(title="Дейлик A"))),
+            transcript="Создай дейлик A",
+        )
+        stale_applied = _conversation_turn(first.record)
+        second = await apply(
+            pipeline,
+            151,
+            plan(
+                create_op(
+                    event(
+                        title="Дейлик B",
+                        start_at="2026-08-24T11:30:00+03:00",
+                        end_at="2026-08-24T12:00:00+03:00",
+                    )
+                )
+            ),
+            transcript="Создай дейлик B",
+        )
+        undone = await pipeline.undo(
+            operation_id=first.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+
+        # Simulate an old state file which retained the original source turn
+        # as applied and lost the separately appended Undo turn.
+        conversation_key = f"personal:{OWNER}"
+        store._data["conversations"][conversation_key]["turns"] = [
+            _conversation_turn(second.record),
+            stale_applied,
+        ]
+        store._save()
+        return first, second, undone, OperationStore(tmp_path / "ops.json")
+
+    first, second, undone, reloaded = asyncio.run(scenario())
+    context = reloaded.context("personal", OWNER, NOW, "Europe/Moscow")
+    second_id = second.record["items"][0]["after"]["event_id"]
+
+    assert undone.outcome == "undone"
+    assert reloaded.get(first.operation_id)["stage"] == "undone"
+    assert context.allowed_event_ids == (second_id,)
+    assert [turn["status"] for turn in context.recent_conversation] == [
+        "applied",
+        "undone",
+    ]
+    assert context.recent_conversation[-1]["actions"] == [{"type": "create"}]
 
 
 def test_model_context_is_bounded_and_never_contains_event_snapshots(tmp_path):

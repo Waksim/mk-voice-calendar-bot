@@ -16,6 +16,7 @@ from tg_voice_transcriber_bot.gemini import (
     GeminiCliError,
     GeminiError,
     GeminiFallback,
+    GeminiRateLimitError,
 )
 from tg_voice_transcriber_bot.intent import (
     CALENDAR_INTENT_SCHEMA,
@@ -307,7 +308,317 @@ def test_direct_api_retries_interactions_too_many_requests_code():
 
     assert asyncio.run(scenario())["action"] == "create"
     assert attempts == 2
-    assert delays == [1]
+    assert delays == [10]
+
+
+@pytest.mark.parametrize(
+    "error_envelope",
+    [
+        {"code": 429, "status": "RESOURCE_EXHAUSTED"},
+        {"code": "429"},
+        {"status": "RESOURCE_EXHAUSTED"},
+        {"code": "rate_limit_exceeded"},
+    ],
+)
+def test_direct_api_retries_standard_rate_limit_envelopes(error_envelope):
+    attempts = 0
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                json={"error": {**error_envelope, "message": "private body"}},
+            )
+        return httpx.Response(200, json=interaction_response())
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=45,
+                timezone="Europe/Moscow",
+                max_retries=1,
+                client=http_client,
+                sleep=fake_sleep,
+            )
+            return await client.extract_event(
+                "Завтра в десять позвонить врачу",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+
+    assert asyncio.run(scenario())["action"] == "create"
+    assert attempts == 2
+    assert delays == [10]
+
+
+def test_direct_api_exhausted_transient_rate_limit_is_sanitized():
+    attempts = 0
+    delays = []
+    secret_body = "private-provider-response"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "message": secret_body,
+                }
+            },
+        )
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=45,
+                timezone="Europe/Moscow",
+                max_retries=2,
+                client=http_client,
+                sleep=fake_sleep,
+            )
+            await client.extract_event(
+                "Завтра в десять позвонить врачу",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+
+    with pytest.raises(GeminiRateLimitError) as raised:
+        asyncio.run(scenario())
+    assert attempts == 3
+    assert delays == [10, 20]
+    assert str(raised.value) == "Gemini API rate limit exceeded"
+    assert secret_body not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "quota_detail",
+    [
+        {
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [
+                {
+                    "quotaMetric": (
+                        "generativelanguage.googleapis.com/"
+                        "generate_content_free_tier_requests"
+                    ),
+                    "quotaId": (
+                        "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+                    ),
+                    "quotaDimensions": {
+                        "location": "global",
+                        "model": "gemini-3.7-flash",
+                    },
+                }
+            ],
+        },
+        {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "RATE_LIMIT_EXCEEDED",
+            "domain": "generativelanguage.googleapis.com",
+            "metadata": {
+                "quota_limit": "GenerateRequestsPerDayPerProject-FreeTier",
+                "quota_location": "global",
+            },
+        },
+    ],
+)
+def test_direct_api_does_not_retry_daily_quota_details(quota_detail):
+    attempts = 0
+    delays = []
+    private_detail = "provider-secret-detail"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "message": private_detail,
+                    "details": [
+                        quota_detail,
+                        {
+                            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                            "retryDelay": "28s",
+                        },
+                    ],
+                }
+            },
+        )
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=45,
+                timezone="Europe/Moscow",
+                max_retries=2,
+                client=http_client,
+                sleep=fake_sleep,
+            )
+            await client.extract_event(
+                "Завтра в десять позвонить врачу",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+
+    with pytest.raises(GeminiRateLimitError) as raised:
+        asyncio.run(scenario())
+    assert attempts == 1
+    assert delays == []
+    assert str(raised.value) == "Gemini API rate limit exceeded"
+    assert private_detail not in str(raised.value)
+
+
+def test_direct_api_retries_realistic_retry_info_envelope():
+    attempts = 0
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "details": [
+                            {
+                                "@type": (
+                                    "type.googleapis.com/"
+                                    "google.rpc.QuotaFailure"
+                                ),
+                                "violations": [
+                                    {
+                                        "quotaMetric": (
+                                            "generativelanguage.googleapis.com/"
+                                            "generate_content_free_tier_requests"
+                                        ),
+                                        "quotaId": (
+                                            "GenerateRequestsPerMinutePerProject"
+                                            "PerModel-FreeTier"
+                                        ),
+                                    }
+                                ],
+                            },
+                            {
+                                "@type": (
+                                    "type.googleapis.com/google.rpc.ErrorInfo"
+                                ),
+                                "reason": "RATE_LIMIT_EXCEEDED",
+                                "domain": "generativelanguage.googleapis.com",
+                            },
+                            {
+                                "@type": (
+                                    "type.googleapis.com/google.rpc.RetryInfo"
+                                ),
+                                "retryDelay": "12s",
+                            },
+                        ],
+                    }
+                },
+            )
+        return httpx.Response(200, json=interaction_response())
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=45,
+                timezone="Europe/Moscow",
+                max_retries=1,
+                client=http_client,
+                sleep=fake_sleep,
+            )
+            return await client.extract_event(
+                "Завтра в десять позвонить врачу",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+
+    assert asyncio.run(scenario())["action"] == "create"
+    assert attempts == 2
+    assert delays == [12]
+
+
+def test_resource_exhausted_without_429_or_details_is_not_a_rate_limit():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            400,
+            json={"error": {"status": "RESOURCE_EXHAUSTED"}},
+        )
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=45,
+                timezone="Europe/Moscow",
+                client=http_client,
+            )
+            await client.extract_event(
+                "Завтра в десять позвонить врачу",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+
+    with pytest.raises(GeminiApiError) as raised:
+        asyncio.run(scenario())
+    assert not isinstance(raised.value, GeminiRateLimitError)
+    assert attempts == 1
 
 
 def test_direct_api_has_one_total_timeout_budget():
@@ -411,9 +722,10 @@ def test_direct_api_does_not_retry_daily_quota_or_expose_secret():
                 account="personal",
             )
 
-    with pytest.raises(GeminiApiError) as raised:
+    with pytest.raises(GeminiRateLimitError) as raised:
         asyncio.run(scenario())
     assert attempts == 1
+    assert str(raised.value) == "Gemini API rate limit exceeded"
     assert api_key not in str(raised.value)
 
 
@@ -859,7 +1171,7 @@ def test_fallback_planner_preserves_all_context_arguments():
     )
 
 
-def test_fallback_deadline_cancels_hanging_primary_before_cli():
+def test_fallback_reserves_deadline_for_cli_after_hanging_primary():
     class HangingApi:
         def __init__(self):
             self.cancelled = False
@@ -871,7 +1183,7 @@ def test_fallback_deadline_cancels_hanging_primary_before_cli():
                 self.cancelled = True
                 raise
 
-    class UnexpectedCli:
+    class WorkingCli:
         def __init__(self):
             self.calls = 0
 
@@ -884,21 +1196,21 @@ def test_fallback_deadline_cancels_hanging_primary_before_cli():
 
     async def scenario():
         primary = HangingApi()
-        cli = UnexpectedCli()
+        cli = WorkingCli()
         provider = GeminiFallback(primary, cli, timeout_seconds=0.01)
-        with pytest.raises(GeminiError, match="provider chain timed out"):
-            await provider.extract_event(
-                "Завтра встреча",
-                reference_time=datetime(
-                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
-                ),
-                account="personal",
-            )
-        return primary, cli
+        result = await provider.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+        return primary, cli, result
 
-    primary, cli = asyncio.run(scenario())
+    primary, cli, result = asyncio.run(scenario())
     assert primary.cancelled is True
-    assert cli.calls == 0
+    assert cli.calls == 1
+    assert result == CALENDAR_RESULT
 
 
 def test_fallback_deadline_cancels_slow_cli_after_fast_primary_failure():
@@ -975,6 +1287,64 @@ def test_fast_primary_failure_allows_successful_fallback_within_deadline():
     assert result == CALENDAR_RESULT
 
 
+def test_exhausted_transient_retries_reach_fast_cli_before_total_deadline():
+    attempts = 0
+    delays = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            429,
+            json={"error": {"code": "too_many_requests"}},
+        )
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    class WorkingCli:
+        def __init__(self):
+            self.calls = 0
+
+        def is_available(self):
+            return True
+
+        async def extract_event(self, transcript, **kwargs):
+            self.calls += 1
+            return CALENDAR_RESULT
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            primary = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=45,
+                timezone="Europe/Moscow",
+                max_retries=2,
+                client=http_client,
+                sleep=fake_sleep,
+            )
+            cli = WorkingCli()
+            provider = GeminiFallback(primary, cli, timeout_seconds=0.05)
+            result = await provider.extract_event(
+                "Завтра встреча",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+            return cli, result
+
+    cli, result = asyncio.run(scenario())
+    assert attempts == 3
+    assert delays == [10, 20]
+    assert cli.calls == 1
+    assert result == CALENDAR_RESULT
+
+
 def test_missing_cli_preserves_primary_api_error(tmp_path):
     primary_error = GeminiApiError("Gemini API request timed out")
 
@@ -1035,6 +1405,74 @@ def test_fallback_combines_provider_error_types_without_details():
     assert "fallback=GeminiCliError" in message
     assert "unsafe primary response detail" not in message
     assert "unsafe fallback response detail" not in message
+
+
+def test_fallback_preserves_sanitized_rate_limit_error_type():
+    class RateLimitedApi:
+        async def extract_event(self, transcript, **kwargs):
+            raise GeminiRateLimitError("Gemini API rate limit exceeded")
+
+    class FailedCli:
+        def is_available(self):
+            return True
+
+        async def extract_event(self, transcript, **kwargs):
+            raise GeminiCliError("private fallback response")
+
+    async def scenario():
+        provider = GeminiFallback(
+            RateLimitedApi(), FailedCli(), timeout_seconds=45
+        )
+        await provider.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+
+    with pytest.raises(GeminiRateLimitError) as raised:
+        asyncio.run(scenario())
+    assert str(raised.value) == "Gemini API rate limit exceeded"
+    assert "private fallback response" not in str(raised.value)
+
+
+def test_fallback_deadline_after_rate_limit_preserves_error_type():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"code": "too_many_requests"}},
+        )
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            api = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=0.01,
+                timezone="Europe/Moscow",
+                client=http_client,
+            )
+            cli = GeminiCli(
+                Path("/missing-antigravity"),
+                model="gemini-3.7-flash-high",
+                timeout_seconds=45,
+                timezone="Europe/Moscow",
+            )
+            provider = GeminiFallback(api, cli, timeout_seconds=0.01)
+            await provider.extract_event(
+                "Завтра встреча",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+
+    with pytest.raises(GeminiRateLimitError) as raised:
+        asyncio.run(scenario())
+    assert str(raised.value) == "Gemini API rate limit exceeded"
 
 
 def test_cli_availability_requires_an_executable_regular_file(tmp_path):

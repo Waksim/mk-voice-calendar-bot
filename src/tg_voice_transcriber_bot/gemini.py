@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime
 import json
@@ -32,8 +33,17 @@ class GeminiApiError(GeminiError):
     """Gemini Developer API request or response failure."""
 
 
+class GeminiRateLimitError(GeminiApiError):
+    """A sanitized Gemini rate/quota failure safe for logs and user mapping."""
+
+
 class GeminiCliError(GeminiError):
     """Google Antigravity CLI request or response failure."""
+
+
+_RATE_LIMIT_OBSERVED: ContextVar[bool | None] = ContextVar(
+    "gemini_rate_limit_observed", default=None
+)
 
 
 class GeminiProvider(Protocol):
@@ -274,6 +284,17 @@ class GeminiApi:
 
     _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
     _RETRYABLE_STATUS_CODES = frozenset({408, 500, 502, 503, 504})
+    _TRANSIENT_RATE_LIMIT_CODES = frozenset(
+        {"rate_limit_exceeded", "too_many_requests"}
+    )
+    _QUOTA_EXHAUSTED_CODES = frozenset({"quota_exceeded"})
+    _PERSISTENT_QUOTA_MARKERS = (
+        "perday",
+        "per_day",
+        "per-day",
+        "daily",
+    )
+    _RATE_LIMIT_INITIAL_DELAY_SECONDS = 10.0
     _MAX_RESPONSE_BYTES = 1_000_000
 
     def __init__(
@@ -321,7 +342,7 @@ class GeminiApi:
             await self._client.aclose()
 
     @staticmethod
-    def _error_code(response: httpx.Response) -> str | None:
+    def _error_object(response: httpx.Response) -> Mapping[str, Any] | None:
         if len(response.content) > GeminiApi._MAX_RESPONSE_BYTES:
             return None
         try:
@@ -333,8 +354,86 @@ class GeminiApi:
         error = body.get("error")
         if not isinstance(error, dict):
             return None
-        code = error.get("code")
-        return code if isinstance(code, str) else None
+        return error
+
+    @classmethod
+    def _error_markers(cls, response: httpx.Response) -> frozenset[str]:
+        """Return normalized provider error markers without retaining its body."""
+
+        error = cls._error_object(response)
+        if error is None:
+            return frozenset()
+        markers: set[str] = set()
+        for field in ("code", "status"):
+            value = error.get(field)
+            if isinstance(value, str):
+                normalized = value.strip().casefold()
+                if normalized:
+                    markers.add(normalized)
+            elif isinstance(value, int) and not isinstance(value, bool):
+                markers.add(str(value))
+        return frozenset(markers)
+
+    @classmethod
+    def _rate_limit_detail_flags(
+        cls, response: httpx.Response
+    ) -> tuple[bool, bool]:
+        """Return (persistent quota, transient retry) from google.rpc details."""
+
+        error = cls._error_object(response)
+        details = error.get("details") if error is not None else None
+        if not isinstance(details, list):
+            return False, False
+        quota = False
+        transient = False
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            detail_type = str(detail.get("@type", "")).casefold()
+            if detail_type.endswith("google.rpc.retryinfo"):
+                transient = True
+                continue
+            if not detail_type.endswith(
+                ("google.rpc.quotafailure", "google.rpc.errorinfo")
+            ):
+                continue
+            # Quota IDs and ErrorInfo metadata are provider data used only for
+            # classification. They are never copied into exceptions or logs.
+            detail_text = json.dumps(
+                detail,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                default=str,
+            ).casefold()
+            reason = str(detail.get("reason", "")).strip().casefold()
+            if (
+                reason in cls._QUOTA_EXHAUSTED_CODES
+                or any(
+                    marker in detail_text
+                    for marker in cls._PERSISTENT_QUOTA_MARKERS
+                )
+            ):
+                quota = True
+            elif reason in cls._TRANSIENT_RATE_LIMIT_CODES:
+                transient = True
+        return quota, transient
+
+    @classmethod
+    def _rate_limit_kind(cls, response: httpx.Response) -> str | None:
+        """Classify all documented Gemini 429 envelope variants."""
+
+        markers = cls._error_markers(response)
+        detail_quota, detail_transient = cls._rate_limit_detail_flags(response)
+        if markers & cls._QUOTA_EXHAUSTED_CODES or detail_quota:
+            return "quota"
+        if detail_transient or markers & cls._TRANSIENT_RATE_LIMIT_CODES:
+            return "transient"
+        # RESOURCE_EXHAUSTED alone is deliberately not enough: Google uses it
+        # for both short rolling limits and daily/free-tier quota exhaustion.
+        # An otherwise unknown HTTP/numeric 429 still receives bounded retries.
+        if response.status_code == 429 or "429" in markers:
+            return "transient"
+        return None
 
     @staticmethod
     def _retry_delay_from_response(response: httpx.Response) -> float | None:
@@ -344,16 +443,8 @@ class GeminiApi:
                 return max(0.0, float(header))
             except ValueError:
                 pass
-        if len(response.content) > GeminiApi._MAX_RESPONSE_BYTES:
-            return None
-        try:
-            body = response.json()
-        except ValueError:
-            return None
-        if not isinstance(body, dict):
-            return None
-        error = body.get("error")
-        if not isinstance(error, dict):
+        error = GeminiApi._error_object(response)
+        if error is None:
             return None
         details = error.get("details")
         if not isinstance(details, list):
@@ -371,13 +462,27 @@ class GeminiApi:
                 return float(match.group(1))
         return None
 
-    def _retry_delay(self, response: httpx.Response | None, attempt: int) -> float:
+    def _retry_delay(
+        self,
+        response: httpx.Response | None,
+        attempt: int,
+        *,
+        rate_limited: bool = False,
+    ) -> float:
         server_delay = (
             self._retry_delay_from_response(response)
             if response is not None
             else None
         )
-        delay = server_delay if server_delay is not None else float(2**attempt)
+        if server_delay is not None:
+            delay = server_delay
+        elif rate_limited:
+            # A 1s/2s retry merely hits Gemini's short rolling window again.
+            # 10s/20s is still bounded enough to fit inside the service's single
+            # 45-second primary-to-fallback deadline.
+            delay = self._RATE_LIMIT_INITIAL_DELAY_SECONDS * float(2**attempt)
+        else:
+            delay = float(2**attempt)
         return min(delay, self.max_retry_delay_seconds)
 
     async def _request(
@@ -387,14 +492,20 @@ class GeminiApi:
         *,
         payload: dict[str, Any] | None = None,
     ) -> httpx.Response:
+        rate_limit_seen = [False]
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 return await self._request_with_retries(
                     method,
                     url,
                     payload=payload,
+                    rate_limit_seen=rate_limit_seen,
                 )
         except TimeoutError:
+            if rate_limit_seen[0]:
+                raise GeminiRateLimitError(
+                    "Gemini API rate limit exceeded"
+                ) from None
             raise GeminiApiError("Gemini API request timed out") from None
 
     async def _request_with_retries(
@@ -403,6 +514,7 @@ class GeminiApi:
         url: str,
         *,
         payload: dict[str, Any] | None = None,
+        rate_limit_seen: list[bool] | None = None,
     ) -> httpx.Response:
         headers = {
             "x-goog-api-key": self._api_key,
@@ -433,18 +545,28 @@ class GeminiApi:
             if 200 <= response.status_code < 300:
                 return response
             retryable = response.status_code in self._RETRYABLE_STATUS_CODES
-            if response.status_code == 429:
-                # Per the Interactions API contract, rate_limit_exceeded is
-                # transient while quota_exceeded lasts until quota reset.
-                retryable = self._error_code(response) in {
-                    "rate_limit_exceeded",
-                    # The Interactions endpoint currently uses this code for
-                    # the same short-window condition and includes a retry hint.
-                    "too_many_requests",
-                }
+            rate_limit_kind = self._rate_limit_kind(response)
+            if rate_limit_kind is not None:
+                if _RATE_LIMIT_OBSERVED.get() is not None:
+                    _RATE_LIMIT_OBSERVED.set(True)
+                if rate_limit_seen is not None:
+                    rate_limit_seen[0] = True
+                # quota_exceeded lasts until the provider resets quota;
+                # retry short-window throttling only.
+                retryable = rate_limit_kind == "transient"
             if retryable and attempt < self.max_retries:
-                await self._sleep(self._retry_delay(response, attempt))
+                await self._sleep(
+                    self._retry_delay(
+                        response,
+                        attempt,
+                        rate_limited=rate_limit_kind == "transient",
+                    )
+                )
                 continue
+            if rate_limit_kind is not None:
+                raise GeminiRateLimitError(
+                    "Gemini API rate limit exceeded"
+                ) from None
             raise GeminiApiError(
                 f"Gemini API HTTP status {response.status_code}"
             ) from None
@@ -649,6 +771,9 @@ class GeminiApi:
 class GeminiFallback:
     """Use the direct API first and Antigravity CLI only after a safe failure."""
 
+    _MAX_FALLBACK_RESERVE_SECONDS = 10.0
+    _FALLBACK_RESERVE_FRACTION = 0.25
+
     def __init__(
         self,
         primary: GeminiApi,
@@ -669,6 +794,10 @@ class GeminiFallback:
         primary_error: GeminiError,
         fallback_error: GeminiError,
     ) -> GeminiError:
+        if isinstance(primary_error, GeminiRateLimitError) or isinstance(
+            fallback_error, GeminiRateLimitError
+        ):
+            return GeminiRateLimitError("Gemini API rate limit exceeded")
         # Provider messages can contain response details. Error class names are
         # enough to diagnose which stages failed without exposing those details.
         return GeminiError(
@@ -683,14 +812,47 @@ class GeminiFallback:
         except OSError:
             return False
 
+    async def _run_primary(
+        self,
+        operation: Awaitable[Any],
+        *,
+        reserve_for_fallback: bool,
+    ) -> Any:
+        """Bound primary work so an executable CLI retains part of the deadline."""
+
+        if not reserve_for_fallback:
+            return await operation
+        reserve = min(
+            self._MAX_FALLBACK_RESERVE_SECONDS,
+            self.timeout_seconds * self._FALLBACK_RESERVE_FRACTION,
+        )
+        primary_budget = self.timeout_seconds - reserve
+        try:
+            async with asyncio.timeout(primary_budget):
+                return await operation
+        except TimeoutError:
+            if _RATE_LIMIT_OBSERVED.get():
+                raise GeminiRateLimitError(
+                    "Gemini API rate limit exceeded"
+                ) from None
+            raise GeminiError("Gemini primary provider timed out") from None
+
     async def _with_deadline(self, operation: Awaitable[Any]) -> Any:
         """Run the complete primary-to-fallback chain under one time budget."""
 
+        rate_limit_token = _RATE_LIMIT_OBSERVED.set(False)
         try:
-            async with asyncio.timeout(self.timeout_seconds):
-                return await operation
-        except TimeoutError:
-            raise GeminiError("Gemini provider chain timed out") from None
+            try:
+                async with asyncio.timeout(self.timeout_seconds):
+                    return await operation
+            except TimeoutError:
+                if _RATE_LIMIT_OBSERVED.get():
+                    raise GeminiRateLimitError(
+                        "Gemini API rate limit exceeded"
+                    ) from None
+                raise GeminiError("Gemini provider chain timed out") from None
+        finally:
+            _RATE_LIMIT_OBSERVED.reset(rate_limit_token)
 
     async def validate(self) -> None:
         try:
@@ -728,14 +890,18 @@ class GeminiFallback:
         account: str,
     ) -> dict[str, Any]:
         if self._primary_available:
+            fallback_available = self._fallback_available()
             try:
-                return await self.primary.extract_event(
-                    transcript,
-                    reference_time=reference_time,
-                    account=account,
+                return await self._run_primary(
+                    self.primary.extract_event(
+                        transcript,
+                        reference_time=reference_time,
+                        account=account,
+                    ),
+                    reserve_for_fallback=fallback_available,
                 )
             except GeminiError as primary_error:
-                if not self._fallback_available():
+                if not fallback_available:
                     raise primary_error
                 try:
                     return await self.fallback.extract_event(
@@ -796,13 +962,17 @@ class GeminiFallback:
             "history_steps": history_steps,
         }
         if self._primary_available:
+            fallback_available = self._fallback_available()
             try:
-                return await self.primary.plan_calendar_actions(
-                    transcript,
-                    **arguments,
+                return await self._run_primary(
+                    self.primary.plan_calendar_actions(
+                        transcript,
+                        **arguments,
+                    ),
+                    reserve_for_fallback=fallback_available,
                 )
             except GeminiError as primary_error:
-                if not self._fallback_available():
+                if not fallback_available:
                     raise primary_error
                 try:
                     return await self.fallback.plan_calendar_actions(

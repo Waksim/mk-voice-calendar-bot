@@ -179,6 +179,31 @@ def test_create_operation_requires_and_normalizes_a_complete_event():
     assert plan["operations"][0]["recurrence_scope"] is None
 
 
+def test_two_recurring_series_accept_distinct_meeting_links():
+    payload = operation_plan(
+        update_operation(
+            "e1",
+            patch={"description": "https://meet.example/daily-a?token=one"},
+            recurrence_scope="series",
+        ),
+        update_operation(
+            "e2",
+            patch={"description": "https://meet.example/daily-b?token=two"},
+            recurrence_scope="series",
+        ),
+    )
+
+    plan = validate_calendar_operation_plan(payload, {"e1", "e2"})
+
+    assert [
+        operation["patch"]["description"]
+        for operation in plan["operations"]
+    ] == [
+        "https://meet.example/daily-a?token=one",
+        "https://meet.example/daily-b?token=two",
+    ]
+
+
 def test_create_operation_rejects_partial_event_and_target_id():
     partial = {"title": "Недостаточно полей"}
     payload = operation_plan(create_operation(partial))

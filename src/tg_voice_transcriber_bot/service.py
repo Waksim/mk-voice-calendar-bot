@@ -36,6 +36,7 @@ from .gemini import (
     GeminiError,
     GeminiFallback,
     GeminiProvider,
+    GeminiRateLimitError,
 )
 from .intent import format_calendar_preview
 from .operations import (
@@ -606,6 +607,11 @@ def _gemini_timed_out(exc: GeminiError) -> bool:
 
 
 def _gemini_failure_copy(exc: GeminiError, *, matching: bool = False) -> str:
+    if isinstance(exc, GeminiRateLimitError):
+        return (
+            "Gemini отклонила запрос из-за временного лимита или исчерпанной "
+            "квоты API. Подождите немного и повторите команду."
+        )
     if _gemini_timed_out(exc):
         return (
             "Gemini не успела обработать команду за отведённое время. "

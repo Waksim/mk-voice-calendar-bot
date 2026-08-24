@@ -137,6 +137,89 @@ def _conversation_key(account: str, chat_id: int) -> str:
     return f"{account}:{chat_id}"
 
 
+def _conversation_turn(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a durable journal record into bounded conversation metadata."""
+
+    return {
+        "source_key": str(record["source_key"]),
+        "operation_id": record["operation_id"],
+        "user_message": record.get("transcript"),
+        "assistant_message": record.get("assistant_text"),
+        "stage": record.get("stage"),
+        "occurred_at": record.get("updated_at") or record.get("created_at"),
+        "actions": [
+            {
+                "type": item.get("type"),
+                "event_id": (
+                    (
+                        item.get("undo_after")
+                        if record.get("stage") == "undone"
+                        else None
+                    )
+                    or item.get("after")
+                    or item.get("before")
+                    or {}
+                ).get("event_id")
+                if isinstance(item, dict)
+                else None,
+            }
+            for item in record.get("items", [])
+            if isinstance(item, Mapping)
+        ],
+        "displayed_candidates": (
+            [
+                {
+                    "event_id": candidate.get("event_id"),
+                    "display_index": candidate.get("display_index"),
+                }
+                for candidate in record.get("displayed_candidates", [])
+                if isinstance(candidate, Mapping) and candidate.get("event_id")
+            ]
+            if isinstance(record.get("displayed_candidates"), list)
+            else None
+        ),
+    }
+
+
+def _is_recoverable_mutation(record: Mapping[str, Any]) -> bool:
+    """Return whether a completed journal record is useful follow-up memory."""
+
+    if record.get("stage") not in {"applied", "undone"}:
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and item.get("type") in {"create", "update", "delete"}
+        for item in record.get("items", [])
+    )
+
+
+def _turn_order(turn: Mapping[str, Any], fallback: int) -> tuple[int, int]:
+    """Order Telegram turns without depending on JSON object key order."""
+
+    occurred_at = turn.get("occurred_at")
+    if isinstance(occurred_at, str):
+        try:
+            normalized = (
+                occurred_at[:-1] + "+00:00"
+                if occurred_at.endswith("Z")
+                else occurred_at
+            )
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                return (2, int(parsed.timestamp() * 1_000_000))
+        except ValueError:
+            pass
+
+    source_key = str(turn.get("source_key") or "")
+    prefix = "telegram-update:"
+    if source_key.startswith(prefix):
+        try:
+            return (1, int(source_key.removeprefix(prefix)))
+        except ValueError:
+            pass
+    return (0, fallback)
+
+
 def _mapping(value: Any) -> dict[str, Any]:
     if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
@@ -906,50 +989,19 @@ class OperationStore:
         carries opaque thought signatures into unrelated user commands.
         """
 
+        # Smalltalk must not evict the calendar actions needed to interpret a
+        # follow-up such as "добавь ссылки к обоим этим дейликам".  The full
+        # ignored record is still retained in the durable operation journal.
+        if record.get("stage") == "ignored":
+            return
+
         conversation_key = str(record["conversation_key"])
         conversation = self._data["conversations"].setdefault(
             conversation_key, {"turns": []}
         )
         turns = conversation.setdefault("turns", [])
         source_key = str(record["source_key"])
-        turn = {
-            "source_key": source_key,
-            "operation_id": record["operation_id"],
-            "user_message": record.get("transcript"),
-            "assistant_message": record.get("assistant_text"),
-            "stage": record.get("stage"),
-            "actions": [
-                {
-                    "type": item.get("type"),
-                    "event_id": (
-                        (
-                            item.get("undo_after")
-                            if record.get("stage") == "undone"
-                            else None
-                        )
-                        or item.get("after")
-                        or item.get("before")
-                        or {}
-                    ).get("event_id")
-                    if isinstance(item, dict)
-                    else None,
-                }
-                for item in record.get("items", [])
-                if isinstance(item, Mapping)
-            ],
-            "displayed_candidates": (
-                [
-                    {
-                        "event_id": candidate.get("event_id"),
-                        "display_index": candidate.get("display_index"),
-                    }
-                    for candidate in record.get("displayed_candidates", [])
-                    if isinstance(candidate, Mapping) and candidate.get("event_id")
-                ]
-                if isinstance(record.get("displayed_candidates"), list)
-                else None
-            ),
-        }
+        turn = _conversation_turn(record)
         turns[:] = [item for item in turns if item.get("source_key") != source_key]
         turns.append(turn)
         del turns[:-_MAX_TURNS]
@@ -961,13 +1013,120 @@ class OperationStore:
         chat_id: int,
         now: datetime,
         timezone_name: str,
+        owner_user_id: int | None = None,
     ) -> OperationContext:
         scope_events = self._data["events"].get(self._scope(account), {})
-        turns = deepcopy(
-            self._data["conversations"]
-            .get(_conversation_key(account, chat_id), {})
-            .get("turns", [])[-_MAX_TURNS:]
+        conversation_key = _conversation_key(account, chat_id)
+        expected_owner_user_id = (
+            chat_id if owner_user_id is None else owner_user_id
         )
+        persisted_turns = deepcopy(
+            self._data["conversations"]
+            .get(conversation_key, {})
+            .get("turns", [])
+        )
+
+        # Older state files may already have lost a mutation turn because an
+        # ignored greeting occupied one of the two conversation slots.  The
+        # durable operation journal is authoritative enough to recover the
+        # two latest completed mutation turns, provided every ownership field
+        # matches this exact conversation.  We never scan the shared event
+        # cache for candidates: only event IDs named by those selected turns
+        # can become aliases below.
+        all_records_by_source: dict[str, Mapping[str, Any]] = {}
+        all_records_by_operation_id: dict[str, Mapping[str, Any]] = {}
+        owned_records: dict[str, Mapping[str, Any]] = {}
+        owned_records_by_operation_id: dict[str, Mapping[str, Any]] = {}
+        for raw_record in self._data["operations"].values():
+            if not isinstance(raw_record, Mapping):
+                continue
+            source_key = str(raw_record.get("source_key") or "")
+            operation_id = str(raw_record.get("operation_id") or "")
+            if source_key:
+                all_records_by_source[source_key] = raw_record
+            if operation_id:
+                all_records_by_operation_id[operation_id] = raw_record
+            if (
+                raw_record.get("conversation_key") != conversation_key
+                or raw_record.get("account") != account
+                or raw_record.get("chat_id") != chat_id
+                or raw_record.get("owner_user_id") != expected_owner_user_id
+            ):
+                continue
+            if source_key:
+                owned_records[source_key] = raw_record
+            if operation_id:
+                owned_records_by_operation_id[operation_id] = raw_record
+
+        selected_by_identity: dict[str, tuple[int, dict[str, Any]]] = {}
+        sequence = 0
+        for raw_turn in persisted_turns:
+            if not isinstance(raw_turn, Mapping) or raw_turn.get("stage") == "ignored":
+                continue
+            source_key = str(raw_turn.get("source_key") or "")
+            if not source_key:
+                continue
+            operation_id = str(raw_turn.get("operation_id") or "")
+            journal_record = owned_records.get(source_key)
+            # If a journal record exists, accept its compact turn only after
+            # the ownership checks above.  Unknown legacy compact turns remain
+            # scoped by their conversation bucket.
+            if (
+                journal_record is None
+                and source_key in all_records_by_source
+            ):
+                continue
+            if (
+                journal_record is None
+                and operation_id in all_records_by_operation_id
+                and operation_id not in owned_records_by_operation_id
+            ):
+                continue
+
+            # A compact source turn may predate an Undo which updated its
+            # durable journal record.  When source ownership matches, rebuild
+            # stage/actions/time from that authoritative record rather than
+            # replaying stale "applied" metadata.
+            selected_turn = (
+                _conversation_turn(journal_record)
+                if journal_record is not None
+                else deepcopy(dict(raw_turn))
+            )
+            selected_operation_id = str(selected_turn.get("operation_id") or "")
+            identity = (
+                f"operation:{selected_operation_id}"
+                if selected_operation_id
+                else f"source:{source_key}"
+            )
+            previous = selected_by_identity.get(identity)
+            if previous is None or _turn_order(
+                selected_turn, sequence
+            ) >= _turn_order(previous[1], previous[0]):
+                selected_by_identity[identity] = (sequence, selected_turn)
+            sequence += 1
+
+        for source_key, record in owned_records.items():
+            if not _is_recoverable_mutation(record):
+                continue
+            operation_id = str(record.get("operation_id") or "")
+            identity = (
+                f"operation:{operation_id}"
+                if operation_id
+                else f"source:{source_key}"
+            )
+            # An explicit persisted Undo turn uses a synthetic source key but
+            # retains the original operation ID.  Do not recover the original
+            # source as a second semantic turn and evict another event.
+            selected_by_identity.setdefault(
+                identity, (sequence, _conversation_turn(record))
+            )
+            sequence += 1
+
+        ordered_turns = sorted(
+            selected_by_identity.values(),
+            key=lambda selected: _turn_order(selected[1], selected[0]),
+        )
+        turns = [turn for _sequence, turn in ordered_turns[-_MAX_TURNS:]]
 
         # Candidate order is deterministic: first preserve the exact order of
         # the most recently displayed list, then append active events touched
@@ -1141,9 +1300,20 @@ class CalendarOperationPipeline:
         self._lock = asyncio.Lock()
 
     def context(
-        self, *, account: str, chat_id: int, now: datetime
+        self,
+        *,
+        account: str,
+        chat_id: int,
+        now: datetime,
+        owner_user_id: int | None = None,
     ) -> OperationContext:
-        return self.store.context(account, chat_id, now, self.timezone_name)
+        return self.store.context(
+            account,
+            chat_id,
+            now,
+            self.timezone_name,
+            owner_user_id,
+        )
 
     def mark_undo_notified(self, operation_id: str) -> None:
         """Persist that the separate Telegram undo result reached the owner."""
@@ -1269,7 +1439,12 @@ class CalendarOperationPipeline:
                         )
                     )
 
-            context = self.context(account=account, chat_id=chat_id, now=reference_time)
+            context = self.context(
+                account=account,
+                chat_id=chat_id,
+                now=reference_time,
+                owner_user_id=owner_user_id,
+            )
             trusted_event_ids = (
                 context.allowed_event_ids
                 if allowed_event_ids is None

@@ -16,7 +16,7 @@ from tg_voice_transcriber_bot.calendar import (
     UpdatedCalendarEvent,
 )
 from tg_voice_transcriber_bot.config import Config
-from tg_voice_transcriber_bot.gemini import GeminiApiError
+from tg_voice_transcriber_bot.gemini import GeminiApiError, GeminiRateLimitError
 from tg_voice_transcriber_bot.operations import (
     CalendarOperationError,
     CalendarOperationPipeline,
@@ -979,6 +979,159 @@ def test_two_recent_creates_are_directly_editable_by_alias_without_calendar_read
     assert by_title["Второй дейлик"].location == "Ссылка 2"
 
 
+def test_two_recurring_dailies_survive_ignored_greeting_and_receive_distinct_links(
+    tmp_path,
+):
+    first_url = "https://meet.example/daily-a?token=one"
+    second_url = "https://meet.example/daily-b?token=two"
+    rrule = "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+    first = create_plan(metadata=False)
+    first["operations"][0]["event"] = calendar_event(
+        title="Дейлик A",
+        start_at="2026-08-24T10:50:00+03:00",
+        end_at="2026-08-24T11:30:00+03:00",
+        description=None,
+        recurrence_rrule=rrule,
+    )
+    second = create_plan(metadata=False)
+    second["operations"][0]["event"] = calendar_event(
+        title="Дейлик B",
+        start_at="2026-08-24T11:30:00+03:00",
+        end_at="2026-08-24T12:00:00+03:00",
+        description=None,
+        recurrence_rrule=rrule,
+    )
+    ignored = {
+        "action": "ignore",
+        "operations": [],
+        "lookup": None,
+        "clarification_question": None,
+        "confidence": 1.0,
+    }
+
+    def dynamic_plan(call_number, _transcript, kwargs):
+        if call_number == 1:
+            return first
+        if call_number == 2:
+            return second
+        if call_number == 3:
+            return ignored
+        candidates = kwargs["application_state"]["candidate_events"]
+        refs_by_title = {
+            candidate["title"]: candidate["event_id"]
+            for candidate in candidates
+        }
+        return {
+            "action": "execute",
+            "operations": [
+                {
+                    "type": "update",
+                    "target_event_id": refs_by_title["Дейлик A"],
+                    "recurrence_scope": "series",
+                    "event": None,
+                    "patch": {"description": first_url},
+                    "clear_fields": [],
+                },
+                {
+                    "type": "update",
+                    "target_event_id": refs_by_title["Дейлик B"],
+                    "recurrence_scope": "series",
+                    "event": None,
+                    "patch": {"description": second_url},
+                    "clear_fields": [],
+                },
+            ],
+            "lookup": None,
+            "clarification_question": None,
+            "confidence": 1.0,
+        }
+
+    async def scenario():
+        bot = FakeBot()
+        calendar = FakeCalendar()
+        gemini = FakeGemini(dynamic=dynamic_plan)
+        service, _state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+        )
+        await process_text(
+            service,
+            "Создай дейлик A по будням с 10:50 до 11:30",
+            update_id=840,
+            bot_message_id=840,
+        )
+        await process_text(
+            service,
+            "Создай дейлик B по будням с 11:30 до 12:00",
+            update_id=841,
+            bot_message_id=841,
+        )
+        await process_text(
+            service,
+            "Привет",
+            update_id=842,
+            bot_message_id=842,
+        )
+        before_by_title = {
+            event.title: event for event in calendar.events.values()
+        }
+        calendar.calls.clear()
+        await process_text(
+            service,
+            (
+                "Теперь к обоим этим дейликам добавь ссылки соответственно:\n\n"
+                f"10:50 (Дейлик A) {first_url}\n\n"
+                f"11:30 (Дейлик B) {second_url}"
+            ),
+            update_id=843,
+            bot_message_id=843,
+        )
+        return bot, calendar, gemini, before_by_title
+
+    bot, calendar, gemini, before_by_title = asyncio.run(scenario())
+
+    context = gemini.calls[3][1]
+    candidates = context["application_state"]["candidate_events"]
+    assert [(candidate["event_id"], candidate["title"]) for candidate in candidates] == [
+        ("e1", "Дейлик B"),
+        ("e2", "Дейлик A"),
+    ]
+    assert all(candidate["recurring"] is True for candidate in candidates)
+    assert all(candidate["recurrence_rrule"] == rrule for candidate in candidates)
+    assert [turn["user_message"] for turn in context["recent_conversation"]] == [
+        "Создай дейлик A по будням с 10:50 до 11:30",
+        "Создай дейлик B по будням с 11:30 до 12:00",
+    ]
+    assert [call[0] for call in calendar.calls] == [
+        "get",
+        "get",
+        "update",
+        "update",
+    ]
+    update_calls = [call for call in calendar.calls if call[0] == "update"]
+    assert [call[3] for call in update_calls] == [
+        {"description": first_url},
+        {"description": second_url},
+    ]
+
+    after_by_title = {event.title: event for event in calendar.events.values()}
+    assert after_by_title["Дейлик A"].description == first_url
+    assert after_by_title["Дейлик B"].description == second_url
+    for title in ("Дейлик A", "Дейлик B"):
+        before = before_by_title[title]
+        after = after_by_title[title]
+        assert (after.start_at, after.end_at, after.recurrence_rrules) == (
+            before.start_at,
+            before.end_at,
+            before.recurrence_rrules,
+        )
+    assert "✏️ <b>Событие обновлено</b>" in bot.edited_html[-1]["html"]
+    assert "Не удалось" not in bot.edited_html[-1]["html"]
+
+
 def test_unknown_model_event_alias_is_rejected_before_calendar_access(tmp_path):
     async def scenario():
         calendar = FakeCalendar()
@@ -1045,6 +1198,45 @@ def test_gemini_timeout_has_specific_copy_and_safe_diagnostic_log(
     assert "error_type=GeminiApiError" in caplog.text
     assert "error=Gemini API transport error: ReadTimeout" in caplog.text
     assert "elapsed=" in caplog.text
+
+
+def test_gemini_rate_limit_has_honest_copy_and_does_not_mutate_calendar(
+    tmp_path, caplog
+):
+    class RateLimitedGemini(FakeGemini):
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            self.calls.append((transcript, kwargs))
+            raise GeminiRateLimitError("Gemini API rate limit exceeded")
+
+    async def scenario():
+        calendar = FakeCalendar()
+        bot = FakeBot()
+        service, state, pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=RateLimitedGemini(),
+            calendar=calendar,
+        )
+        await process_text(
+            service,
+            "Добавь ссылки к обоим дейликам",
+            update_id=186,
+            bot_message_id=606,
+        )
+        return bot, calendar, state, pipeline
+
+    with caplog.at_level("WARNING", logger="tg_voice_transcriber_bot"):
+        bot, calendar, state, pipeline = asyncio.run(scenario())
+
+    final_html = bot.edited_html[-1]["html"]
+    assert "из-за временного лимита или исчерпанной квоты API" in final_html
+    assert "не смогла надёжно разобрать" not in final_html
+    assert calendar.calls == []
+    assert pipeline.store.find_by_source("telegram-update:186") is None
+    assert state.job(186)["status"] == "sent"
+    assert "error_type=GeminiRateLimitError" in caplog.text
+    assert "Gemini API rate limit exceeded" in caplog.text
 
 
 def test_intermediate_status_edit_failure_does_not_block_calendar_mutation(tmp_path):
