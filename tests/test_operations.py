@@ -11,14 +11,18 @@ import pytest
 from tg_voice_transcriber_bot.calendar import (
     CalendarConnectionError,
     CalendarEventSnapshot,
+    CalendarStateConflictError,
     CalendarWriteRejectedError,
     CreatedCalendarEvent,
     DeletedCalendarEvent,
+    UpdatedCalendarEvent,
 )
 from tg_voice_transcriber_bot.operations import (
     CalendarOperationError,
     CalendarOperationPipeline,
+    OperationStateError,
     OperationStore,
+    _materially_equivalent,
     _snapshot,
 )
 
@@ -46,6 +50,7 @@ def plan(*operations, confidence=0.95):
     return {
         "action": "execute",
         "operations": list(operations),
+        "lookup": None,
         "clarification_question": None,
         "confidence": confidence,
     }
@@ -55,6 +60,7 @@ def create_op(payload=None):
     return {
         "type": "create",
         "target_event_id": None,
+        "recurrence_scope": None,
         "event": payload or event(),
         "patch": None,
         "clear_fields": [],
@@ -62,12 +68,19 @@ def create_op(payload=None):
 
 
 def update_op(event_id, patch, clear_fields=None):
+    cleared = list(clear_fields or [])
     return {
         "type": "update",
         "target_event_id": event_id,
+        "recurrence_scope": (
+            "series"
+            if "recurrence_rrule" in patch
+            or "recurrence_rrule" in cleared
+            else None
+        ),
         "event": None,
         "patch": patch,
-        "clear_fields": list(clear_fields or []),
+        "clear_fields": cleared,
     }
 
 
@@ -75,6 +88,7 @@ def delete_op(event_id):
     return {
         "type": "delete",
         "target_event_id": event_id,
+        "recurrence_scope": None,
         "event": None,
         "patch": None,
         "clear_fields": [],
@@ -161,28 +175,58 @@ class FakeCalendar:
         self.calls.append(("get", event_id))
         return self.events[event_id]
 
-    async def update_event(self, *, account, event_id, patch, idempotency_key):
+    async def update_event(
+        self,
+        *,
+        account,
+        event_id,
+        patch,
+        idempotency_key,
+        expected_current=None,
+    ):
         self.calls.append(("update", event_id, dict(patch), idempotency_key))
         before = self.events[event_id]
+        if expected_current is not None and replace(
+            before, updated_at=None, html_link=None
+        ) != replace(expected_current, updated_at=None, html_link=None):
+            raise CalendarStateConflictError
         updates = {}
         for key, value in patch.items():
             if key in {"description", "location"} and value == "":
                 value = None
+            if key == "recurrence_rrules":
+                value = tuple(value)
             updates[key] = value
         if "start_at" in updates:
             updates["all_day"] = len(str(updates["start_at"])) == 10
         result = replace(before, **updates)
         self.events[event_id] = result
-        return result
+        return UpdatedCalendarEvent(
+            previous=before,
+            current=result,
+            already_applied=result == before,
+        )
 
-    async def delete_event(self, *, account, event_id, idempotency_key):
+    async def delete_event(
+        self,
+        *,
+        account,
+        event_id,
+        idempotency_key,
+        expected_current=None,
+    ):
         self.calls.append(("delete", event_id, idempotency_key))
         previous = self.events[event_id]
+        if expected_current is not None and replace(
+            previous, updated_at=None, html_link=None
+        ) != replace(expected_current, updated_at=None, html_link=None):
+            raise CalendarStateConflictError
         cancelled = replace(previous, status="cancelled")
         self.events[event_id] = cancelled
         return DeletedCalendarEvent(
             previous=previous,
             current=cancelled,
+            already_deleted=previous.status == "cancelled",
             verified_cancelled=True,
         )
 
@@ -197,6 +241,20 @@ def apply(
     allowed_event_ids=None,
     displayed_candidates=None,
 ):
+    if allowed_event_ids is None:
+        # These unit scenarios often model a provider lookup by calling
+        # observe_lookup_events directly. In production the service passes the
+        # real IDs returned by that lookup into apply_plan explicitly.
+        trusted_targets = []
+        for operation in operation_plan.get("operations", []):
+            target = operation.get("target_event_id")
+            if not isinstance(target, str) or target in trusted_targets:
+                continue
+            entry = pipeline.store.event_entry(account, target)
+            if isinstance(entry, dict) and entry.get("active") is True:
+                trusted_targets.append(target)
+        if trusted_targets:
+            allowed_event_ids = tuple(trusted_targets)
     return pipeline.apply_plan(
         source_update_id=source_id,
         account=account,
@@ -212,7 +270,14 @@ def apply(
     )
 
 
-def test_legacy_confirmations_seed_exact_known_ids_without_inventing_transcript(tmp_path):
+def expire_cached_event(pipeline, account, event_id):
+    scope = pipeline.store._scope(account)
+    pipeline.store._data["events"][scope][event_id]["updated_at"] = (
+        "2000-01-01T00:00:00+00:00"
+    )
+
+
+def test_legacy_confirmation_does_not_leak_global_candidates_into_fresh_chat(tmp_path):
     legacy = tmp_path / "calendar-confirmations.json"
     legacy.write_text(
         json.dumps(
@@ -249,10 +314,9 @@ def test_legacy_confirmations_seed_exact_known_ids_without_inventing_transcript(
     store = OperationStore(path, legacy)
     context = store.context("work", OWNER + 1, NOW, "Europe/Moscow")
 
-    assert context.allowed_event_ids == ("known-google-id",)
-    assert context.application_state["candidate_events"][0]["start_at"].endswith(
-        "17:30:00+03:00"
-    )
+    assert context.allowed_event_ids == ()
+    assert context.event_id_by_ref == {}
+    assert context.application_state["candidate_events"] == []
     assert context.recent_conversation == ()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -351,11 +415,242 @@ def test_recent_actions_are_isolated_per_telegram_conversation(tmp_path):
 
     event_id, personal, work = asyncio.run(scenario())
 
-    assert personal.application_state["recent_actions"][0]["operation_id"]
-    assert work.application_state["recent_actions"] == []
-    # Provider events remain shared so the other profile can still discover
-    # and target the event explicitly instead of inheriting invisible chat history.
-    assert event_id in work.allowed_event_ids
+    assert personal.allowed_event_ids == (event_id,)
+    assert personal.event_id_by_ref == {"e1": event_id}
+    assert personal.recent_conversation[-1]["actions"] == [
+        {"type": "create", "event_id": "e1"}
+    ]
+    assert "recent_actions" not in personal.application_state
+    # Calendar provider state may be shared, but implicit conversation memory
+    # never crosses Telegram chats/accounts.
+    assert work.allowed_event_ids == ()
+    assert work.recent_conversation == ()
+
+
+def test_last_two_created_events_are_compact_editable_aliases(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        store = OperationStore(tmp_path / "ops.json")
+        pipeline = CalendarOperationPipeline(store, calendar)
+        first = await apply(
+            pipeline,
+            12,
+            plan(create_op(event(title="Первый дейлик"))),
+        )
+        second = await apply(
+            pipeline,
+            13,
+            plan(
+                create_op(
+                    event(
+                        title="Второй дейлик",
+                        start_at="2026-08-24T18:30:00+03:00",
+                        end_at="2026-08-24T19:00:00+03:00",
+                    )
+                )
+            ),
+        )
+        return first, second, store, pipeline.context(
+            account="personal", chat_id=OWNER, now=NOW
+        )
+
+    first, second, store, context = asyncio.run(scenario())
+    first_id = first.record["items"][0]["after"]["event_id"]
+    second_id = second.record["items"][0]["after"]["event_id"]
+
+    # The newest displayed result is first; the preceding touched event is
+    # appended deterministically and both remain server-authorized.
+    assert context.allowed_event_ids == (second_id, first_id)
+    assert context.event_id_by_ref == {"e1": second_id, "e2": first_id}
+    assert [
+        (candidate["event_id"], candidate["title"])
+        for candidate in context.application_state["candidate_events"]
+    ] == [("e1", "Второй дейлик"), ("e2", "Первый дейлик")]
+    assert context.application_state["allowed_event_ids"] == ["e1", "e2"]
+    assert context.recent_conversation[0]["actions"] == [
+        {"type": "create", "event_id": "e2"}
+    ]
+    assert context.recent_conversation[1]["actions"] == [
+        {"type": "create", "event_id": "e1"}
+    ]
+    assert context.history_steps == ()
+    assert all(
+        set(action) <= {"type", "event_id"}
+        for turn in context.recent_conversation
+        for action in turn["actions"]
+    )
+
+    persisted_turns = store._data["conversations"][f"personal:{OWNER}"]["turns"]
+    assert all("interaction_input" not in turn for turn in persisted_turns)
+    assert all("interaction_steps" not in turn for turn in persisted_turns)
+    # The durable operation journal remains complete for recovery/debugging.
+    assert store.get(first.operation_id)["interaction_input"] is not None
+    assert store.get(first.operation_id)["items"][0]["after"]["event_id"] == first_id
+
+
+def test_model_context_is_bounded_and_never_contains_event_snapshots(tmp_path):
+    store = OperationStore(tmp_path / "ops.json")
+    snapshots = store.observe_events(
+        "personal",
+        [
+            provider_event(
+                f"provider-id-{index}-" + "z" * 200,
+                title=f"Событие {index} " + "т" * 1_000,
+                description="д" * 50_000,
+                location="л" * 5_000,
+            )
+            for index in range(12)
+        ],
+    )
+
+    def append_fixture_turn(index, selected, *, displayed=None):
+        store.append_turn(
+            {
+                "conversation_key": f"personal:{OWNER}",
+                "source_key": f"telegram-update:{index}",
+                "operation_id": f"operation-{index}",
+                "transcript": "к" * 50_000,
+                "assistant_text": "а" * 50_000,
+                "stage": "applied",
+                "items": [
+                    {"type": "update", "before": snapshot, "after": snapshot}
+                    for snapshot in selected
+                ],
+                "displayed_candidates": displayed,
+                "interaction_input": {"opaque": "x" * 100_000},
+                "interaction_steps": [{"thought_signature": "y" * 100_000}],
+            }
+        )
+
+    append_fixture_turn(1, snapshots[:6])
+    append_fixture_turn(2, snapshots[6:], displayed=list(snapshots[6:]))
+    context = store.context("personal", OWNER, NOW, "Europe/Moscow")
+    model_payload = json.dumps(
+        {
+            "application_state": context.application_state,
+            "recent_conversation": context.recent_conversation,
+            "history_steps": context.history_steps,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    assert len(context.application_state["candidate_events"]) == 12
+    assert len(context.event_id_by_ref) == 12
+    assert len(model_payload.encode("utf-8")) < 40_000
+    assert "thought_signature" not in model_payload
+    assert '"before"' not in model_payload
+    assert '"after"' not in model_payload
+    assert "provider-id-" not in model_payload
+    assert set(context.application_state) == {
+        "allowed_event_ids",
+        "candidate_events",
+        "lookup_permitted",
+    }
+
+
+def test_model_context_normalizes_mismatched_offset_to_requested_timezone(tmp_path):
+    store = OperationStore(tmp_path / "ops.json")
+    observed = store.observe_events(
+        "personal",
+        [
+            provider_event(
+                "mismatched-offset",
+                start_at="2026-08-24T10:30:00+02:00",
+                end_at="2026-08-24T11:00:00+02:00",
+                timezone="Europe/Moscow",
+            )
+        ],
+    )[0]
+    store.append_turn(
+        {
+            "conversation_key": f"personal:{OWNER}",
+            "source_key": "telegram-update:14",
+            "operation_id": "operation-14",
+            "transcript": "Измени это событие",
+            "assistant_text": None,
+            "stage": "applied",
+            "items": [{"type": "update", "before": observed, "after": observed}],
+            "displayed_candidates": [observed],
+        }
+    )
+
+    candidate = store.context(
+        "personal", OWNER, NOW, "Europe/Moscow"
+    ).application_state["candidate_events"][0]
+    assert candidate["start_at"] == "2026-08-24T11:30:00+03:00"
+    assert candidate["end_at"] == "2026-08-24T12:00:00+03:00"
+    assert candidate["timezone"] == "Europe/Moscow"
+
+
+def test_recurring_instance_alias_keeps_master_id_server_side(tmp_path):
+    store = OperationStore(tmp_path / "ops.json")
+    instance = store.observe_events(
+        "personal",
+        [
+            provider_event(
+                "provider-instance-secret",
+                recurring_event_id="provider-master-secret",
+                original_start_at="2026-08-24T10:50:00+03:00",
+            )
+        ],
+    )[0]
+    store.append_turn(
+        {
+            "conversation_key": f"personal:{OWNER}",
+            "source_key": "telegram-update:15",
+            "operation_id": "operation-15",
+            "transcript": "Покажи дейлик",
+            "assistant_text": "Показано одно событие",
+            "stage": "read",
+            "items": [{"type": "read", "after": instance}],
+            "displayed_candidates": [instance],
+        }
+    )
+
+    context = store.context("personal", OWNER, NOW, "Europe/Moscow")
+    serialized = json.dumps(context.application_state, ensure_ascii=False)
+
+    assert context.event_id_by_ref == {"e1": "provider-instance-secret"}
+    assert context.series_event_id_by_ref == {"e1": "provider-master-secret"}
+    assert context.allowed_event_ids == (
+        "provider-instance-secret",
+        "provider-master-secret",
+    )
+    assert context.application_state["candidate_events"][0]["recurring"] is True
+    assert context.application_state["candidate_events"][0][
+        "recurring_instance"
+    ] is True
+    assert "provider-instance-secret" not in serialized
+    assert "provider-master-secret" not in serialized
+
+
+def test_legacy_conversation_history_loads_but_is_not_replayed(tmp_path):
+    async def seed():
+        store = OperationStore(tmp_path / "ops.json")
+        pipeline = CalendarOperationPipeline(store, FakeCalendar())
+        created = await apply(pipeline, 15, plan(create_op()))
+        turn = store._data["conversations"][f"personal:{OWNER}"]["turns"][0]
+        turn["interaction_input"] = {"type": "user_input", "secret": "legacy"}
+        turn["interaction_steps"] = [
+            {"type": "model_output", "thought_signature": "legacy-signature"}
+        ]
+        turn["actions"][0]["before"] = created.record["items"][0]["after"]
+        turn["actions"][0]["after"] = created.record["items"][0]["after"]
+        store._save()
+        return created
+
+    created = asyncio.run(seed())
+    reloaded = OperationStore(tmp_path / "ops.json")
+    context = reloaded.context("personal", OWNER, NOW, "Europe/Moscow")
+
+    assert context.history_steps == ()
+    assert context.recent_conversation[-1]["actions"] == [
+        {"type": "create", "event_id": "e1"}
+    ]
+    assert context.event_id_by_ref == {
+        "e1": created.record["items"][0]["after"]["event_id"]
+    }
 
 
 def test_update_location_keeps_time_and_undo_restores_before_snapshot(tmp_path):
@@ -382,6 +677,346 @@ def test_update_location_keeps_time_and_undo_restores_before_snapshot(tmp_path):
     assert after["end_at"] == before["end_at"]
     assert undone.outcome == "undone"
     assert calendar.events[event_id].location is None
+    assert undone.record["items"][0]["undo_after"]["timezone"] == (
+        "Europe/Moscow"
+    )
+
+
+def test_recurrence_update_preserves_exceptions_and_undo_restores_full_rules(
+    tmp_path,
+):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        provider = provider_event(
+            "recurring-master",
+            recurrence_rrules=(
+                "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+                "EXDATE:20260828T073000Z",
+            ),
+        )
+        calendar.events[provider.event_id] = provider
+        pipeline.observe_lookup_events("personal", [provider])
+        updated = await apply(
+            pipeline,
+            17,
+            plan(
+                update_op(
+                    provider.event_id,
+                    {
+                        "recurrence_rrule": (
+                            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"
+                        )
+                    },
+                )
+            ),
+        )
+        undone = await pipeline.undo(
+            operation_id=updated.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return calendar, updated, undone
+
+    calendar, updated, undone = asyncio.run(scenario())
+
+    assert updated.record["items"][0]["after"]["recurrence_rrules"] == [
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR",
+        "EXDATE:20260828T073000Z",
+    ]
+    assert undone.outcome == "undone"
+    assert calendar.events["recurring-master"].recurrence_rrules == (
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        "EXDATE:20260828T073000Z",
+    )
+    recurrence_patches = [
+        call[2]["recurrence_rrules"]
+        for call in calendar.calls
+        if call[0] == "update" and "recurrence_rrules" in call[2]
+    ]
+    assert recurrence_patches == [
+        ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR", "EXDATE:20260828T073000Z"],
+        [
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            "EXDATE:20260828T073000Z",
+        ],
+    ]
+
+
+def test_clear_recurrence_journals_empty_rules_and_undo_restores_series(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        original_rules = (
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            "EXDATE:20260828T073000Z",
+        )
+        provider = provider_event(
+            "clear-recurring-master", recurrence_rrules=original_rules
+        )
+        calendar.events[provider.event_id] = provider
+        pipeline.observe_lookup_events("personal", [provider])
+        cleared = await apply(
+            pipeline,
+            171,
+            plan(update_op(provider.event_id, {}, ["recurrence_rrule"])),
+        )
+        undone = await pipeline.undo(
+            operation_id=cleared.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return calendar, cleared, undone, original_rules
+
+    calendar, cleared, undone, original_rules = asyncio.run(scenario())
+
+    after = cleared.record["items"][0]["after"]
+    assert after["recurrence_rrule"] is None
+    assert after["recurrence_rrules"] == []
+    assert undone.outcome == "undone"
+    assert calendar.events["clear-recurring-master"].recurrence_rrules == (
+        original_rules
+    )
+
+
+def test_immediate_create_followup_update_skips_discovery_but_refreshes_before(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        created = await apply(pipeline, 18, plan(create_op()))
+        event_id = created.record["items"][0]["after"]["event_id"]
+        calendar.calls.clear()
+        updated = await apply(
+            pipeline,
+            19,
+            plan(update_op(event_id, {"location": "метро Киевская"})),
+        )
+        return calendar, created, updated
+
+    calendar, created, updated = asyncio.run(scenario())
+    assert [call[0] for call in calendar.calls] == ["get", "update"]
+    assert updated.record["items"][0]["before"] == created.record["items"][0]["after"]
+
+
+def test_external_edit_inside_old_cache_window_is_not_a_false_noop_and_undo_is_safe(
+    tmp_path,
+):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        cached = provider_event("externally-edited", location="Кабинет А")
+        calendar.events[cached.event_id] = cached
+        pipeline.observe_lookup_events("personal", [cached])
+        # No artificial cache expiry: this models an edit made immediately in
+        # Google Calendar after the bot observed the event.
+        calendar.events[cached.event_id] = replace(cached, location="Кабинет Б")
+
+        updated = await apply(
+            pipeline,
+            24,
+            plan(update_op(cached.event_id, {"location": "Кабинет А"})),
+        )
+        undone = await pipeline.undo(
+            operation_id=updated.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return calendar, updated, undone
+
+    calendar, updated, undone = asyncio.run(scenario())
+
+    assert updated.record["items"][0]["before"]["location"] == "Кабинет Б"
+    assert updated.record["items"][0]["after"]["location"] == "Кабинет А"
+    assert updated.record["items"][0].get("write_skipped") is not True
+    assert undone.outcome == "undone"
+    assert calendar.events["externally-edited"].location == "Кабинет Б"
+
+
+@pytest.mark.parametrize(
+    ("manual_location", "already_applied"),
+    [("Кабинет А", True), ("Кабинет В", False)],
+)
+def test_update_adapter_snapshot_closes_race_after_pipeline_preflight(
+    tmp_path, manual_location, already_applied
+):
+    class RacingCalendar(FakeCalendar):
+        raced = False
+
+        async def update_event(
+            self,
+            *,
+            account,
+            event_id,
+            patch,
+            idempotency_key,
+            expected_current=None,
+        ):
+            # This edit lands after the pipeline's durable preflight GET but
+            # before the adapter's own provider-fresh read. Do it only on the
+            # forward mutation: Undo has its own separate race tests below.
+            if not self.raced and expected_current is None:
+                self.raced = True
+                self.events[event_id] = replace(
+                    self.events[event_id], location=manual_location
+                )
+            return await super().update_event(
+                account=account,
+                event_id=event_id,
+                patch=patch,
+                idempotency_key=idempotency_key,
+                expected_current=expected_current,
+            )
+
+    async def scenario():
+        calendar = RacingCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        provider = provider_event("preflight-race", location="Кабинет Б")
+        calendar.events[provider.event_id] = provider
+        pipeline.observe_lookup_events("personal", [provider])
+
+        updated = await apply(
+            pipeline,
+            241,
+            plan(update_op(provider.event_id, {"location": "Кабинет А"})),
+        )
+        undone = await pipeline.undo(
+            operation_id=updated.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return calendar, pipeline, updated, undone
+
+    calendar, pipeline, updated, undone = asyncio.run(scenario())
+
+    item = updated.record["items"][0]
+    assert item["before"]["location"] == manual_location
+    assert item["after"]["location"] == "Кабинет А"
+    assert bool(item.get("write_skipped")) is already_applied
+    assert undone.outcome == "undone"
+    assert calendar.events["preflight-race"].location == manual_location
+    entry = pipeline.store.event_entry("personal", "preflight-race")
+    if already_applied:
+        assert entry["last_operation_id"] is None
+
+
+def test_update_replay_that_finds_requested_state_does_not_claim_undo(tmp_path):
+    class LostNoopResponseCalendar(FakeCalendar):
+        def __init__(self):
+            super().__init__()
+            self.lost = False
+
+        async def update_event(
+            self,
+            *,
+            account,
+            event_id,
+            patch,
+            idempotency_key,
+            expected_current=None,
+        ):
+            if not self.lost:
+                self.lost = True
+                # An external actor reaches the requested state after the
+                # journal's preflight. The process then loses the adapter
+                # result before it can persist that this was a no-op.
+                self.events[event_id] = replace(
+                    self.events[event_id], location="Кабинет А"
+                )
+                raise RuntimeError("response lost before no-op was journaled")
+            return await super().update_event(
+                account=account,
+                event_id=event_id,
+                patch=patch,
+                idempotency_key=idempotency_key,
+                expected_current=expected_current,
+            )
+
+    async def scenario():
+        calendar = LostNoopResponseCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        provider = provider_event("replayed-noop", location="Кабинет Б")
+        calendar.events[provider.event_id] = provider
+        pipeline.observe_lookup_events("personal", [provider])
+        operation_plan = plan(
+            update_op(provider.event_id, {"location": "Кабинет А"})
+        )
+        with pytest.raises(CalendarOperationError) as raised:
+            await apply(pipeline, 242, operation_plan)
+        assert raised.value.outcome_uncertain is True
+
+        reconciled = await apply(pipeline, 242, operation_plan)
+        undone = await pipeline.undo(
+            operation_id=reconciled.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return calendar, pipeline, reconciled, undone
+
+    calendar, pipeline, reconciled, undone = asyncio.run(scenario())
+
+    item = reconciled.record["items"][0]
+    assert item["before"]["location"] == "Кабинет А"
+    assert item["after"]["location"] == "Кабинет А"
+    assert item["write_skipped"] is True
+    assert pipeline.store.event_entry("personal", "replayed-noop")[
+        "last_operation_id"
+    ] is None
+    assert undone.outcome == "undone"
+    assert calendar.events["replayed-noop"].location == "Кабинет А"
+
+
+def test_stale_cached_event_falls_back_to_provider_get_before_update(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        provider = provider_event("stale-target")
+        calendar.events[provider.event_id] = provider
+        pipeline.observe_lookup_events("personal", [provider])
+        expire_cached_event(pipeline, "personal", provider.event_id)
+        result = await apply(
+            pipeline,
+            25,
+            plan(update_op(provider.event_id, {"location": "метро Киевская"})),
+        )
+        return calendar, result
+
+    calendar, result = asyncio.run(scenario())
+    assert result.stage == "applied"
+    assert [call[0] for call in calendar.calls] == ["get", "update"]
+
+
+def test_inactive_allowlisted_event_is_rejected_before_provider_call(tmp_path):
+    calendar = FakeCalendar()
+    pipeline = CalendarOperationPipeline(
+        OperationStore(tmp_path / "ops.json"), calendar
+    )
+    inactive = provider_event("inactive-target", status="cancelled")
+    pipeline.observe_lookup_events("personal", [inactive])
+
+    with pytest.raises(OperationStateError, match="not active"):
+        asyncio.run(
+            apply(
+                pipeline,
+                26,
+                plan(delete_op(inactive.event_id)),
+                allowed_event_ids=(inactive.event_id,),
+            )
+        )
+    assert calendar.calls == []
 
 
 def test_low_confidence_execute_is_not_policy_blocked(tmp_path):
@@ -412,7 +1047,7 @@ def test_low_confidence_execute_is_not_policy_blocked(tmp_path):
     assert calendar.events["low-confidence-update"].location == "переговорная А"
 
 
-def test_noop_update_is_applied_without_provider_update_call(tmp_path):
+def test_noop_update_is_verified_and_keeps_undo_as_a_noop(tmp_path):
     async def scenario():
         calendar = FakeCalendar()
         pipeline = CalendarOperationPipeline(
@@ -434,8 +1069,9 @@ def test_noop_update_is_applied_without_provider_update_call(tmp_path):
     assert result.stage == "applied"
     assert result.record["items"][0]["stage"] == "applied"
     assert result.record["items"][0]["after"] == result.record["items"][0]["before"]
-    assert result.record["items"][0].get("provider_write_started_at") is None
-    assert [call[0] for call in calendar.calls] == ["get"]
+    assert result.record["items"][0].get("provider_write_started_at") is not None
+    assert result.record["items"][0]["write_skipped"] is True
+    assert [call[0] for call in calendar.calls] == ["get", "update"]
 
 
 def test_noop_after_real_update_keeps_real_undo_ownership(tmp_path):
@@ -475,7 +1111,7 @@ def test_noop_after_real_update_keeps_real_undo_ownership(tmp_path):
     assert entry_after_noop["last_operation_id"] == real.operation_id
     assert undone.outcome == "undone"
     assert calendar.events["real-then-noop"].location is None
-    assert [call[0] for call in calendar.calls].count("update") == 2
+    assert [call[0] for call in calendar.calls].count("update") == 3
 
 
 def test_write_skipped_item_does_not_participate_in_mixed_undo_freshness(
@@ -686,7 +1322,7 @@ def test_delete_undo_recreates_event_with_a_new_known_id(tmp_path):
         undone = await pipeline.undo(
             operation_id=deleted.operation_id, owner_user_id=OWNER, chat_id=OWNER
         )
-        context = pipeline.context(account="work", chat_id=OWNER + 1, now=NOW)
+        context = pipeline.context(account="personal", chat_id=OWNER, now=NOW)
         return old_id, deleted, deleted_entry, undone, context
 
     old_id, deleted, deleted_entry, undone, context = asyncio.run(scenario())
@@ -694,6 +1330,7 @@ def test_delete_undo_recreates_event_with_a_new_known_id(tmp_path):
     assert undone.outcome == "undone"
     assert old_id not in context.allowed_event_ids
     assert len(context.allowed_event_ids) == 1
+    assert context.event_id_by_ref == {"e1": context.allowed_event_ids[0]}
 
 
 def test_unknown_target_is_rejected_before_any_calendar_write(tmp_path):
@@ -717,6 +1354,7 @@ def test_clarification_is_kept_in_two_turn_history_without_calendar_write(tmp_pa
         clarification = {
             "action": "clarify",
             "operations": [],
+            "lookup": None,
             "clarification_question": "Какую именно планёрку перенести?",
             "confidence": 0.7,
         }
@@ -728,10 +1366,7 @@ def test_clarification_is_kept_in_two_turn_history_without_calendar_write(tmp_pa
     assert result.stage == "clarify"
     assert calendar.calls == []
     assert context.recent_conversation[-1]["assistant_message"].startswith("Какую")
-    assert [step["type"] for step in context.history_steps] == [
-        "user_input",
-        "model_output",
-    ]
+    assert context.history_steps == ()
 
 
 def test_undo_is_blocked_after_a_later_operation_touches_same_event(tmp_path):
@@ -794,6 +1429,144 @@ def test_undo_is_blocked_by_unobserved_provider_edit(tmp_path, action):
 
     assert result.outcome == "blocked"
     assert writes_after_undo == writes_before_undo
+
+
+def test_update_undo_precondition_blocks_edit_after_freshness_get(tmp_path):
+    class UndoRaceCalendar(FakeCalendar):
+        race_on_conditional_update = False
+
+        async def update_event(self, **kwargs):
+            if self.race_on_conditional_update and kwargs.get(
+                "expected_current"
+            ) is not None:
+                event_id = kwargs["event_id"]
+                self.events[event_id] = replace(
+                    self.events[event_id],
+                    location="РУЧНАЯ ПРАВКА ПОСЛЕ ПРОВЕРКИ",
+                )
+                self.race_on_conditional_update = False
+            return await super().update_event(**kwargs)
+
+    async def scenario():
+        calendar = UndoRaceCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        provider = provider_event("undo-update-race", location="До бота")
+        calendar.events[provider.event_id] = provider
+        pipeline.observe_lookup_events("personal", [provider])
+        updated = await apply(
+            pipeline,
+            751,
+            plan(update_op(provider.event_id, {"location": "Изменено ботом"})),
+        )
+        calendar.race_on_conditional_update = True
+        undone = await pipeline.undo(
+            operation_id=updated.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return calendar, undone
+
+    calendar, undone = asyncio.run(scenario())
+
+    assert undone.outcome == "blocked"
+    assert calendar.events["undo-update-race"].location == (
+        "РУЧНАЯ ПРАВКА ПОСЛЕ ПРОВЕРКИ"
+    )
+
+
+def test_update_undo_precondition_preserves_raw_untitled_provider_state(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        provider = provider_event(
+            "untitled-update-undo",
+            title=None,
+            location="До бота",
+        )
+        calendar.events[provider.event_id] = provider
+        pipeline.observe_lookup_events("personal", [provider])
+
+        updated = await apply(
+            pipeline,
+            753,
+            plan(update_op(provider.event_id, {"location": "Изменено ботом"})),
+        )
+        undone = await pipeline.undo(
+            operation_id=updated.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return calendar, updated, undone
+
+    calendar, updated, undone = asyncio.run(scenario())
+
+    assert updated.record["items"][0]["after"]["title"] == "Без названия"
+    assert updated.record["items"][0]["after"]["provider_title"] is None
+    assert undone.outcome == "undone"
+    assert calendar.events["untitled-update-undo"].title is None
+    assert calendar.events["untitled-update-undo"].location == "До бота"
+
+
+def test_legacy_snapshot_title_comparison_is_compatible_but_fail_closed():
+    legacy_named = {"title": "Планёрка", "event_id": "legacy"}
+    current_named = {
+        "title": "Планёрка",
+        "provider_title": "Планёрка",
+        "event_id": "legacy",
+    }
+    assert _materially_equivalent(legacy_named, current_named)
+
+    legacy_untitled = {"title": "Без названия", "event_id": "legacy"}
+    current_untitled = {
+        "title": "Без названия",
+        "provider_title": None,
+        "event_id": "legacy",
+    }
+    assert not _materially_equivalent(legacy_untitled, current_untitled)
+
+
+def test_create_undo_delete_precondition_blocks_late_manual_edit(tmp_path):
+    class UndoDeleteRaceCalendar(FakeCalendar):
+        race_on_conditional_delete = False
+
+        async def delete_event(self, **kwargs):
+            if self.race_on_conditional_delete and kwargs.get(
+                "expected_current"
+            ) is not None:
+                event_id = kwargs["event_id"]
+                self.events[event_id] = replace(
+                    self.events[event_id],
+                    description="РУЧНАЯ ПРАВКА ПОСЛЕ ПРОВЕРКИ",
+                )
+                self.race_on_conditional_delete = False
+            return await super().delete_event(**kwargs)
+
+    async def scenario():
+        calendar = UndoDeleteRaceCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        created = await apply(pipeline, 752, plan(create_op()))
+        event_id = created.record["items"][0]["after"]["event_id"]
+        calendar.race_on_conditional_delete = True
+        undone = await pipeline.undo(
+            operation_id=created.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        return calendar, undone, event_id
+
+    calendar, undone, event_id = asyncio.run(scenario())
+
+    assert undone.outcome == "blocked"
+    assert calendar.events[event_id].status == "confirmed"
+    assert calendar.events[event_id].description == (
+        "РУЧНАЯ ПРАВКА ПОСЛЕ ПРОВЕРКИ"
+    )
 
 
 def test_undo_provider_read_error_is_retryable_without_clearing_marker(tmp_path):
@@ -864,19 +1637,62 @@ def test_record_read_caches_events_and_conversation_without_undo(tmp_path):
     assert context.application_state["candidate_events"][0]["title"] == "Планёрка"
     assert context.recent_conversation[-1] == {
         "user_message": "Что у меня в календаре завтра?",
-        "assistant_message": "Нашёл одно событие.",
         "status": "read",
         "actions": [
             {
                 "type": "read",
-                "event_id": "provider-event",
-                "before": None,
-                "after": result.record["items"][0]["after"],
+                "event_id": "e1",
             }
         ],
     }
     assert undo.outcome == "blocked"
     assert calendar.calls == []
+
+
+def test_read_followup_authorizes_only_events_actually_displayed(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        events = [
+            provider_event(f"visible-{index}", title=f"Событие {index}")
+            for index in range(4)
+        ]
+        result = await pipeline.record_read(
+            source_update_id=801,
+            account="personal",
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+            transcript="Покажи события",
+            reference_time=NOW,
+            lookup={
+                "query": None,
+                "time_min": "2026-08-23T00:00:00+03:00",
+                "time_max": "2026-08-24T00:00:00+03:00",
+            },
+            events=events,
+            total_count=4,
+            may_be_incomplete=False,
+            displayed_candidates=(events[2], events[0]),
+        )
+        return result, pipeline.context(
+            account="personal", chat_id=OWNER, now=NOW
+        )
+
+    result, context = asyncio.run(scenario())
+    assert [
+        candidate["event_id"] for candidate in result.record["displayed_candidates"]
+    ] == ["visible-2", "visible-0"]
+    assert context.allowed_event_ids == ("visible-2", "visible-0")
+    assert context.event_id_by_ref == {
+        "e1": "visible-2",
+        "e2": "visible-0",
+    }
+    assert context.recent_conversation[-1]["actions"] == [
+        {"type": "read", "event_id": "e2"},
+        {"type": "read", "event_id": "e1"},
+    ]
 
 
 def test_record_read_replay_is_idempotent(tmp_path):
@@ -966,7 +1782,7 @@ def test_lookup_observation_of_external_edit_clears_undo_freshness(tmp_path):
     assert personal_entry["last_operation_id"] is None
     assert personal_entry["snapshot"]["location"] == "Переговорная А"
     assert event_id in personal_context.allowed_event_ids
-    assert event_id in work_context.allowed_event_ids
+    assert work_context.allowed_event_ids == ()
     assert undone.outcome == "blocked"
 
 
@@ -1008,6 +1824,7 @@ def test_clarification_preserves_displayed_candidate_order_for_next_turn(tmp_pat
         clarification = {
             "action": "clarify",
             "operations": [],
+            "lookup": None,
             "clarification_question": "Какое из этих событий изменить?",
             "confidence": 0.8,
         }
@@ -1031,7 +1848,60 @@ def test_clarification_preserves_displayed_candidate_order_for_next_turn(tmp_pat
     assert [
         (event["display_index"], event["event_id"])
         for event in context.application_state["candidate_events"]
-    ] == [(1, "second"), (2, "first")]
+    ] == [(1, "e1"), (2, "e2")]
+    assert context.event_id_by_ref == {"e1": "second", "e2": "first"}
+
+
+def test_direct_clarification_inherits_last_displayed_read_order(tmp_path):
+    async def scenario():
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), FakeCalendar()
+        )
+        first = provider_event("read-first", title="Первое событие")
+        second = provider_event("read-second", title="Второе событие")
+        await pipeline.record_read(
+            source_update_id=840,
+            account="personal",
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+            transcript="Покажи события",
+            reference_time=NOW,
+            lookup={
+                "query": None,
+                "time_min": "2026-08-23T00:00:00+03:00",
+                "time_max": "2026-08-24T00:00:00+03:00",
+            },
+            events=(first, second),
+            total_count=2,
+            may_be_incomplete=False,
+            displayed_candidates=(first, second),
+        )
+        clarification = {
+            "action": "clarify",
+            "operations": [],
+            "lookup": None,
+            "clarification_question": "Какое событие изменить?",
+            "confidence": 0.8,
+        }
+        await apply(
+            pipeline,
+            841,
+            clarification,
+            allowed_event_ids=(first.event_id, second.event_id),
+            displayed_candidates=None,
+        )
+        return pipeline.context(account="personal", chat_id=OWNER, now=NOW)
+
+    context = asyncio.run(scenario())
+
+    assert context.event_id_by_ref == {
+        "e1": "read-first",
+        "e2": "read-second",
+    }
+    assert [
+        candidate["display_index"]
+        for candidate in context.application_state["candidate_events"]
+    ] == [1, 2]
 
 
 @pytest.mark.parametrize("action", ["update", "delete"])
@@ -1047,6 +1917,7 @@ def test_fresh_provider_recurrence_change_does_not_block_exact_id_mutation(
         calendar.events[event_id] = provider_event(
             event_id, recurrence_rrules=("RRULE:FREQ=WEEKLY",)
         )
+        expire_cached_event(pipeline, "personal", event_id)
         operation = (
             update_op(event_id, {"location": "Переговорная А"})
             if action == "update"
@@ -1097,6 +1968,7 @@ def test_fresh_provider_policy_metadata_does_not_block_mutation(
         cached = provider_event(event_id)
         pipeline.observe_lookup_events("personal", [cached])
         calendar.events[event_id] = provider_event(event_id, **fresh_changes)
+        expire_cached_event(pipeline, "personal", event_id)
         operation = (
             update_op(event_id, {"location": "Переговорная А"})
             if action == "update"
@@ -1136,6 +2008,7 @@ def test_semantically_changed_target_uses_fresh_snapshot_for_exact_id_mutation(
         cached = provider_event(event_id)
         pipeline.observe_lookup_events("personal", [cached])
         calendar.events[event_id] = provider_event(event_id, **fresh_changes)
+        expire_cached_event(pipeline, "personal", event_id)
         operation = (
             update_op(event_id, {"location": "Переговорная А"})
             if action == "update"
@@ -1184,6 +2057,7 @@ def test_richer_fresh_metadata_does_not_look_like_semantic_target_change(
         fresh = provider_event(event_id)
         pipeline.observe_lookup_events("personal", [cached])
         calendar.events[event_id] = fresh
+        expire_cached_event(pipeline, "personal", event_id)
         operation = (
             update_op(event_id, {"location": "Переговорная А"})
             if action == "update"
@@ -1321,11 +2195,19 @@ def test_uncertain_delete_replays_after_target_was_observed_cancelled(tmp_path):
             super().__init__()
             self.response_lost = False
 
-        async def delete_event(self, *, account, event_id, idempotency_key):
+        async def delete_event(
+            self,
+            *,
+            account,
+            event_id,
+            idempotency_key,
+            expected_current=None,
+        ):
             result = await super().delete_event(
                 account=account,
                 event_id=event_id,
                 idempotency_key=idempotency_key,
+                expected_current=expected_current,
             )
             if not self.response_lost:
                 self.response_lost = True
@@ -1349,15 +2231,24 @@ def test_uncertain_delete_replays_after_target_was_observed_cancelled(tmp_path):
         # original journal target remains trusted for idempotent reconciliation.
         pipeline.observe_lookup_events("personal", [calendar.events[event_id]])
         reconciled = await apply(pipeline, 188, deletion_plan)
-        return calendar, reconciled, event_id
+        undone = await pipeline.undo(
+            operation_id=reconciled.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+        )
+        entry = pipeline.store.event_entry("personal", event_id)
+        return calendar, reconciled, undone, entry, event_id
 
-    calendar, reconciled, event_id = asyncio.run(scenario())
+    calendar, reconciled, undone, entry, event_id = asyncio.run(scenario())
 
     delete_calls = [call for call in calendar.calls if call[0] == "delete"]
     assert len(delete_calls) == 2
     assert delete_calls[0][2] == delete_calls[1][2]
     assert reconciled.stage == "applied"
+    assert reconciled.record["items"][0]["write_skipped"] is True
     assert reconciled.record["displayed_candidates"] == []
+    assert undone.outcome == "undone"
+    assert entry["last_operation_id"] != reconciled.operation_id
     assert calendar.events[event_id].status == "cancelled"
 
 
@@ -1570,7 +2461,8 @@ def test_self_organized_event_with_attendees_can_be_updated(tmp_path):
     assert [
         (event["display_index"], event["event_id"])
         for event in context.application_state["candidate_events"]
-    ] == [(1, "self-organized")]
+    ] == [(1, "e1")]
+    assert context.event_id_by_ref == {"e1": "self-organized"}
     assert any(call[0] == "update" for call in calendar.calls)
 
 
@@ -1611,7 +2503,11 @@ def test_batch_create_persists_success_card_order_for_relative_followup(tmp_path
         (1, result.record["items"][0]["after"]["event_id"]),
         (2, result.record["items"][1]["after"]["event_id"]),
     ]
-    assert context_rows == result_rows
+    assert context_rows == [(1, "e1"), (2, "e2")]
+    assert context.event_id_by_ref == {
+        "e1": result_rows[0][1],
+        "e2": result_rows[1][1],
+    }
     assert context.allowed_event_ids == tuple(event_id for _, event_id in result_rows)
 
 
@@ -1646,7 +2542,11 @@ def test_batch_update_persists_operation_order_not_cache_recency(tmp_path):
     assert [
         (candidate["display_index"], candidate["event_id"])
         for candidate in context.application_state["candidate_events"]
-    ] == expected
+    ] == [(1, "e1"), (2, "e2")]
+    assert context.event_id_by_ref == {
+        "e1": "second-update",
+        "e2": "first-update",
+    }
     assert context.allowed_event_ids == ("second-update", "first-update")
 
 
@@ -1685,7 +2585,11 @@ def test_mixed_success_omits_deleted_candidate_without_renumbering(tmp_path):
     assert [
         (candidate["display_index"], candidate["event_id"])
         for candidate in context.application_state["candidate_events"]
-    ] == expected
+    ] == [(1, "e1"), (3, "e2")]
+    assert context.event_id_by_ref == {
+        "e1": "mixed-first",
+        "e2": "mixed-third",
+    }
     assert context.allowed_event_ids == ("mixed-first", "mixed-third")
 
 
@@ -1900,6 +2804,7 @@ def test_fresh_delete_policy_metadata_does_not_block_provider_write(
         calendar.events[cached.event_id] = provider_event(
             cached.event_id, **fresh_changes
         )
+        expire_cached_event(pipeline, "personal", cached.event_id)
 
         result = await apply(pipeline, 92, plan(delete_op(cached.event_id)))
         return calendar, result
@@ -1923,6 +2828,7 @@ def test_fresh_delete_uses_changed_status_snapshot_for_exact_id(tmp_path):
         calendar.events[cached.event_id] = provider_event(
             cached.event_id, status="tentative"
         )
+        expire_cached_event(pipeline, "personal", cached.event_id)
 
         result = await apply(pipeline, 920, plan(delete_op(cached.event_id)))
         return calendar, result

@@ -13,6 +13,7 @@ from tg_voice_transcriber_bot.calendar import (
     CalendarConnectionError,
     CalendarEventQueryResult,
     CalendarEventSnapshot,
+    CalendarStateConflictError,
     DeletedCalendarEvent,
 )
 from tg_voice_transcriber_bot.calendar_mcp import (
@@ -63,6 +64,18 @@ def stored_event(event_id, source, *, html_link="https://calendar.google.com/eve
         "accountId": "google_personal",
         "calendarId": "primary@example.com",
     }
+
+
+def normalized_snapshot(event_id, source, **provider_updates):
+    provider_event = stored_event(event_id, source)
+    provider_event.update(provider_updates)
+    return calendar_mcp_module._snapshot_from_event(
+        provider_event,
+        logical_account="personal",
+        mcp_account="google_personal",
+        requested_calendar_id="primary",
+        expected_event_id=event_id,
+    )
 
 
 def result(
@@ -1012,7 +1025,9 @@ def test_update_event_sends_safe_patch_and_parses_provider_state():
         )
     )
 
-    assert updated.location == "переговорная А"
+    assert updated.previous.location is None
+    assert updated.current.location == "переговорная А"
+    assert updated.already_applied is False
     assert [call[:2] for call in session.calls] == [
         (
             "get-event",
@@ -1049,8 +1064,189 @@ def test_update_event_is_noop_when_patch_is_already_applied():
         )
     )
 
-    assert updated.location == "переговорная А"
+    assert updated.previous.location == "переговорная А"
+    assert updated.current is updated.previous
+    assert updated.already_applied is True
     assert [call[0] for call in session.calls] == ["get-event"]
+
+
+def test_update_event_does_not_treat_equivalent_instants_in_another_timezone_as_noop():
+    before = timed_event(
+        start_at="2026-08-24T07:00:00+00:00",
+        end_at="2026-08-24T08:00:00+00:00",
+        timezone="UTC",
+    )
+    after = timed_event(
+        start_at="2026-08-24T10:00:00+03:00",
+        end_at="2026-08-24T11:00:00+03:00",
+        timezone="Europe/Moscow",
+    )
+    before_provider = stored_event("event-42", before)
+    before_provider["start"]["timeZone"] = "UTC"
+    before_provider["end"]["timeZone"] = "UTC"
+    after_provider = stored_event("event-42", after)
+    after_provider["start"]["timeZone"] = "Europe/Moscow"
+    after_provider["end"]["timeZone"] = "Europe/Moscow"
+    session = FakeSession(
+        [
+            result({"event": before_provider}),
+            result({"event": after_provider}),
+        ]
+    )
+
+    updated = asyncio.run(
+        client(session).update_event(
+            account="personal",
+            event_id="event-42",
+            patch={
+                "start_at": after["start_at"],
+                "end_at": after["end_at"],
+                "timezone": after["timezone"],
+            },
+            idempotency_key="operation-update-timezone",
+        )
+    )
+
+    assert updated.already_applied is False
+    assert updated.previous.timezone == "UTC"
+    assert updated.current.timezone == "Europe/Moscow"
+    assert [call[0] for call in session.calls] == ["get-event", "update-event"]
+    assert session.calls[1][1]["start"] == "2026-08-24T10:00:00+03:00"
+    assert session.calls[1][1]["end"] == "2026-08-24T11:00:00+03:00"
+    assert session.calls[1][1]["timeZone"] == "Europe/Moscow"
+
+
+def test_update_event_timezone_verification_recovers_only_matching_provider_zone():
+    before = timed_event(
+        start_at="2026-08-24T07:00:00+00:00",
+        end_at="2026-08-24T08:00:00+00:00",
+        timezone="UTC",
+    )
+    requested = timed_event(
+        start_at="2026-08-24T10:00:00+03:00",
+        end_at="2026-08-24T11:00:00+03:00",
+        timezone="Europe/Moscow",
+    )
+    before_provider = stored_event("event-42", before)
+    before_provider["start"]["timeZone"] = "UTC"
+    before_provider["end"]["timeZone"] = "UTC"
+    wrong_update_response = stored_event("event-42", requested)
+    wrong_update_response["start"]["timeZone"] = "UTC"
+    wrong_update_response["end"]["timeZone"] = "UTC"
+    recovered_provider = stored_event("event-42", requested)
+    recovered_provider["start"]["timeZone"] = "Europe/Moscow"
+    recovered_provider["end"]["timeZone"] = "Europe/Moscow"
+    session = FakeSession(
+        [
+            result({"event": before_provider}),
+            result({"event": wrong_update_response}),
+            result({"event": recovered_provider}),
+        ]
+    )
+
+    updated = asyncio.run(
+        client(session).update_event(
+            account="personal",
+            event_id="event-42",
+            patch={
+                "start_at": requested["start_at"],
+                "end_at": requested["end_at"],
+                "timezone": requested["timezone"],
+            },
+            idempotency_key="operation-update-timezone-recovery",
+        )
+    )
+
+    assert updated.already_applied is False
+    assert updated.current.timezone == "Europe/Moscow"
+    assert [call[0] for call in session.calls] == [
+        "get-event",
+        "update-event",
+        "get-event",
+    ]
+
+
+def test_update_event_reconciles_applied_patch_before_stale_precondition():
+    expected = normalized_snapshot(
+        "event-42", timed_event(location="Состояние до попытки")
+    )
+    applied = timed_event(location="Уже применено")
+    session = FakeSession([result({"event": stored_event("event-42", applied)})])
+
+    updated = asyncio.run(
+        client(session).update_event(
+            account="personal",
+            event_id="event-42",
+            patch={"location": "Уже применено"},
+            idempotency_key="operation-update-lost-response-retry",
+            expected_current=expected,
+        )
+    )
+
+    assert updated.already_applied is True
+    assert updated.current.location == "Уже применено"
+    assert [call[0] for call in session.calls] == ["get-event"]
+
+
+def test_update_event_precondition_conflict_stops_before_provider_write():
+    expected = normalized_snapshot(
+        "event-42", timed_event(location="Изменено ботом")
+    )
+    provider_current = timed_event(location="Ручная правка после проверки")
+    session = FakeSession(
+        [result({"event": stored_event("event-42", provider_current)})]
+    )
+
+    with pytest.raises(CalendarStateConflictError) as raised:
+        asyncio.run(
+            client(session).update_event(
+                account="personal",
+                event_id="event-42",
+                patch={"location": "До изменения ботом"},
+                idempotency_key="operation-update-conflict",
+                expected_current=expected,
+            )
+        )
+
+    assert str(raised.value) == "Calendar event changed after it was observed"
+    assert raised.value.__cause__ is None
+    assert [call[0] for call in session.calls] == ["get-event"]
+
+
+def test_update_event_precondition_ignores_link_and_provider_update_time():
+    source = timed_event(location="Изменено ботом")
+    expected = normalized_snapshot("event-42", source)
+    provider_current = stored_event(
+        "event-42",
+        source,
+        html_link="https://calendar.google.com/event/new-link",
+    )
+    provider_current["updated"] = "2026-08-24T12:00:00Z"
+    provider_after = stored_event(
+        "event-42",
+        timed_event(location="До изменения ботом"),
+        html_link="https://calendar.google.com/event/new-link",
+    )
+    provider_after["updated"] = "2026-08-24T12:00:01Z"
+    session = FakeSession(
+        [
+            result({"event": provider_current}),
+            result({"event": provider_after}),
+        ]
+    )
+
+    updated = asyncio.run(
+        client(session).update_event(
+            account="personal",
+            event_id="event-42",
+            patch={"location": "До изменения ботом"},
+            idempotency_key="operation-update-bookkeeping-only",
+            expected_current=expected,
+        )
+    )
+
+    assert updated.current.location == "До изменения ботом"
+    assert [call[0] for call in session.calls] == ["get-event", "update-event"]
 
 
 def test_update_event_moves_both_bounds_with_explicit_timezone():
@@ -1059,10 +1255,13 @@ def test_update_event_moves_both_bounds_with_explicit_timezone():
         start_at="2026-08-26T15:00:00+03:00",
         end_at="2026-08-26T16:00:00+03:00",
     )
+    after_provider = stored_event("event-42", after)
+    after_provider["start"]["timeZone"] = "Europe/Moscow"
+    after_provider["end"]["timeZone"] = "Europe/Moscow"
     session = FakeSession(
         [
             result({"event": stored_event("event-42", before)}),
-            result({"event": stored_event("event-42", after)}),
+            result({"event": after_provider}),
         ]
     )
 
@@ -1079,7 +1278,9 @@ def test_update_event_moves_both_bounds_with_explicit_timezone():
         )
     )
 
-    assert updated.start_at == "2026-08-26T15:00:00+03:00"
+    assert updated.previous.start_at == "2026-08-24T15:00:00+03:00"
+    assert updated.current.start_at == "2026-08-26T15:00:00+03:00"
+    assert updated.already_applied is False
     assert session.calls[1][1] == {
         "account": "google_personal",
         "calendarId": "primary",
@@ -1089,6 +1290,69 @@ def test_update_event_moves_both_bounds_with_explicit_timezone():
         "end": "2026-08-26T16:00:00+03:00",
         "timeZone": "Europe/Moscow",
     }
+
+
+def test_update_event_replaces_series_recurrence_with_explicit_all_scope():
+    before = timed_event(recurrence_rrule="RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR")
+    after = timed_event(recurrence_rrule="RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR")
+    session = FakeSession(
+        [
+            result({"event": stored_event("event-42", before)}),
+            result({"event": stored_event("event-42", after)}),
+        ]
+    )
+
+    updated = asyncio.run(
+        client(session).update_event(
+            account="personal",
+            event_id="event-42",
+            patch={
+                "recurrence_rrules": [
+                    "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"
+                ]
+            },
+            idempotency_key="operation-recurrence-1",
+        )
+    )
+
+    assert updated.current.recurrence_rrules == (
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR",
+    )
+    assert updated.already_applied is False
+    assert session.calls[1][1] == {
+        "account": "google_personal",
+        "calendarId": "primary",
+        "eventId": "event-42",
+        "sendUpdates": "none",
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"],
+        "modificationScope": "all",
+    }
+
+
+def test_update_event_clears_series_recurrence_with_an_empty_array():
+    before = timed_event(recurrence_rrule="RRULE:FREQ=DAILY")
+    after = timed_event(recurrence_rrule=None)
+    session = FakeSession(
+        [
+            result({"event": stored_event("event-42", before)}),
+            result({"event": stored_event("event-42", after)}),
+        ]
+    )
+
+    updated = asyncio.run(
+        client(session).update_event(
+            account="personal",
+            event_id="event-42",
+            patch={"recurrence_rrules": []},
+            idempotency_key="operation-recurrence-clear",
+        )
+    )
+
+    assert updated.previous.recurrence_rrules == ("RRULE:FREQ=DAILY",)
+    assert updated.current.recurrence_rrules == ()
+    assert updated.already_applied is False
+    assert session.calls[1][1]["recurrence"] == []
+    assert session.calls[1][1]["modificationScope"] == "all"
 
 
 def test_update_event_recovers_after_lost_response_by_probing_target_state():
@@ -1111,7 +1375,9 @@ def test_update_event_recovers_after_lost_response_by_probing_target_state():
         )
     )
 
-    assert updated.location == "переговорная А"
+    assert updated.previous.location == "Клиника"
+    assert updated.current.location == "переговорная А"
+    assert updated.already_applied is False
     assert [call[0] for call in session.calls] == [
         "get-event",
         "update-event",
@@ -1267,17 +1533,43 @@ def test_delete_event_retry_skips_second_delete_for_cancelled_event():
     provider_event = stored_event("event-42", timed_event())
     provider_event["status"] = "cancelled"
     session = FakeSession([result({"event": provider_event})])
+    expected = normalized_snapshot("event-42", timed_event())
 
     deleted = asyncio.run(
         client(session).delete_event(
             account="personal",
             event_id="event-42",
             idempotency_key="operation-delete-retry",
+            expected_current=expected,
         )
     )
 
     assert deleted.already_deleted is True
     assert deleted.verified_cancelled is True
+    assert [call[0] for call in session.calls] == ["get-event"]
+
+
+def test_delete_event_precondition_conflict_stops_before_provider_write():
+    expected = normalized_snapshot(
+        "event-42", timed_event(description="Состояние после бота")
+    )
+    provider_current = timed_event(description="Ручная правка после проверки")
+    session = FakeSession(
+        [result({"event": stored_event("event-42", provider_current)})]
+    )
+
+    with pytest.raises(CalendarStateConflictError) as raised:
+        asyncio.run(
+            client(session).delete_event(
+                account="personal",
+                event_id="event-42",
+                idempotency_key="operation-delete-conflict",
+                expected_current=expected,
+            )
+        )
+
+    assert str(raised.value) == "Calendar event changed after it was observed"
+    assert raised.value.__cause__ is None
     assert [call[0] for call in session.calls] == ["get-event"]
 
 

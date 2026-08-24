@@ -87,6 +87,7 @@ _CALENDAR_PATCH_PROPERTIES: dict[str, Any] = {
     "timezone": {"type": "string"},
     "location": {"type": "string", "minLength": 1, "maxLength": 500},
     "description": {"type": "string", "minLength": 1, "maxLength": 5000},
+    "recurrence_rrule": {"type": "string", "minLength": 1, "maxLength": 500},
 }
 
 _CALENDAR_LOOKUP_PROPERTIES: dict[str, Any] = {
@@ -117,6 +118,15 @@ CALENDAR_OPERATION_SCHEMA: dict[str, Any] = {
                     "target_event_id": {
                         "anyOf": [{"type": "string"}, {"type": "null"}]
                     },
+                    "recurrence_scope": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": ["series", "occurrence"],
+                            },
+                            {"type": "null"},
+                        ]
+                    },
                     "event": {
                         "anyOf": [
                             {
@@ -146,6 +156,7 @@ CALENDAR_OPERATION_SCHEMA: dict[str, Any] = {
                             "enum": [
                                 "location",
                                 "description",
+                                "recurrence_rrule",
                             ],
                         },
                     },
@@ -153,6 +164,7 @@ CALENDAR_OPERATION_SCHEMA: dict[str, Any] = {
                 "required": [
                     "type",
                     "target_event_id",
+                    "recurrence_scope",
                     "event",
                     "patch",
                     "clear_fields",
@@ -175,7 +187,13 @@ CALENDAR_OPERATION_SCHEMA: dict[str, Any] = {
         },
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
-    "required": ["action", "operations", "clarification_question", "confidence"],
+    "required": [
+        "action",
+        "operations",
+        "lookup",
+        "clarification_question",
+        "confidence",
+    ],
 }
 
 
@@ -391,11 +409,11 @@ _OPERATION_KEYS = frozenset(
 )
 _PATCH_KEYS = frozenset(_CALENDAR_PATCH_PROPERTIES)
 _CLEARABLE_EVENT_FIELDS = frozenset(
-    {"location", "description"}
+    {"location", "description", "recurrence_rrule"}
 )
 _LOOKUP_KEYS = frozenset(_CALENDAR_LOOKUP_PROPERTIES)
 _OPERATION_REQUIRED_KEYS = frozenset(
-    {"action", "operations", "clarification_question", "confidence"}
+    {"action", "operations", "lookup", "clarification_question", "confidence"}
 )
 
 
@@ -454,6 +472,11 @@ def _normalize_event_patch(
         normalized["description"] = _patch_text(
             raw_patch["description"], "description", max_length=5000
         )
+    if "recurrence_rrule" in raw_patch:
+        recurrence = _validate_rrule(raw_patch["recurrence_rrule"])
+        if recurrence is None:  # pragma: no cover - guarded by the schema path
+            raise ValueError("patch recurrence_rrule must be a non-null string")
+        normalized["recurrence_rrule"] = recurrence
     if "all_day" in raw_patch:
         if not isinstance(raw_patch["all_day"], bool):
             raise ValueError("patch all_day must be boolean")
@@ -621,6 +644,14 @@ def validate_calendar_operation_plan(
             raise ValueError("invalid calendar operation type")
 
         target_event_id = raw_operation.get("target_event_id")
+        recurrence_scope = raw_operation.get("recurrence_scope")
+        if recurrence_scope is not None and (
+            not isinstance(recurrence_scope, str)
+            or recurrence_scope not in {"series", "occurrence"}
+        ):
+            raise ValueError(
+                "recurrence_scope must be series, occurrence, or null"
+            )
         event = raw_operation.get("event")
         patch = raw_operation.get("patch")
         clear_fields = raw_operation.get("clear_fields")
@@ -637,7 +668,12 @@ def validate_calendar_operation_plan(
             raise ValueError("clear_fields contains invalid or duplicate fields")
 
         if operation_type == "create":
-            if target_event_id is not None or patch is not None or clear_fields:
+            if (
+                target_event_id is not None
+                or recurrence_scope is not None
+                or patch is not None
+                or clear_fields
+            ):
                 raise ValueError("create operation must contain only a complete event")
             normalized_event = _normalize_complete_event(
                 event, expected_timezone=expected_timezone
@@ -671,6 +707,14 @@ def validate_calendar_operation_plan(
                     raise ValueError("update operation must change or clear a field")
                 if normalized_patch and set(normalized_patch) & set(clear_fields):
                     raise ValueError("a field cannot be patched and cleared together")
+                recurrence_changed = (
+                    normalized_patch is not None
+                    and "recurrence_rrule" in normalized_patch
+                ) or "recurrence_rrule" in clear_fields
+                if recurrence_changed and recurrence_scope != "series":
+                    raise ValueError(
+                        "recurrence rule changes require recurrence_scope=series"
+                    )
             else:
                 if patch is not None or clear_fields:
                     raise ValueError("delete operation cannot contain a patch")
@@ -680,6 +724,7 @@ def validate_calendar_operation_plan(
             {
                 "type": operation_type,
                 "target_event_id": target_event_id,
+                "recurrence_scope": recurrence_scope,
                 "event": normalized_event,
                 "patch": normalized_patch,
                 "clear_fields": list(clear_fields),

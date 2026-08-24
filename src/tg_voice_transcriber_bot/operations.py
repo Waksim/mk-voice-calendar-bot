@@ -20,14 +20,22 @@ from .calendar import (
     CalendarClient,
     CalendarConnectionError,
     CalendarEventQueryResult,
+    CalendarEventSnapshot,
+    CalendarStateConflictError,
     CalendarWriteRejectedError,
+    UpdatedCalendarEvent,
 )
 from .intent import validate_calendar_intent, validate_calendar_operation_plan
 
 
 _MAX_TURNS = 2
-_MAX_CONTEXT_EVENTS = 50
-_MAX_CONTEXT_ACTIONS = 10
+_MAX_CONTEXT_EVENTS = 12
+_MAX_CONTEXT_USER_TEXT = 1_000
+_MAX_CONTEXT_ASSISTANT_TEXT = 500
+_MAX_CONTEXT_TITLE = 300
+_MAX_CONTEXT_LOCATION = 300
+_MAX_CONTEXT_DESCRIPTION = 500
+_MAX_CONTEXT_RECURRENCE = 500
 _NON_MATERIAL_SNAPSHOT_FIELDS = {
     "account",
     "html_link",
@@ -75,6 +83,8 @@ class OperationContext:
     application_state: dict[str, Any]
     recent_conversation: tuple[dict[str, Any], ...]
     history_steps: tuple[dict[str, Any], ...]
+    event_id_by_ref: dict[str, str]
+    series_event_id_by_ref: dict[str, str]
     allowed_event_ids: tuple[str, ...]
 
 
@@ -156,6 +166,9 @@ def _snapshot(
         if "reminder_overrides" in raw
         else fallback.get("reminder_overrides", ())
     )
+    recurrence_is_authoritative = value is not None and (
+        "recurrence_rrule" in raw or "recurrence_rrules" in raw
+    )
     recurrence = raw.get("recurrence_rrule")
     recurrence_list: list[str] = []
     if recurrence is None:
@@ -166,10 +179,17 @@ def _snapshot(
             and recurrence_values
         ):
             recurrence_list = [str(value) for value in recurrence_values]
-            recurrence = recurrence_list[0]
+            recurrence = next(
+                (
+                    rule
+                    for rule in recurrence_list
+                    if rule.startswith("RRULE:")
+                ),
+                None,
+            )
     else:
         recurrence_list = [str(recurrence)]
-    if not recurrence_list:
+    if not recurrence_list and not recurrence_is_authoritative:
         fallback_recurrences = fallback.get("recurrence_rrules")
         if isinstance(fallback_recurrences, Sequence) and not isinstance(
             fallback_recurrences, (str, bytes)
@@ -177,11 +197,21 @@ def _snapshot(
             recurrence_list = [str(value) for value in fallback_recurrences]
         elif fallback.get("recurrence_rrule"):
             recurrence_list = [str(fallback["recurrence_rrule"])]
+    # ``title`` below is normalized for model/UI use because Google permits an
+    # absent summary.  Preserve the provider's raw value separately so an Undo
+    # optimistic-concurrency precondition can distinguish a genuinely
+    # untitled event from one literally named "Без названия".
+    provider_title = (
+        raw.get("provider_title", raw.get("title"))
+        if value is not None
+        else fallback.get("provider_title", fallback.get("title"))
+    )
     normalized = {
         "account": str(raw.get("account") or account),
         "calendar_id": str(raw.get("calendar_id") or fallback.get("calendar_id") or "primary"),
         "event_id": str(raw.get("event_id") or event_id or fallback.get("event_id") or ""),
         "title": raw.get("title", fallback.get("title")),
+        "provider_title": provider_title,
         "start_at": raw.get("start_at", fallback.get("start_at")),
         "end_at": raw.get("end_at", fallback.get("end_at")),
         "all_day": raw.get("all_day", fallback.get("all_day")),
@@ -193,7 +223,7 @@ def _snapshot(
         "description": raw.get("description", fallback.get("description")),
         "recurrence_rrule": (
             recurrence
-            if recurrence is not None
+            if recurrence_is_authoritative
             else fallback.get("recurrence_rrule")
         ),
         "recurrence_rrules": recurrence_list,
@@ -309,6 +339,213 @@ def _event_payload(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _snapshot_precondition(snapshot: Mapping[str, Any]) -> CalendarEventSnapshot:
+    """Rebuild the typed provider snapshot required by conditional Undo."""
+
+    overrides = snapshot.get("reminder_overrides") or ()
+    provider_title = (
+        snapshot.get("provider_title")
+        if "provider_title" in snapshot
+        else snapshot.get("title")
+    )
+    return CalendarEventSnapshot(
+        account=str(snapshot.get("account") or ""),
+        calendar_id=str(snapshot.get("calendar_id") or "primary"),
+        event_id=str(snapshot.get("event_id") or ""),
+        title=str(provider_title) if provider_title is not None else None,
+        description=(
+            str(snapshot["description"])
+            if snapshot.get("description") is not None
+            else None
+        ),
+        location=(
+            str(snapshot["location"])
+            if snapshot.get("location") is not None
+            else None
+        ),
+        start_at=str(snapshot.get("start_at") or ""),
+        end_at=str(snapshot.get("end_at") or ""),
+        all_day=bool(snapshot.get("all_day")),
+        timezone=(
+            str(snapshot["timezone"])
+            if snapshot.get("timezone") is not None
+            else None
+        ),
+        status=str(snapshot.get("status") or "confirmed"),
+        html_link=(
+            str(snapshot["html_link"])
+            if snapshot.get("html_link") is not None
+            else None
+        ),
+        recurrence_rrules=tuple(
+            str(value) for value in (snapshot.get("recurrence_rrules") or ())
+        ),
+        attendee_emails=tuple(
+            str(value) for value in (snapshot.get("attendee_emails") or ())
+        ),
+        updated_at=(
+            str(snapshot["provider_updated_at"])
+            if snapshot.get("provider_updated_at") is not None
+            else None
+        ),
+        recurring_event_id=(
+            str(snapshot["recurring_event_id"])
+            if snapshot.get("recurring_event_id") is not None
+            else None
+        ),
+        original_start_at=(
+            str(snapshot["original_start_at"])
+            if snapshot.get("original_start_at") is not None
+            else None
+        ),
+        color_id=(
+            str(snapshot["color_id"])
+            if snapshot.get("color_id") is not None
+            else None
+        ),
+        transparency=(
+            str(snapshot["transparency"])
+            if snapshot.get("transparency") is not None
+            else None
+        ),
+        visibility=(
+            str(snapshot["visibility"])
+            if snapshot.get("visibility") is not None
+            else None
+        ),
+        event_type=(
+            str(snapshot["event_type"])
+            if snapshot.get("event_type") is not None
+            else None
+        ),
+        creator_email=(
+            str(snapshot["creator_email"])
+            if snapshot.get("creator_email") is not None
+            else None
+        ),
+        creator_is_self=snapshot.get("creator_self"),
+        organizer_email=(
+            str(snapshot["organizer_email"])
+            if snapshot.get("organizer_email") is not None
+            else None
+        ),
+        organizer_is_self=snapshot.get("organizer_self"),
+        reminders_present=bool(snapshot.get("reminders_present")),
+        reminders_use_default=snapshot.get("reminders_use_default"),
+        reminder_overrides=tuple(
+            (str(value[0]), int(value[1]))
+            for value in overrides
+            if isinstance(value, Sequence)
+            and not isinstance(value, (str, bytes))
+            and len(value) == 2
+        ),
+        has_conference_data=bool(snapshot.get("has_conference_data")),
+        has_hangout_link=bool(snapshot.get("has_hangout_link")),
+        has_attachments=bool(snapshot.get("has_attachments")),
+        has_extended_properties=bool(snapshot.get("has_extended_properties")),
+        has_source=bool(snapshot.get("has_source")),
+        anyone_can_add_self=snapshot.get("anyone_can_add_self"),
+        guests_can_invite_others=snapshot.get("guests_can_invite_others"),
+        guests_can_modify=snapshot.get("guests_can_modify"),
+        guests_can_see_other_guests=snapshot.get(
+            "guests_can_see_other_guests"
+        ),
+        private_copy=snapshot.get("private_copy"),
+        locked=snapshot.get("locked"),
+        safety_metadata_complete=bool(snapshot.get("safety_metadata_complete")),
+        safety_metadata_fingerprint=(
+            str(snapshot["safety_metadata_fingerprint"])
+            if snapshot.get("safety_metadata_fingerprint") is not None
+            else None
+        ),
+    )
+
+
+def _context_text(value: Any, limit: int) -> str | None:
+    """Bound model-visible text without changing the durable provider journal."""
+
+    if not isinstance(value, str):
+        return None
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+def _compact_model_event(
+    snapshot: Mapping[str, Any],
+    *,
+    event_ref: str,
+    timezone_name: str,
+    display_index: int | None,
+) -> dict[str, Any]:
+    """Build the sole compact, timezone-normalized model view of an event."""
+
+    all_day = bool(snapshot.get("all_day"))
+    start_at = snapshot.get("start_at")
+    end_at = snapshot.get("end_at")
+    if not all_day:
+        zone = ZoneInfo(timezone_name)
+        for field_name, value in (("start_at", start_at), ("end_at", end_at)):
+            if not isinstance(value, str):
+                raise OperationStateError(
+                    f"Calendar snapshot has no {field_name} timestamp"
+                )
+            try:
+                normalized = _parse_temporal(value, all_day=False)
+            except (TypeError, ValueError) as exc:
+                raise OperationStateError(
+                    f"Calendar snapshot has an invalid {field_name} timestamp"
+                ) from exc
+            assert isinstance(normalized, datetime)
+            if field_name == "start_at":
+                start_at = normalized.astimezone(zone).isoformat()
+            else:
+                end_at = normalized.astimezone(zone).isoformat()
+
+    recurrence = snapshot.get("recurrence_rrule")
+    if recurrence is None:
+        recurrence_rules = snapshot.get("recurrence_rrules")
+        if (
+            isinstance(recurrence_rules, Sequence)
+            and not isinstance(recurrence_rules, (str, bytes))
+            and recurrence_rules
+        ):
+            recurrence = next(
+                (
+                    str(rule)
+                    for rule in recurrence_rules
+                    if str(rule).startswith("RRULE:")
+                ),
+                None,
+            )
+
+    compact = {
+        # This short reference is the only event identifier exposed to the
+        # model. The provider ID remains in OperationContext.event_id_by_ref.
+        "event_id": event_ref,
+        "title": _context_text(
+            snapshot.get("title") or "Без названия", _MAX_CONTEXT_TITLE
+        ),
+        "start_at": start_at,
+        "end_at": end_at,
+        "all_day": all_day,
+        "timezone": timezone_name,
+        "location": _context_text(snapshot.get("location"), _MAX_CONTEXT_LOCATION),
+        "description": _context_text(
+            snapshot.get("description"), _MAX_CONTEXT_DESCRIPTION
+        ),
+        "recurrence_rrule": _context_text(
+            recurrence, _MAX_CONTEXT_RECURRENCE
+        ),
+        "recurring": bool(recurrence or snapshot.get("recurring_event_id")),
+        "recurring_instance": bool(snapshot.get("recurring_event_id")),
+        "status": str(snapshot.get("status") or "confirmed"),
+    }
+    if display_index is not None:
+        compact["display_index"] = display_index
+    return compact
+
+
 def _delete_undo_is_core_only(snapshot: Mapping[str, Any]) -> bool:
     """Whether recreating a deleted event cannot restore all known metadata."""
 
@@ -364,6 +601,11 @@ def _material_event_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         for key, value in snapshot.items()
         if key not in _NON_MATERIAL_SNAPSHOT_FIELDS
     }
+    # Journals created before raw provider titles were persisted have only the
+    # UI-normalized title.  Promote that value for comparison so ordinary old
+    # Undo buttons keep working; an old genuinely untitled event still fails
+    # closed because "Без названия" will not equal a current raw ``None``.
+    material.setdefault("provider_title", snapshot.get("title"))
     attendee_emails = material.get("attendee_emails")
     if isinstance(attendee_emails, Sequence) and not isinstance(
         attendee_emails, (str, bytes)
@@ -509,7 +751,12 @@ class OperationStore:
                         "undo_stage": "pending",
                     }
                 )
-                self._put_event(account, after, active=True, operation_id=op_id)
+                self._put_event(
+                    account,
+                    after,
+                    active=True,
+                    operation_id=op_id,
+                )
             if not items:
                 continue
             record = {
@@ -640,7 +887,6 @@ class OperationStore:
                 # Preserve undo ownership only when the provider confirms that
                 # the event is still materially identical to our last write.
                 "last_operation_id": preserve_operation_id,
-                "origin": previous.get("origin") or "lookup",
                 "updated_at": _iso_now(),
             }
             observed.append(snapshot)
@@ -652,6 +898,14 @@ class OperationStore:
         return deepcopy(entry) if isinstance(entry, dict) else None
 
     def append_turn(self, record: Mapping[str, Any]) -> None:
+        """Persist only compact application memory for the next user turn.
+
+        Complete snapshots and native Gemini interaction payloads remain in
+        the operation journal. They are deliberately not copied into the
+        conversation because replaying them duplicates provider state and
+        carries opaque thought signatures into unrelated user commands.
+        """
+
         conversation_key = str(record["conversation_key"])
         conversation = self._data["conversations"].setdefault(
             conversation_key, {"turns": []}
@@ -668,22 +922,33 @@ class OperationStore:
                 {
                     "type": item.get("type"),
                     "event_id": (
-                        (item.get("after") or item.get("before") or {}).get("event_id")
-                        if isinstance(item, dict)
-                        else None
-                    ),
-                    "before": item.get("before") if isinstance(item, dict) else None,
-                    "after": item.get("after") if isinstance(item, dict) else None,
+                        (
+                            item.get("undo_after")
+                            if record.get("stage") == "undone"
+                            else None
+                        )
+                        or item.get("after")
+                        or item.get("before")
+                        or {}
+                    ).get("event_id")
+                    if isinstance(item, dict)
+                    else None,
                 }
                 for item in record.get("items", [])
+                if isinstance(item, Mapping)
             ],
             "displayed_candidates": (
-                deepcopy(record.get("displayed_candidates"))
+                [
+                    {
+                        "event_id": candidate.get("event_id"),
+                        "display_index": candidate.get("display_index"),
+                    }
+                    for candidate in record.get("displayed_candidates", [])
+                    if isinstance(candidate, Mapping) and candidate.get("event_id")
+                ]
                 if isinstance(record.get("displayed_candidates"), list)
                 else None
             ),
-            "interaction_input": record.get("interaction_input"),
-            "interaction_steps": record.get("interaction_steps", []),
         }
         turns[:] = [item for item in turns if item.get("source_key") != source_key]
         turns.append(turn)
@@ -703,41 +968,48 @@ class OperationStore:
             .get(_conversation_key(account, chat_id), {})
             .get("turns", [])[-_MAX_TURNS:]
         )
-        active_entries = sorted(
-            (
-                entry
-                for entry in scope_events.values()
-                if isinstance(entry, dict) and entry.get("active") is True
-            ),
-            key=lambda entry: str(entry.get("updated_at", "")),
-            reverse=True,
-        )
-        latest_displayed = (
-            turns[-1].get("displayed_candidates")
-            if turns and isinstance(turns[-1], dict)
-            else None
-        )
+
+        # Candidate order is deterministic: first preserve the exact order of
+        # the most recently displayed list, then append active events touched
+        # by the newest conversation turn followed by the preceding turn.
+        # The broad shared calendar cache is never used as an implicit source.
+        candidate_rows: list[tuple[str, int | None]] = []
+        candidate_ids: set[str] = set()
+
+        def append_candidate(event_id: str, display_index: int | None = None) -> None:
+            if len(candidate_rows) >= _MAX_CONTEXT_EVENTS or event_id in candidate_ids:
+                return
+            entry = scope_events.get(event_id)
+            if not isinstance(entry, Mapping) or entry.get("active") is not True:
+                return
+            if not isinstance(entry.get("snapshot"), Mapping):
+                return
+            candidate_ids.add(event_id)
+            candidate_rows.append((event_id, display_index))
+
+        # A model clarification does not render a new event list. Preserve the
+        # last exact provider-ordered list the owner actually saw so an answer
+        # such as “второе” remains resolvable on the next turn. An explicitly
+        # empty displayed list is authoritative and clears older candidates.
+        latest_displayed = None
+        for turn in reversed(turns):
+            if not isinstance(turn, Mapping):
+                continue
+            displayed = turn.get("displayed_candidates")
+            if isinstance(displayed, list):
+                latest_displayed = displayed
+                break
         if isinstance(latest_displayed, list):
             # Relative references such as "второй" must resolve against the
             # exact list and order the user just saw, never against a recency
             # sort of the broader calendar cache.
-            candidate_events = []
-            seen_ids: set[str] = set()
             seen_display_indexes: set[int] = set()
             for displayed in latest_displayed[:_MAX_CONTEXT_EVENTS]:
                 if not isinstance(displayed, Mapping):
                     continue
                 event_id = str(displayed.get("event_id") or "")
-                if not event_id or event_id in seen_ids:
+                if not event_id:
                     continue
-                entry = scope_events.get(event_id)
-                if not isinstance(entry, dict) or entry.get("active") is not True:
-                    continue
-                snapshot = entry.get("snapshot")
-                if not isinstance(snapshot, dict):
-                    continue
-                seen_ids.add(event_id)
-                candidate = deepcopy(snapshot)
                 stored_index = displayed.get("display_index")
                 if (
                     isinstance(stored_index, int)
@@ -750,82 +1022,100 @@ class OperationStore:
                     while display_index in seen_display_indexes:
                         display_index += 1
                 if display_index in seen_display_indexes:
-                    continue
+                    display_index = 1
+                    while display_index in seen_display_indexes:
+                        display_index += 1
                 seen_display_indexes.add(display_index)
-                candidate["display_index"] = display_index
-                candidate_events.append(candidate)
-        else:
-            candidate_events = [
-                deepcopy(entry["snapshot"])
-                for entry in active_entries[:_MAX_CONTEXT_EVENTS]
-            ]
-        allowed_ids = tuple(str(event["event_id"]) for event in candidate_events)
+                append_candidate(event_id, display_index)
 
-        operations = sorted(
-            (
-                record
-                for record in self._data["operations"].values()
-                if isinstance(record, dict)
-                and record.get("conversation_key")
-                == _conversation_key(account, chat_id)
-                and record.get("stage")
-                in {"applied", "undone", "read", "clarify", "ignored"}
-            ),
-            key=lambda record: str(record.get("updated_at", "")),
-            reverse=True,
-        )[:_MAX_CONTEXT_ACTIONS]
-        recent_actions = [
-            {
-                "operation_id": record.get("operation_id"),
-                "status": record.get("stage"),
-                "items": [
-                    {
-                        "type": item.get("type"),
-                        "event_id": (
-                            (item.get("after") or item.get("before") or {}).get("event_id")
-                            if isinstance(item, dict)
-                            else None
-                        ),
-                        "before": item.get("before"),
-                        "after": item.get("after"),
-                    }
-                    for item in record.get("items", [])
-                    if isinstance(item, dict)
-                ],
-            }
-            for record in operations
-        ]
-        recent_conversation = tuple(
-            {
-                "user_message": turn.get("user_message"),
-                "assistant_message": turn.get("assistant_message"),
-                "status": turn.get("stage"),
-                "actions": turn.get("actions", []),
-            }
-            for turn in turns
+        for turn in reversed(turns):
+            if not isinstance(turn, Mapping):
+                continue
+            for action in turn.get("actions", []):
+                if not isinstance(action, Mapping):
+                    continue
+                # A read can observe more provider rows than Telegram displayed.
+                # Only the explicit displayed list may authorize those rows;
+                # "touched" here means a mutation result.
+                if action.get("type") == "read":
+                    continue
+                event_id = str(action.get("event_id") or "")
+                if event_id:
+                    append_candidate(event_id)
+
+        visible_ids = tuple(event_id for event_id, _ in candidate_rows)
+        event_id_by_ref = {
+            f"e{index}": event_id
+            for index, event_id in enumerate(visible_ids, start=1)
+        }
+        series_event_id_by_ref = {
+            event_ref: str(
+                scope_events[event_id]["snapshot"].get("recurring_event_id")
+                or event_id
+            )
+            for event_ref, event_id in event_id_by_ref.items()
+        }
+        allowed_ids = tuple(
+            dict.fromkeys(
+                (*visible_ids, *series_event_id_by_ref.values())
+            )
         )
-        history_steps: list[dict[str, Any]] = []
+        ref_by_event_id = {
+            event_id: event_ref for event_ref, event_id in event_id_by_ref.items()
+        }
+        candidate_events = [
+            _compact_model_event(
+                scope_events[event_id]["snapshot"],
+                event_ref=ref_by_event_id[event_id],
+                timezone_name=timezone_name,
+                display_index=display_index,
+            )
+            for event_id, display_index in candidate_rows
+        ]
+
+        compact_turns: list[dict[str, Any]] = []
         for turn in turns:
-            interaction_input = turn.get("interaction_input")
-            interaction_steps = turn.get("interaction_steps")
-            if isinstance(interaction_input, dict) and isinstance(interaction_steps, list):
-                history_steps.append(deepcopy(interaction_input))
-                history_steps.extend(
-                    deepcopy(step) for step in interaction_steps if isinstance(step, dict)
-                )
+            if not isinstance(turn, Mapping):
+                continue
+            compact_turn: dict[str, Any] = {
+                "user_message": _context_text(
+                    turn.get("user_message"), _MAX_CONTEXT_USER_TEXT
+                ),
+                "status": turn.get("stage"),
+                "actions": [],
+            }
+            assistant_message = _context_text(
+                turn.get("assistant_message"), _MAX_CONTEXT_ASSISTANT_TEXT
+            )
+            if assistant_message and turn.get("stage") in {
+                "clarify",
+                "ignored",
+                "undone",
+            }:
+                compact_turn["assistant_message"] = assistant_message
+            for action in turn.get("actions", []):
+                if not isinstance(action, Mapping):
+                    continue
+                compact_action = {"type": action.get("type")}
+                event_ref = ref_by_event_id.get(str(action.get("event_id") or ""))
+                if event_ref is not None:
+                    compact_action["event_id"] = event_ref
+                elif action.get("type") == "read":
+                    continue
+                compact_turn["actions"].append(compact_action)
+            compact_turns.append(compact_turn)
+
         application_state = {
-            "reference_time": now.isoformat(),
-            "timezone": timezone_name,
-            "calendar_profile": account,
-            "allowed_event_ids": list(allowed_ids),
+            "allowed_event_ids": list(event_id_by_ref),
             "candidate_events": candidate_events,
-            "recent_actions": recent_actions,
             "lookup_permitted": True,
         }
         return OperationContext(
             application_state=application_state,
-            recent_conversation=recent_conversation,
-            history_steps=tuple(history_steps),
+            recent_conversation=tuple(compact_turns),
+            history_steps=(),
+            event_id_by_ref=event_id_by_ref,
+            series_event_id_by_ref=series_event_id_by_ref,
             allowed_event_ids=allowed_ids,
         )
 
@@ -904,6 +1194,45 @@ class CalendarOperationPipeline:
                 "Google Calendar вернул некорректный результат. Попробуйте ещё раз."
             )
         return result
+
+    async def read_event_snapshot(
+        self, *, account: str, event_id: str
+    ) -> dict[str, Any]:
+        """Read one exact provider event for trusted server-side enrichment.
+
+        This boundary is used to hydrate a recurring series before the model
+        computes a relative RRULE edit.  Provider diagnostics and IDs never
+        become part of an error shown to the owner.
+        """
+
+        if not isinstance(event_id, str) or not event_id:
+            raise OperationStateError("Calendar event ID is invalid")
+        try:
+            provider = await self.calendar.get_event(
+                account=account, event_id=event_id
+            )
+        except CalendarConnectionError:
+            raise
+        except Exception:
+            raise CalendarOperationError(
+                "Не удалось прочитать серию событий из Google Calendar. "
+                "Попробуйте ещё раз."
+            ) from None
+        snapshot = _snapshot(
+            provider,
+            account=account,
+            timezone_name=None,
+        )
+        if snapshot["event_id"] != event_id:
+            raise CalendarOperationError(
+                "Google Calendar вернул другую серию событий. Попробуйте ещё раз."
+            )
+        if snapshot.get("status") not in {"confirmed", "tentative"}:
+            raise CalendarOperationError(
+                "Серия событий больше недоступна для изменения."
+            )
+        self.store.observe_events(account, [snapshot])
+        return snapshot
 
     async def apply_plan(
         self,
@@ -1277,9 +1606,9 @@ class CalendarOperationPipeline:
             if event_id in snapshots:
                 continue
             entry = self.store.event_entry(account, event_id)
-            if entry is None or entry.get("active") is not True:
+            if entry is not None and entry.get("active") is not True:
                 raise OperationStateError("Mutation target is not active")
-            if not isinstance(entry.get("snapshot"), Mapping):
+            if entry is not None and not isinstance(entry.get("snapshot"), Mapping):
                 raise OperationStateError("Mutation target snapshot is invalid")
             try:
                 provider = await self.calendar.get_event(
@@ -1301,6 +1630,8 @@ class CalendarOperationPipeline:
                 raise CalendarOperationError(
                     "Google Calendar вернул другое событие. Попробуйте ещё раз."
                 )
+            if snapshot.get("status") not in {"confirmed", "tentative"}:
+                raise OperationStateError("Mutation target is not active")
             snapshots[event_id] = snapshot
         if snapshots:
             self.store.observe_events(account, tuple(snapshots.values()))
@@ -1335,6 +1666,7 @@ class CalendarOperationPipeline:
                     "event": deepcopy(operation["event"]),
                     "patch": deepcopy(operation["patch"]),
                     "clear_fields": deepcopy(operation["clear_fields"]),
+                    "recurrence_scope": operation.get("recurrence_scope"),
                 },
                 "before": (
                     deepcopy(dict(before_snapshots[operation["target_event_id"]]))
@@ -1478,19 +1810,52 @@ class CalendarOperationPipeline:
                 return
             item["provider_write_started_at"] = _iso_now()
             self.store.put(record)
-            provider = await self.calendar.update_event(
+            update_result = await self.calendar.update_event(
                 account=account,
                 event_id=event_id,
                 patch=provider_patch,
                 idempotency_key=key,
             )
+            if not isinstance(update_result, UpdatedCalendarEvent):
+                raise OperationStateError(
+                    "Calendar update returned an invalid result"
+                )
+            adapter_before = _snapshot(
+                update_result.previous,
+                account=account,
+                timezone_name=None,
+            )
+            if adapter_before["event_id"] != event_id:
+                raise OperationStateError(
+                    "Updated target has another previous ID"
+                )
+            # The adapter's own GET is closer to the provider write than the
+            # durable pipeline preflight.  Always adopt it after a confirmed
+            # response, including replay: otherwise an external edit landing
+            # in between could be overwritten by Undo.
+            before = adapter_before
+            item["before"] = adapter_before
+            self.store.observe_events(account, [adapter_before])
+            self.store.put(record)
             after = _snapshot(
-                provider,
+                update_result.current,
                 account=account,
                 fallback=desired,
                 timezone_name=None,
             )
             item["after"] = after
+            if update_result.already_applied:
+                # On replay this may be either our earlier ambiguous write or
+                # an external actor.  Fail closed: do not claim Undo ownership.
+                item["write_skipped"] = True
+                item["stage"] = "applied"
+                item.pop("last_error_class", None)
+                return
+            if _materially_equivalent(before, after):
+                item["write_skipped"] = True
+                item["stage"] = "applied"
+                item.pop("last_error_class", None)
+                return
             self.store._put_event(account, after, active=True, operation_id=operation_id)
         elif action == "delete":
             event_id = str(item["target_event_id"])
@@ -1523,6 +1888,21 @@ class CalendarOperationPipeline:
             deletion = await self.calendar.delete_event(
                 account=account, event_id=event_id, idempotency_key=key
             )
+            provider_previous = getattr(deletion, "previous", None)
+            if provider_previous is not None:
+                before = _snapshot(
+                    provider_previous,
+                    account=account,
+                    timezone_name=None,
+                )
+                if before["event_id"] != event_id:
+                    raise OperationStateError("Deleted target has another previous ID")
+                item["before"] = before
+                self.store.put(record)
+            if bool(getattr(deletion, "already_deleted", False)):
+                # A cancelled target on replay is ownership-ambiguous. Never
+                # recreate it through Undo unless this call confirmed a write.
+                item["write_skipped"] = True
             provider_current = getattr(deletion, "current", None)
             deleted_snapshot = _snapshot(
                 provider_current,
@@ -1533,9 +1913,15 @@ class CalendarOperationPipeline:
             )
             if deleted_snapshot.get("status") != "cancelled":
                 raise OperationStateError("Calendar delete was not confirmed")
-            self.store._put_event(
-                account, deleted_snapshot, active=False, operation_id=operation_id
-            )
+            if item.get("write_skipped") is True:
+                self.store.observe_events(account, [deleted_snapshot])
+            else:
+                self.store._put_event(
+                    account,
+                    deleted_snapshot,
+                    active=False,
+                    operation_id=operation_id,
+                )
         else:  # pragma: no cover - protected by plan validation
             raise OperationStateError("Unknown calendar operation")
         item["stage"] = "applied"
@@ -1547,8 +1933,6 @@ class CalendarOperationPipeline:
         patch: Mapping[str, Any],
         clear_fields: Sequence[str],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if "recurrence_rrule" in patch or "recurrence_rrule" in clear_fields:
-            raise OperationStateError("Recurring event updates require explicit scope")
         desired = {**dict(before), **dict(patch)}
         for field in clear_fields:
             desired[field] = None
@@ -1611,12 +1995,13 @@ class CalendarOperationPipeline:
             )["events"][0]
         desired.update(validated)
         provider_patch: dict[str, Any] = {}
+        explicit_fields = set(patch) | set(clear_fields)
         for field in ("title", "description", "location", "timezone"):
             before_value = before.get(field)
             after_value = desired.get(field)
-            if before_value != after_value:
+            if field in explicit_fields or before_value != after_value:
                 provider_patch[field] = "" if after_value is None else after_value
-        if (
+        if temporal_patch or (
             before.get("start_at") != desired.get("start_at")
             or before.get("end_at") != desired.get("end_at")
             or old_all_day != new_all_day
@@ -1624,6 +2009,27 @@ class CalendarOperationPipeline:
             provider_patch["start_at"] = desired["start_at"]
             provider_patch["end_at"] = desired["end_at"]
             provider_patch["timezone"] = desired["timezone"]
+        if "recurrence_rrule" in explicit_fields:
+            recurrence = desired.get("recurrence_rrule")
+            if recurrence is None:
+                provider_patch["recurrence_rrules"] = []
+            else:
+                existing_rules = before.get("recurrence_rrules")
+                preserved_rules = (
+                    [
+                        str(rule)
+                        for rule in existing_rules
+                        if isinstance(rule, str)
+                        and not rule.startswith("RRULE:")
+                    ]
+                    if isinstance(existing_rules, Sequence)
+                    and not isinstance(existing_rules, (str, bytes))
+                    else []
+                )
+                provider_patch["recurrence_rrules"] = [
+                    str(recurrence),
+                    *preserved_rules,
+                ]
         return provider_patch, desired
 
     @staticmethod
@@ -1702,6 +2108,15 @@ class CalendarOperationPipeline:
                     item["undo_stage"] = "undone"
                     record["updated_at"] = _iso_now()
                     self.store.put(record)
+            except CalendarStateConflictError:
+                record["undo"] = {
+                    "stage": "blocked",
+                    "fidelity": undo_fidelity,
+                    "updated_at": _iso_now(),
+                }
+                record["updated_at"] = _iso_now()
+                self.store.put(record)
+                return UndoResult(True, "blocked", deepcopy(record), titles)
             except CalendarConnectionError:
                 record["undo"] = {
                     "stage": "undoing",
@@ -1811,7 +2226,10 @@ class CalendarOperationPipeline:
         if action == "create":
             event_id = str(item["after"]["event_id"])
             await self.calendar.delete_event(
-                account=account, event_id=event_id, idempotency_key=key
+                account=account,
+                event_id=event_id,
+                idempotency_key=key,
+                expected_current=_snapshot_precondition(item["after"]),
             )
             self.store._put_event(
                 account, item["after"], active=False, operation_id=operation_id
@@ -1822,11 +2240,27 @@ class CalendarOperationPipeline:
             if item.get("write_skipped") is True:
                 item["undo_after"] = deepcopy(before)
                 return
+            request = item.get("request")
+            request = request if isinstance(request, Mapping) else {}
+            requested_patch = request.get("patch")
+            requested_patch = (
+                requested_patch if isinstance(requested_patch, Mapping) else {}
+            )
+            requested_clears = request.get("clear_fields")
+            requested_clears = (
+                requested_clears
+                if isinstance(requested_clears, Sequence)
+                and not isinstance(requested_clears, (str, bytes))
+                else ()
+            )
+            touched_fields = set(requested_patch) | {
+                str(field) for field in requested_clears
+            }
             patch: dict[str, Any] = {}
-            for field in ("title", "description", "location", "timezone"):
-                if before.get(field) != after.get(field):
+            for field in ("title", "description", "location"):
+                if field in touched_fields and before.get(field) != after.get(field):
                     patch[field] = "" if before.get(field) is None else before.get(field)
-            if (
+            if touched_fields & {"start_at", "end_at", "all_day", "timezone"} and (
                 before.get("start_at") != after.get("start_at")
                 or before.get("end_at") != after.get("end_at")
                 or before.get("all_day") != after.get("all_day")
@@ -1836,14 +2270,30 @@ class CalendarOperationPipeline:
                     end_at=before["end_at"],
                     timezone=before["timezone"],
                 )
+            if (
+                "recurrence_rrule" in touched_fields
+                and before.get("recurrence_rrules")
+                != after.get("recurrence_rrules")
+            ):
+                patch["recurrence_rrules"] = list(
+                    before.get("recurrence_rrules") or ()
+                )
+            if not patch:
+                item["undo_after"] = deepcopy(after)
+                return
             restored = await self.calendar.update_event(
                 account=account,
                 event_id=str(after["event_id"]),
                 patch=patch,
                 idempotency_key=key,
+                expected_current=_snapshot_precondition(after),
             )
+            if not isinstance(restored, UpdatedCalendarEvent):
+                raise OperationStateError(
+                    "Calendar update undo returned an invalid result"
+                )
             restored_snapshot = _snapshot(
-                restored,
+                restored.current,
                 account=account,
                 fallback=before,
                 timezone_name=None,
@@ -1853,6 +2303,9 @@ class CalendarOperationPipeline:
                 account, restored_snapshot, active=True, operation_id=operation_id
             )
         elif action == "delete":
+            if item.get("write_skipped") is True:
+                item["undo_after"] = deepcopy(item["before"])
+                return
             before = item["before"]
             restore_event = _event_payload(before)
             if restore_event.get("timezone") is None:

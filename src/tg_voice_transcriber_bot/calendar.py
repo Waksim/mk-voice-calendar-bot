@@ -31,6 +31,15 @@ class CalendarWriteRejectedError(RuntimeError):
     """
 
 
+class CalendarStateConflictError(CalendarWriteRejectedError):
+    """The event changed after the caller observed it, so no write occurred.
+
+    This is an optimistic-concurrency conflict rather than an ambiguous
+    provider failure.  Retrying the same mutation without first obtaining a
+    new snapshot would risk overwriting a newer edit.
+    """
+
+
 @dataclass(frozen=True)
 class CreatedCalendarEvent:
     """Stable, non-secret reference returned by a calendar adapter."""
@@ -107,6 +116,21 @@ class CalendarEventQueryResult:
 
 
 @dataclass(frozen=True)
+class UpdatedCalendarEvent:
+    """Verified result of an idempotent update boundary.
+
+    ``previous`` is the provider-fresh state observed immediately before the
+    adapter decided whether a write was needed. ``current`` is the verified
+    resulting state. ``already_applied`` is true only when the initial read
+    already matched the requested patch and no provider write was attempted.
+    """
+
+    previous: CalendarEventSnapshot
+    current: CalendarEventSnapshot
+    already_applied: bool = False
+
+
+@dataclass(frozen=True)
 class DeletedCalendarEvent:
     """Result of an idempotent delete boundary.
 
@@ -171,7 +195,8 @@ class CalendarClient(Protocol):
         event_id: str,
         patch: Mapping[str, Any],
         idempotency_key: str,
-    ) -> CalendarEventSnapshot: ...
+        expected_current: CalendarEventSnapshot | None = None,
+    ) -> UpdatedCalendarEvent: ...
 
     async def delete_event(
         self,
@@ -179,4 +204,5 @@ class CalendarClient(Protocol):
         account: str,
         event_id: str,
         idempotency_key: str,
+        expected_current: CalendarEventSnapshot | None = None,
     ) -> DeletedCalendarEvent: ...

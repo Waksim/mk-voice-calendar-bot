@@ -110,26 +110,35 @@ def create_operation(event=None):
     return {
         "type": "create",
         "target_event_id": None,
+        "recurrence_scope": None,
         "event": event or valid_event()["events"][0],
         "patch": None,
         "clear_fields": [],
     }
 
 
-def update_operation(event_id="known-event", *, patch=None, clear_fields=None):
+def update_operation(
+    event_id="known-event",
+    *,
+    patch=None,
+    clear_fields=None,
+    recurrence_scope=None,
+):
     return {
         "type": "update",
         "target_event_id": event_id,
+        "recurrence_scope": recurrence_scope,
         "event": None,
         "patch": patch,
         "clear_fields": clear_fields or [],
     }
 
 
-def delete_operation(event_id="known-event"):
+def delete_operation(event_id="known-event", *, recurrence_scope=None):
     return {
         "type": "delete",
         "target_event_id": event_id,
+        "recurrence_scope": recurrence_scope,
         "event": None,
         "patch": None,
         "clear_fields": [],
@@ -140,6 +149,7 @@ def operation_plan(*operations):
     return {
         "action": "execute",
         "operations": list(operations),
+        "lookup": None,
         "clarification_question": None,
         "confidence": 0.94,
     }
@@ -148,9 +158,13 @@ def operation_plan(*operations):
 def test_operation_schema_exposes_all_mutation_types_and_five_item_limit():
     operations = CALENDAR_OPERATION_SCHEMA["properties"]["operations"]
     operation_type = operations["items"]["properties"]["type"]
+    recurrence_scope = operations["items"]["properties"]["recurrence_scope"]
 
     assert operations["maxItems"] == 5
     assert operation_type["enum"] == ["create", "update", "delete"]
+    assert recurrence_scope["anyOf"][0]["enum"] == ["series", "occurrence"]
+    assert "recurrence_scope" in operations["items"]["required"]
+    assert "lookup" in CALENDAR_OPERATION_SCHEMA["required"]
 
 
 def test_create_operation_requires_and_normalizes_a_complete_event():
@@ -162,6 +176,7 @@ def test_create_operation_requires_and_normalizes_a_complete_event():
     assert plan["confidence"] == 0.94
     assert plan["operations"][0]["event"]["title"] == "Встреча с Анной"
     assert plan["operations"][0]["patch"] is None
+    assert plan["operations"][0]["recurrence_scope"] is None
 
 
 def test_create_operation_rejects_partial_event_and_target_id():
@@ -175,6 +190,44 @@ def test_create_operation_rejects_partial_event_and_target_id():
     payload["operations"][0]["target_event_id"] = "known-event"
     with pytest.raises(ValueError, match="create"):
         validate_calendar_operation_plan(payload, {"known-event"})
+
+    payload = operation_plan(create_operation())
+    payload["operations"][0]["recurrence_scope"] = "series"
+    with pytest.raises(ValueError, match="create"):
+        validate_calendar_operation_plan(payload, set())
+
+
+def test_recurrence_scope_is_mandatory_and_strictly_enumerated():
+    missing = operation_plan(update_operation(patch={"title": "Новое"}))
+    del missing["operations"][0]["recurrence_scope"]
+    with pytest.raises(ValueError, match="unexpected or missing"):
+        validate_calendar_operation_plan(missing, {"known-event"})
+
+    invalid = operation_plan(
+        update_operation(
+            patch={"title": "Новое"}, recurrence_scope="everything"
+        )
+    )
+    with pytest.raises(ValueError, match="recurrence_scope"):
+        validate_calendar_operation_plan(invalid, {"known-event"})
+
+
+def test_recurring_mutations_preserve_explicit_series_or_occurrence_scope():
+    series = operation_plan(
+        update_operation(
+            patch={"location": "Офис"}, recurrence_scope="series"
+        )
+    )
+    occurrence = operation_plan(
+        delete_operation(recurrence_scope="occurrence")
+    )
+
+    assert validate_calendar_operation_plan(series, {"known-event"})[
+        "operations"
+    ][0]["recurrence_scope"] == "series"
+    assert validate_calendar_operation_plan(occurrence, {"known-event"})[
+        "operations"
+    ][0]["recurrence_scope"] == "occurrence"
 
 
 def test_update_preserves_omitted_fields_and_uses_explicit_clear_fields():
@@ -203,18 +256,58 @@ def test_update_rejects_null_or_blank_patch_instead_of_accidentally_clearing():
 
 def test_update_can_clear_only_supported_nullable_calendar_fields():
     valid = operation_plan(
-        update_operation(patch=None, clear_fields=["description"])
+        update_operation(
+            patch=None,
+            clear_fields=["description", "recurrence_rrule"],
+            recurrence_scope="series",
+        )
     )
     assert validate_calendar_operation_plan(valid, {"known-event"})[
         "operations"
-    ][0]["clear_fields"] == ["description"]
+    ][0]["clear_fields"] == ["description", "recurrence_rrule"]
 
-    for field in ("title", "recurrence_rrule"):
+    for field in ("title",):
         invalid = operation_plan(
             update_operation(patch=None, clear_fields=[field])
         )
         with pytest.raises(ValueError, match="clear_fields"):
             validate_calendar_operation_plan(invalid, {"known-event"})
+
+
+def test_update_accepts_a_valid_recurrence_rule_and_rejects_injected_lines():
+    valid = operation_plan(
+        update_operation(
+            patch={"recurrence_rrule": "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"},
+            recurrence_scope="series",
+        )
+    )
+    assert validate_calendar_operation_plan(valid, {"known-event"})[
+        "operations"
+    ][0]["patch"]["recurrence_rrule"].endswith("BYDAY=MO,WE,FR")
+
+    invalid = operation_plan(
+        update_operation(
+            patch={
+                "recurrence_rrule": "RRULE:FREQ=WEEKLY\nEXDATE:20260824"
+            },
+            recurrence_scope="series",
+        )
+    )
+    with pytest.raises(ValueError, match="invalid characters"):
+        validate_calendar_operation_plan(invalid, {"known-event"})
+
+
+@pytest.mark.parametrize("scope", [None, "occurrence"])
+def test_recurrence_rule_changes_require_series_scope(scope):
+    payload = operation_plan(
+        update_operation(
+            patch={"recurrence_rrule": "RRULE:FREQ=WEEKLY;BYDAY=MO,WE"},
+            recurrence_scope=scope,
+        )
+    )
+
+    with pytest.raises(ValueError, match="recurrence_scope=series"):
+        validate_calendar_operation_plan(payload, {"known-event"})
 
 
 def test_update_cannot_patch_and_clear_the_same_field():
@@ -393,6 +486,7 @@ def test_execute_clarify_and_ignore_have_disjoint_payloads():
     clarify = {
         "action": "clarify",
         "operations": [],
+        "lookup": None,
         "clarification_question": "Какое событие изменить?",
         "confidence": 0.4,
     }
@@ -403,6 +497,7 @@ def test_execute_clarify_and_ignore_have_disjoint_payloads():
     ignore = {
         "action": "ignore",
         "operations": [],
+        "lookup": None,
         "clarification_question": None,
         "confidence": 0.99,
     }

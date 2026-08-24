@@ -23,6 +23,7 @@ from .calendar import (
 from .calendar_mcp import open_calendar_mcp
 from .config import PROJECT_ROOT, Config
 from .confirmation import CalendarConfirmationPipeline, ConfirmationStore
+from .fast_read import plan_fast_calendar_read
 from .gateway import (
     GatewayConnectionError,
     GatewayError,
@@ -91,6 +92,14 @@ _READ_DISPLAY_LIMIT = 8
 _LOOKUP_DISPLAY_LIMIT = 5
 _ACTIVE_EVENT_STATUSES = frozenset({"confirmed", "tentative"})
 _CALENDAR_WRITE_RETRY_LIMIT = 5
+_MODEL_TITLE_LIMIT = 300
+_MODEL_LOCATION_LIMIT = 300
+_MODEL_DESCRIPTION_LIMIT = 500
+_MODEL_RECURRENCE_LIMIT = 500
+
+
+class _UnknownEventReference(ValueError):
+    """The model selected an event reference outside the server allowlist."""
 
 
 def message_command(text: str) -> str:
@@ -283,17 +292,352 @@ def _calendar_query_payload(result: CalendarEventQueryResult) -> dict[str, Any]:
     }
 
 
-def _indexed_candidates(
-    candidates: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Copy an ordered UI candidate set and attach its one-based row index."""
+def _compact_lookup_candidates(
+    candidates: Sequence[Mapping[str, Any]], *, timezone_name: str
+) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]]:
+    """Expose a minimal, per-request alias set to the lookup second pass.
 
-    indexed: list[dict[str, Any]] = []
+    Provider IDs and metadata stay server-side.  The model sees only short
+    references (``c1``, ``c2``, ...) and the fields needed to distinguish the
+    rows rendered to the owner.
+    """
+
+    compact: list[dict[str, Any]] = []
+    event_id_by_ref: dict[str, str] = {}
+    series_event_id_by_ref: dict[str, str] = {}
+    zone = ZoneInfo(timezone_name)
+
+    def bounded(value: Any, limit: int) -> str | None:
+        if not isinstance(value, str):
+            return None
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+
+    def normalized_series_context(
+        value: Any,
+    ) -> dict[str, Any] | None:
+        if not isinstance(value, Mapping):
+            return None
+        all_day = bool(value.get("all_day"))
+        start_at = value.get("start_at")
+        end_at = value.get("end_at")
+        if not isinstance(start_at, str) or not isinstance(end_at, str):
+            raise RuntimeError("Persisted Calendar series has no time range")
+        if not all_day:
+            normalized: list[str] = []
+            for field, raw_value in (("start_at", start_at), ("end_at", end_at)):
+                try:
+                    parsed = datetime.fromisoformat(raw_value)
+                except ValueError:
+                    raise RuntimeError(
+                        f"Persisted Calendar series has invalid {field} timestamp"
+                    ) from None
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise RuntimeError(
+                        f"Persisted Calendar series has naive {field} timestamp"
+                    )
+                normalized.append(parsed.astimezone(zone).isoformat())
+            start_at, end_at = normalized
+        rules = value.get("recurrence_rrules")
+        recurrence = None
+        if (
+            isinstance(rules, Sequence)
+            and not isinstance(rules, (str, bytes, bytearray))
+            and rules
+        ):
+            recurrence = next(
+                (
+                    str(rule)
+                    for rule in rules
+                    if str(rule).startswith("RRULE:")
+                ),
+                None,
+            )
+        elif isinstance(value.get("recurrence_rrule"), str):
+            recurrence = str(value["recurrence_rrule"])
+        return {
+            "start_at": start_at,
+            "end_at": end_at,
+            "all_day": all_day,
+            "timezone": timezone_name,
+            "recurrence_rrule": bounded(recurrence, _MODEL_RECURRENCE_LIMIT),
+        }
+
     for display_index, candidate in enumerate(candidates, start=1):
-        copied = deepcopy(dict(candidate))
-        copied["display_index"] = display_index
-        indexed.append(copied)
-    return indexed
+        event_id = str(candidate.get("event_id") or "")
+        if not event_id:
+            raise RuntimeError("Persisted Calendar candidate has no event ID")
+        event_ref = f"c{display_index}"
+        event_id_by_ref[event_ref] = event_id
+        series_event_id_by_ref[event_ref] = str(
+            candidate.get("recurring_event_id") or event_id
+        )
+        all_day = bool(candidate.get("all_day"))
+        start_at = candidate.get("start_at")
+        end_at = candidate.get("end_at")
+        if not all_day:
+            normalized_times: list[str] = []
+            for field, value in (("start_at", start_at), ("end_at", end_at)):
+                if not isinstance(value, str):
+                    raise RuntimeError(
+                        f"Persisted Calendar candidate has no {field} timestamp"
+                    )
+                try:
+                    parsed = datetime.fromisoformat(value)
+                except ValueError:
+                    raise RuntimeError(
+                        f"Persisted Calendar candidate has invalid {field} timestamp"
+                    ) from None
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise RuntimeError(
+                        f"Persisted Calendar candidate has naive {field} timestamp"
+                    )
+                normalized_times.append(parsed.astimezone(zone).isoformat())
+            start_at, end_at = normalized_times
+        series_context = normalized_series_context(candidate.get("series_context"))
+        recurrence = candidate.get("recurrence_rrule")
+        if recurrence is None:
+            recurrence_rules = candidate.get("recurrence_rrules")
+            if (
+                isinstance(recurrence_rules, Sequence)
+                and not isinstance(recurrence_rules, (str, bytes, bytearray))
+                and recurrence_rules
+            ):
+                recurrence = next(
+                    (
+                        str(rule)
+                        for rule in recurrence_rules
+                        if str(rule).startswith("RRULE:")
+                    ),
+                    None,
+                )
+        if recurrence is None and series_context is not None:
+            recurrence = series_context.get("recurrence_rrule")
+        item: dict[str, Any] = {
+            "event_id": event_ref,
+            "display_index": display_index,
+            "title": bounded(
+                candidate.get("title") or "Без названия", _MODEL_TITLE_LIMIT
+            ),
+            "start_at": start_at,
+            "end_at": end_at,
+            "all_day": all_day,
+            "timezone": timezone_name,
+            "location": bounded(
+                candidate.get("location"), _MODEL_LOCATION_LIMIT
+            ),
+            "description": bounded(
+                candidate.get("description"), _MODEL_DESCRIPTION_LIMIT
+            ),
+            "recurrence_rrule": bounded(
+                recurrence, _MODEL_RECURRENCE_LIMIT
+            ),
+            "recurring": bool(recurrence or candidate.get("recurring_event_id")),
+            "recurring_instance": bool(candidate.get("recurring_event_id")),
+            "status": str(candidate.get("status") or "confirmed"),
+        }
+        if series_context is not None:
+            item["series_context"] = series_context
+        compact.append(item)
+    return compact, event_id_by_ref, series_event_id_by_ref
+
+
+async def _hydrate_lookup_series_candidates(
+    pipeline: CalendarOperationPipeline,
+    *,
+    account: str,
+    candidates: Sequence[Mapping[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Attach provider-fresh recurrence data without exposing master IDs.
+
+    Google returns expanded occurrences from list/search.  Those rows carry a
+    master ID but normally omit the master's RRULE.  A relative command such
+    as “убери пятницу” is therefore unsafe to plan until the exact master has
+    been read.  Only the bounded rows that can become mutation candidates are
+    hydrated, and duplicate occurrences of one series share a single read.
+    """
+
+    hydrated = [deepcopy(dict(candidate)) for candidate in candidates]
+    master_contexts: dict[str, dict[str, Any]] = {}
+    visible = 0
+    for candidate in hydrated:
+        if candidate.get("status") not in {None, "confirmed", "tentative"}:
+            continue
+        if visible >= limit:
+            break
+        visible += 1
+        master_id = str(candidate.get("recurring_event_id") or "")
+        event_id = str(candidate.get("event_id") or "")
+        if not master_id or master_id == event_id:
+            continue
+        series_context = candidate.get("series_context")
+        if isinstance(series_context, Mapping):
+            continue
+        if master_id not in master_contexts:
+            master = await pipeline.read_event_snapshot(
+                account=account, event_id=master_id
+            )
+            rules = master.get("recurrence_rrules")
+            if not (
+                isinstance(rules, Sequence)
+                and not isinstance(rules, (str, bytes, bytearray))
+                and rules
+            ):
+                raise CalendarOperationError(
+                    "Google Calendar не вернул правило повторения серии. "
+                    "Уточните изменение новым сообщением."
+                )
+            master_contexts[master_id] = {
+                "start_at": master.get("start_at"),
+                "end_at": master.get("end_at"),
+                "all_day": bool(master.get("all_day")),
+                "timezone": master.get("timezone"),
+                "recurrence_rrules": list(rules),
+            }
+        candidate["series_context"] = deepcopy(master_contexts[master_id])
+    return hydrated
+
+
+def _resolve_plan_event_references(
+    plan: Mapping[str, Any],
+    event_id_by_ref: Mapping[str, str],
+    series_event_id_by_ref: Mapping[str, str] | None = None,
+    recurring_event_refs: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Translate model-visible aliases to trusted provider event IDs."""
+
+    resolved = deepcopy(dict(plan))
+    operations = resolved.get("operations")
+    if not isinstance(operations, list):
+        return resolved
+    recurring_refs = (
+        frozenset(recurring_event_refs)
+        if recurring_event_refs is not None
+        else frozenset(
+            event_ref
+            for event_ref, event_id in event_id_by_ref.items()
+            if series_event_id_by_ref is not None
+            and series_event_id_by_ref.get(event_ref) != event_id
+        )
+    )
+
+    def clarify_scope() -> dict[str, Any]:
+        clarification = {
+            "action": "clarify",
+            "operations": [],
+            "lookup": None,
+            "clarification_question": (
+                "Изменить только выбранное повторение или всю серию событий?"
+            ),
+            "confidence": float(resolved.get("confidence", 0)),
+        }
+        for key in ("_interaction_input", "_interaction_steps"):
+            if key in resolved:
+                clarification[key] = deepcopy(resolved[key])
+        return clarification
+
+    def clarify_occurrence_date() -> dict[str, Any]:
+        clarification = {
+            "action": "clarify",
+            "operations": [],
+            "lookup": None,
+            "clarification_question": (
+                "Укажите дату конкретного повторения, которое нужно изменить."
+            ),
+            "confidence": float(resolved.get("confidence", 0)),
+        }
+        for key in ("_interaction_input", "_interaction_steps"):
+            if key in resolved:
+                clarification[key] = deepcopy(resolved[key])
+        return clarification
+
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        operation_type = operation.get("type")
+        if operation_type not in {"update", "delete"}:
+            continue
+        event_ref = operation.get("target_event_id")
+        if not isinstance(event_ref, str) or event_ref not in event_id_by_ref:
+            raise _UnknownEventReference("unknown model event reference")
+        patch = operation.get("patch")
+        clear_fields = operation.get("clear_fields")
+        recurrence_mutation = (
+            isinstance(patch, Mapping) and "recurrence_rrule" in patch
+        ) or (
+            isinstance(clear_fields, Sequence)
+            and not isinstance(clear_fields, (str, bytes, bytearray))
+            and "recurrence_rrule" in clear_fields
+        )
+        recurrence_scope = operation.get("recurrence_scope")
+        recurring = event_ref in recurring_refs
+        if recurrence_mutation and recurrence_scope != "series":
+            return clarify_scope()
+        if recurring and recurrence_scope not in {"series", "occurrence"}:
+            return clarify_scope()
+        if (
+            recurring
+            and recurrence_scope == "occurrence"
+            and series_event_id_by_ref is not None
+            and series_event_id_by_ref.get(event_ref)
+            == event_id_by_ref.get(event_ref)
+        ):
+            # A master ID cannot safely stand in for one concrete occurrence.
+            return clarify_occurrence_date()
+        if not recurring and not recurrence_mutation and recurrence_scope is not None:
+            return clarify_scope()
+        target_map = event_id_by_ref
+        if recurrence_scope == "series":
+            if series_event_id_by_ref is None:
+                return clarify_scope()
+            target_map = series_event_id_by_ref
+        if event_ref not in target_map:
+            raise _UnknownEventReference("unknown model event reference")
+        operation["target_event_id"] = str(target_map[event_ref])
+    return resolved
+
+
+def _gemini_timed_out(exc: GeminiError) -> bool:
+    diagnostic = f"{type(exc).__name__}: {exc}".casefold()
+    return any(
+        marker in diagnostic
+        for marker in ("timeout", "timed out", "deadline", "readtimeout")
+    )
+
+
+def _gemini_failure_copy(exc: GeminiError, *, matching: bool = False) -> str:
+    if _gemini_timed_out(exc):
+        return (
+            "Gemini не успела обработать команду за отведённое время. "
+            "Попробуйте повторить её через несколько минут."
+        )
+    if matching:
+        return (
+            "Gemini не смогла выбрать точное событие. Уточните название "
+            "или время новым сообщением."
+        )
+    return (
+        "Gemini не смогла надёжно разобрать календарную команду. "
+        "Попробуйте уточнить её новым сообщением."
+    )
+
+
+def _fast_read_progress_card(*, input_kind: str) -> str:
+    header = (
+        "🎙️ <b>Обрабатываю голосовое</b>"
+        if input_kind == "voice"
+        else "💬 <b>Обрабатываю текстовую команду</b>"
+    )
+    received = (
+        "✅ Расшифровка Telegram получена"
+        if input_kind == "voice"
+        else "✅ Текстовая команда получена"
+    )
+    return (
+        f"{header}\n\n{received}\n"
+        "✅ Период поиска определён\n"
+        "⏳ Ищу события в Google Calendar…"
+    )
 
 
 def _visible_active_candidates(
@@ -878,9 +1222,27 @@ class VoiceBotService:
             self.state.save_job(update_id, job)
         input_kind = "text" if job.get("input_kind") == "text" else "voice"
         if int(job.get("status_message_id", 0) or 0) <= 0:
-            matching_html = format_progress_card(
-                "gemini" if input_kind == "text" else "matching",
-                input_kind=input_kind,
+            initial_stage = "matching"
+            initial_fast_read = False
+            if input_kind == "text":
+                initial_stage = "gemini"
+                initial_transcript = str(job.get("transcript") or "")
+                initial_time = datetime.fromtimestamp(
+                    int(job["sent_at"]), tz=timezone.utc
+                ).astimezone(ZoneInfo(self.config.calendar_timezone))
+                if plan_fast_calendar_read(
+                    initial_transcript,
+                    reference_time=initial_time,
+                    timezone=self.config.calendar_timezone,
+                ) is not None:
+                    initial_fast_read = True
+            matching_html = (
+                _fast_read_progress_card(input_kind=input_kind)
+                if initial_fast_read
+                else format_progress_card(
+                    initial_stage,  # type: ignore[arg-type]
+                    input_kind=input_kind,
+                )
             )
             job["status_message_id"] = await self.bot.send_html(
                 chat_id,
@@ -965,13 +1327,21 @@ class VoiceBotService:
 
         if job.get("status") == "transcribed":
             transcript = str(job["transcript"])
-            await self._edit_progress_best_effort(
-                chat_id=chat_id,
-                job=job,
-                html_text=format_progress_card("gemini", input_kind=input_kind),
+            sent_time = datetime.fromtimestamp(
+                int(job["sent_at"]), tz=timezone.utc
+            ).astimezone(ZoneInfo(self.config.calendar_timezone))
+            fast_plan = plan_fast_calendar_read(
+                transcript,
+                reference_time=sent_time,
+                timezone=self.config.calendar_timezone,
             )
-            self.state.save_job(update_id, job)
-            if not self.gemini_available:
+            if fast_plan is not None:
+                # Exact, bounded read phrases do not need an LLM round trip.
+                job["plan"] = fast_plan
+                job["fast_read"] = True
+                job["status"] = "planned"
+                self.state.save_job(update_id, job)
+            elif not self.gemini_available:
                 job["final_html"] = format_error_card(
                     "Gemini сейчас недоступна. Команда сохранена в этой карточке.",
                     transcript=transcript,
@@ -981,12 +1351,18 @@ class VoiceBotService:
                 job["status"] = "final_ready"
                 self.state.save_job(update_id, job)
             else:
-                sent_time = datetime.fromtimestamp(
-                    int(job["sent_at"]), tz=timezone.utc
-                ).astimezone(ZoneInfo(self.config.calendar_timezone))
+                await self._edit_progress_best_effort(
+                    chat_id=chat_id,
+                    job=job,
+                    html_text=format_progress_card(
+                        "gemini", input_kind=input_kind
+                    ),
+                )
+                self.state.save_job(update_id, job)
                 context = pipeline.context(
                     account=account, chat_id=chat_id, now=sent_time
                 )
+                planning_started = time.monotonic()
                 try:
                     plan = await self.gemini.plan_calendar_actions(
                         transcript,
@@ -996,14 +1372,46 @@ class VoiceBotService:
                         recent_conversation=context.recent_conversation,
                         history_steps=context.history_steps,
                     )
-                except GeminiError:
+                    plan = _resolve_plan_event_references(
+                        plan,
+                        context.event_id_by_ref,
+                        context.series_event_id_by_ref,
+                        tuple(
+                            str(candidate.get("event_id"))
+                            for candidate in context.application_state.get(
+                                "candidate_events", []
+                            )
+                            if isinstance(candidate, Mapping)
+                            and candidate.get("recurring") is True
+                            and candidate.get("event_id")
+                        ),
+                    )
+                except _UnknownEventReference:
                     LOGGER.warning(
-                        "Gemini planning failed for update %s; calendar unchanged",
+                        "Gemini planning returned an unknown event reference "
+                        "for update %s; calendar unchanged",
                         update_id,
                     )
                     job["final_html"] = format_error_card(
-                        "Gemini не смогла надёжно разобрать календарную команду. "
-                        "Попробуйте уточнить её новым сообщением.",
+                        "Gemini выбрала событие вне доступного контекста. "
+                        "Уточните его название или время новым сообщением.",
+                        transcript=transcript,
+                        elapsed_seconds=self._elapsed(job),
+                    )
+                    job["final_reply_markup"] = None
+                    job["status"] = "final_ready"
+                except GeminiError as exc:
+                    planning_elapsed = time.monotonic() - planning_started
+                    LOGGER.warning(
+                        "Gemini planning failed for update %s; error_type=%s "
+                        "error=%s elapsed=%.3fs; calendar unchanged",
+                        update_id,
+                        type(exc).__name__,
+                        str(exc),
+                        planning_elapsed,
+                    )
+                    job["final_html"] = format_error_card(
+                        _gemini_failure_copy(exc),
                         transcript=transcript,
                         elapsed_seconds=self._elapsed(job),
                     )
@@ -1025,8 +1433,12 @@ class VoiceBotService:
                 await self._edit_progress_best_effort(
                     chat_id=chat_id,
                     job=job,
-                    html_text=format_progress_card(
-                        "calendar_lookup", input_kind=input_kind
+                    html_text=(
+                        _fast_read_progress_card(input_kind=input_kind)
+                        if job.get("fast_read") is True
+                        else format_progress_card(
+                            "calendar_lookup", input_kind=input_kind
+                        )
                     ),
                 )
                 self.state.save_job(update_id, job)
@@ -1043,6 +1455,15 @@ class VoiceBotService:
                         limit=20,
                     )
                     durable_result = _calendar_query_payload(query_result)
+                    if plan.get("action") == "lookup":
+                        durable_result["events"] = (
+                            await _hydrate_lookup_series_candidates(
+                                pipeline,
+                                account=account,
+                                candidates=durable_result["events"],
+                                limit=_LOOKUP_DISPLAY_LIMIT,
+                            )
+                        )
                 except CalendarOperationError as exc:
                     LOGGER.warning(
                         "Calendar lookup failed for update %s; calendar unchanged",
@@ -1142,8 +1563,21 @@ class VoiceBotService:
                 if len(visible_candidates) != len(pinned_candidates):
                     raise RuntimeError("Persisted Calendar candidate set is invalid")
             elif events:
+                series_context_by_event_id = {
+                    str(event.get("event_id")): deepcopy(event["series_context"])
+                    for event in events
+                    if isinstance(event, Mapping)
+                    and event.get("event_id")
+                    and isinstance(event.get("series_context"), Mapping)
+                }
                 observed = pipeline.observe_lookup_events(account, events)
                 trusted_candidates = [deepcopy(dict(event)) for event in observed]
+                for candidate in trusted_candidates:
+                    series_context = series_context_by_event_id.get(
+                        str(candidate.get("event_id") or "")
+                    )
+                    if series_context is not None:
+                        candidate["series_context"] = deepcopy(series_context)
                 job["calendar_query_result"]["events"] = trusted_candidates
                 visible_candidates = _visible_active_candidates(
                     trusted_candidates, limit=_LOOKUP_DISPLAY_LIMIT
@@ -1170,12 +1604,20 @@ class VoiceBotService:
                 account=account, chat_id=chat_id, now=sent_time
             )
             application_state = deepcopy(context.application_state)
-            indexed_candidates = _indexed_candidates(visible_candidates)
-            candidate_ids = [str(event["event_id"]) for event in visible_candidates]
+            (
+                compact_candidates,
+                lookup_event_id_by_ref,
+                lookup_series_event_id_by_ref,
+            ) = (
+                _compact_lookup_candidates(
+                    visible_candidates,
+                    timezone_name=self.config.calendar_timezone,
+                )
+            )
             application_state.update(
                 {
-                    "candidate_events": indexed_candidates,
-                    "allowed_event_ids": candidate_ids,
+                    "candidate_events": compact_candidates,
+                    "allowed_event_ids": list(lookup_event_id_by_ref),
                     "lookup_permitted": False,
                     "lookup_request": deepcopy(lookup),
                     "lookup_result": {
@@ -1184,11 +1626,15 @@ class VoiceBotService:
                     },
                 }
             )
-            native_history = list(context.history_steps)
+            # Preserve native thought signatures only while continuing this
+            # same command from discovery to candidate selection.  Previous
+            # user commands are represented by compact application memory.
+            native_history: list[dict[str, Any]] = []
             first_input, first_steps = _interaction_chain((initial_plan,))
             if first_input is not None:
                 native_history.append(first_input)
             native_history.extend(first_steps)
+            planning_started = time.monotonic()
             try:
                 resolved_plan = await self.gemini.plan_calendar_actions(
                     transcript,
@@ -1198,14 +1644,42 @@ class VoiceBotService:
                     recent_conversation=context.recent_conversation,
                     history_steps=native_history,
                 )
-            except GeminiError:
+                resolved_plan = _resolve_plan_event_references(
+                    resolved_plan,
+                    lookup_event_id_by_ref,
+                    lookup_series_event_id_by_ref,
+                    tuple(
+                        str(candidate["event_id"])
+                        for candidate in compact_candidates
+                        if candidate.get("recurring") is True
+                    ),
+                )
+            except _UnknownEventReference:
                 LOGGER.warning(
-                    "Gemini candidate matching failed for update %s; calendar unchanged",
+                    "Gemini candidate matching returned an unknown event "
+                    "reference for update %s; calendar unchanged",
                     update_id,
                 )
                 job["final_html"] = format_error_card(
-                    "Gemini не смогла выбрать точное событие. Уточните название "
-                    "или время новым сообщением.",
+                    "Gemini выбрала событие вне показанного списка. Уточните "
+                    "его название или время новым сообщением.",
+                    transcript=transcript,
+                    elapsed_seconds=self._elapsed(job),
+                )
+                job["final_reply_markup"] = None
+                job["status"] = "final_ready"
+            except GeminiError as exc:
+                planning_elapsed = time.monotonic() - planning_started
+                LOGGER.warning(
+                    "Gemini candidate matching failed for update %s; "
+                    "error_type=%s error=%s elapsed=%.3fs; calendar unchanged",
+                    update_id,
+                    type(exc).__name__,
+                    str(exc),
+                    planning_elapsed,
+                )
+                job["final_html"] = format_error_card(
+                    _gemini_failure_copy(exc, matching=True),
                     transcript=transcript,
                     elapsed_seconds=self._elapsed(job),
                 )
@@ -1293,11 +1767,13 @@ class VoiceBotService:
                     )
                 )
                 displayed_candidates = candidates
-                trusted_event_ids = [
-                    str(candidate["event_id"])
-                    for candidate in candidates
-                    if isinstance(candidate, dict) and candidate.get("event_id")
-                ]
+                _compact, visible_refs, series_refs = _compact_lookup_candidates(
+                    candidates,
+                    timezone_name=self.config.calendar_timezone,
+                )
+                trusted_event_ids = list(
+                    dict.fromkeys((*visible_refs.values(), *series_refs.values()))
+                )
             try:
                 execution = await pipeline.apply_plan(
                     source_update_id=update_id,
@@ -1679,7 +2155,11 @@ async def async_main() -> None:
             timezone=config.calendar_timezone,
         )
         del gemini_api_key
-        gemini = GeminiFallback(gemini_api, gemini_cli)
+        gemini = GeminiFallback(
+            gemini_api,
+            gemini_cli,
+            timeout_seconds=config.gemini_timeout_seconds,
+        )
 
     try:
         async with BotApi(token) as bot:

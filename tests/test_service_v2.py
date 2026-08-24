@@ -9,17 +9,24 @@ from tg_voice_transcriber_bot.calendar import (
     CalendarConnectionError,
     CalendarEventQueryResult,
     CalendarEventSnapshot,
+    CalendarStateConflictError,
     CalendarWriteRejectedError,
     CreatedCalendarEvent,
     DeletedCalendarEvent,
+    UpdatedCalendarEvent,
 )
 from tg_voice_transcriber_bot.config import Config
+from tg_voice_transcriber_bot.gemini import GeminiApiError
 from tg_voice_transcriber_bot.operations import (
     CalendarOperationError,
     CalendarOperationPipeline,
     OperationStore,
 )
-from tg_voice_transcriber_bot.service import VoiceBotService
+from tg_voice_transcriber_bot.service import (
+    VoiceBotService,
+    _compact_lookup_candidates,
+    _resolve_plan_event_references,
+)
 from tg_voice_transcriber_bot.state import StateStore
 
 
@@ -50,11 +57,13 @@ def create_plan(*, metadata=True):
             {
                 "type": "create",
                 "target_event_id": None,
+                "recurrence_scope": None,
                 "event": calendar_event(),
                 "patch": None,
                 "clear_fields": [],
             }
         ],
+        "lookup": None,
         "clarification_question": None,
         "confidence": 0.96,
     }
@@ -75,6 +84,7 @@ def multi_create_plan():
         {
             "type": "create",
             "target_event_id": None,
+            "recurrence_scope": None,
             "event": calendar_event(
                 title="Стоматолог",
                 start_at="2026-08-25T12:00:00+03:00",
@@ -94,6 +104,7 @@ def create_then_update_plan(event_id):
         {
             "type": "update",
             "target_event_id": event_id,
+            "recurrence_scope": None,
             "event": None,
             "patch": {"location": "переговорная А"},
             "clear_fields": [],
@@ -106,6 +117,7 @@ def clarify_plan():
     return {
         "action": "clarify",
         "operations": [],
+        "lookup": None,
         "clarification_question": "На какое время записать встречу?",
         "confidence": 0.61,
         "_interaction_input": {
@@ -142,13 +154,16 @@ def discovery_plan(action="lookup", *, query="планёрка", metadata=True):
     return plan
 
 
-def update_plan(event_id, *, location="переговорная А"):
+def update_plan(
+    event_id, *, location="переговорная А", recurrence_scope=None
+):
     return {
         "action": "execute",
         "operations": [
             {
                 "type": "update",
                 "target_event_id": event_id,
+                "recurrence_scope": recurrence_scope,
                 "event": None,
                 "patch": {"location": location},
                 "clear_fields": [],
@@ -170,13 +185,14 @@ def update_plan(event_id, *, location="переговорная А"):
     }
 
 
-def delete_plan(event_id):
+def delete_plan(event_id, *, recurrence_scope=None):
     return {
         "action": "execute",
         "operations": [
             {
                 "type": "delete",
                 "target_event_id": event_id,
+                "recurrence_scope": recurrence_scope,
                 "event": None,
                 "patch": None,
                 "clear_fields": [],
@@ -362,29 +378,57 @@ class FakeCalendar:
         return self.query_result
 
     async def update_event(
-        self, *, account, event_id, patch, idempotency_key
+        self,
+        *,
+        account,
+        event_id,
+        patch,
+        idempotency_key,
+        expected_current=None,
     ):
         self.calls.append(("update", account, event_id, dict(patch), idempotency_key))
         before = self.events[event_id]
+        if expected_current is not None and replace(
+            before, updated_at=None, html_link=None
+        ) != replace(expected_current, updated_at=None, html_link=None):
+            raise CalendarStateConflictError
         changes = {}
         for field, value in patch.items():
             if field in {"location", "description"} and value == "":
                 value = None
+            if field == "recurrence_rrules":
+                value = tuple(value)
             changes[field] = value
         if "start_at" in changes:
             changes["all_day"] = len(str(changes["start_at"])) == 10
         after = replace(before, **changes)
         self.events[event_id] = after
-        return after
+        return UpdatedCalendarEvent(
+            previous=before,
+            current=after,
+            already_applied=after == before,
+        )
 
-    async def delete_event(self, *, account, event_id, idempotency_key):
+    async def delete_event(
+        self,
+        *,
+        account,
+        event_id,
+        idempotency_key,
+        expected_current=None,
+    ):
         self.calls.append(("delete", account, event_id, idempotency_key))
         previous = self.events[event_id]
+        if expected_current is not None and replace(
+            previous, updated_at=None, html_link=None
+        ) != replace(expected_current, updated_at=None, html_link=None):
+            raise CalendarStateConflictError
         current = replace(previous, status="cancelled")
         self.events[event_id] = current
         return DeletedCalendarEvent(
             previous=previous,
             current=current,
+            already_deleted=previous.status == "cancelled",
             verified_cancelled=True,
         )
 
@@ -445,6 +489,33 @@ async def process_text(
     )
 
 
+async def expose_candidate(
+    pipeline,
+    event,
+    *,
+    source_update_id=9000,
+):
+    """Persist a row the owner saw so the next plan receives a short alias."""
+
+    await pipeline.record_read(
+        source_update_id=source_update_id,
+        account="personal",
+        owner_user_id=OWNER,
+        chat_id=OWNER,
+        transcript="Покажи событие",
+        reference_time=datetime.fromtimestamp(SENT_AT, tz=timezone.utc),
+        lookup={
+            "query": None,
+            "time_min": "2026-08-22T00:00:00+03:00",
+            "time_max": "2026-08-31T00:00:00+03:00",
+        },
+        events=[event],
+        total_count=1,
+        may_be_incomplete=False,
+        displayed_candidates=[event],
+    )
+
+
 def test_text_enters_shared_calendar_pipeline_without_telegram_gateway(tmp_path):
     command = (
         "Добавь встречу завтра в 17:30\n"
@@ -486,6 +557,193 @@ def test_text_enters_shared_calendar_pipeline_without_telegram_gateway(tmp_path)
     assert state.job(78)["status"] == "sent"
     assert state.job(78)["input_kind"] == "text"
     assert state.after_message_id("personal") == 0
+
+
+def test_nearest_hour_read_skips_gemini_even_when_provider_is_unavailable(tmp_path):
+    async def scenario():
+        candidate = FakeCalendar.snapshot(
+            "nearest-event",
+            calendar_event(
+                title="Ближайшая встреча",
+                start_at="2026-08-22T15:20:00+03:00",
+                end_at="2026-08-22T15:40:00+03:00",
+            ),
+        )
+        calendar = FakeCalendar(
+            query_result=CalendarEventQueryResult((candidate,), 1)
+        )
+        gemini = FakeGemini([])
+        bot = FakeBot()
+        service, state, pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+        )
+        service.gemini_available = False
+        await process_text(
+            service,
+            "Какие у меня события в ближайший час?",
+            update_id=79,
+            bot_message_id=479,
+        )
+        return bot, calendar, gemini, state, pipeline
+
+    bot, calendar, gemini, state, pipeline = asyncio.run(scenario())
+
+    assert gemini.calls == []
+    assert "Gemini" not in bot.sent_html[0]["html"]
+    assert not any("Gemini" in edit["html"] for edit in bot.edited_html)
+    assert calendar.calls == [
+        (
+            "list",
+            "personal",
+            "2026-08-22T15:00:00+03:00",
+            "2026-08-22T16:00:00+03:00",
+            20,
+        )
+    ]
+    assert "События в календаре" in bot.edited_html[-1]["html"]
+    assert "Ближайшая встреча" in bot.edited_html[-1]["html"]
+    assert state.job(79)["status"] == "sent"
+    assert pipeline.store.find_by_source("telegram-update:79")["stage"] == "read"
+
+
+def test_lookup_model_candidates_are_bounded_and_timezone_normalized():
+    compact, refs, series_refs = _compact_lookup_candidates(
+        [
+            {
+                "event_id": "provider-id-secret",
+                "title": "T" * 700,
+                "start_at": "2026-08-24T10:30:00+02:00",
+                "end_at": "2026-08-24T11:00:00+02:00",
+                "all_day": False,
+                "timezone": "Europe/Amsterdam",
+                "location": "L" * 1_200,
+                "description": "D" * 2_500,
+                "recurrence_rrules": [
+                    "RRULE:FREQ=WEEKLY;BYDAY=" + "MO," * 500
+                ],
+                "status": "confirmed",
+                "html_link": "https://calendar.example/secret",
+                "creator_email": "private@example.test",
+            }
+        ],
+        timezone_name="Europe/Moscow",
+    )
+
+    assert refs == {"c1": "provider-id-secret"}
+    assert series_refs == {"c1": "provider-id-secret"}
+    assert compact[0]["event_id"] == "c1"
+    assert compact[0]["start_at"] == "2026-08-24T11:30:00+03:00"
+    assert compact[0]["end_at"] == "2026-08-24T12:00:00+03:00"
+    assert compact[0]["timezone"] == "Europe/Moscow"
+    assert len(compact[0]["title"]) == 300
+    assert len(compact[0]["location"]) == 300
+    assert len(compact[0]["description"]) == 500
+    assert len(compact[0]["recurrence_rrule"]) == 500
+    assert compact[0]["title"].endswith("…")
+    assert "html_link" not in compact[0]
+    assert "creator_email" not in compact[0]
+
+
+def test_recurrence_mutation_resolves_alias_to_trusted_series_master():
+    compact, visible_refs, series_refs = _compact_lookup_candidates(
+        [
+            {
+                "event_id": "provider-instance-secret",
+                "recurring_event_id": "provider-master-secret",
+                "title": "Дейлик",
+                "start_at": "2026-08-24T10:50:00+03:00",
+                "end_at": "2026-08-24T11:30:00+03:00",
+                "all_day": False,
+                "timezone": "Europe/Moscow",
+                "location": None,
+                "description": None,
+                "recurrence_rrules": [],
+                "status": "confirmed",
+            }
+        ],
+        timezone_name="Europe/Moscow",
+    )
+    recurrence_plan = update_plan("c1")
+    recurrence_plan["operations"][0]["patch"] = {
+        "recurrence_rrule": "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"
+    }
+    recurrence_plan["operations"][0]["recurrence_scope"] = "series"
+    location_plan = update_plan("c1")
+    location_plan["operations"][0]["recurrence_scope"] = "occurrence"
+
+    resolved_series = _resolve_plan_event_references(
+        recurrence_plan, visible_refs, series_refs
+    )
+    resolved_occurrence = _resolve_plan_event_references(
+        location_plan, visible_refs, series_refs
+    )
+
+    assert compact[0]["event_id"] == "c1"
+    assert compact[0]["recurring"] is True
+    assert compact[0]["recurring_instance"] is True
+    assert "provider-instance-secret" not in str(compact)
+    assert "provider-master-secret" not in str(compact)
+    assert resolved_series["operations"][0]["target_event_id"] == (
+        "provider-master-secret"
+    )
+    assert resolved_occurrence["operations"][0]["target_event_id"] == (
+        "provider-instance-secret"
+    )
+
+
+def test_recurring_scope_controls_series_delete_and_ordinary_update():
+    visible = {"c1": "provider-instance-secret"}
+    series = {"c1": "provider-master-secret"}
+
+    delete_series = _resolve_plan_event_references(
+        delete_plan("c1", recurrence_scope="series"),
+        visible,
+        series,
+        ("c1",),
+    )
+    update_series = _resolve_plan_event_references(
+        update_plan("c1", recurrence_scope="series"),
+        visible,
+        series,
+        ("c1",),
+    )
+    update_occurrence = _resolve_plan_event_references(
+        update_plan("c1", recurrence_scope="occurrence"),
+        visible,
+        series,
+        ("c1",),
+    )
+    ambiguous = _resolve_plan_event_references(
+        delete_plan("c1"), visible, series, ("c1",)
+    )
+
+    assert delete_series["operations"][0]["target_event_id"] == (
+        "provider-master-secret"
+    )
+    assert update_series["operations"][0]["target_event_id"] == (
+        "provider-master-secret"
+    )
+    assert update_occurrence["operations"][0]["target_event_id"] == (
+        "provider-instance-secret"
+    )
+    assert ambiguous["action"] == "clarify"
+    assert ambiguous["operations"] == []
+    assert "всю серию" in ambiguous["clarification_question"]
+
+    master_occurrence = _resolve_plan_event_references(
+        update_plan("e1", recurrence_scope="occurrence"),
+        {"e1": "provider-master-secret"},
+        {"e1": "provider-master-secret"},
+        ("e1",),
+    )
+    assert master_occurrence["action"] == "clarify"
+    assert "дату конкретного повторения" in master_occurrence[
+        "clarification_question"
+    ]
 
 
 def test_unauthorized_text_is_silently_ignored(tmp_path):
@@ -567,7 +825,7 @@ def test_v2_sends_one_status_then_edits_each_phase_and_applies_create_immediatel
     assert pipeline.store.get(state.job(77)["operation_id"])["stage"] == "applied"
 
 
-def test_v2_passes_known_events_recent_turn_and_native_steps_to_next_plan(tmp_path):
+def test_v2_passes_compact_known_event_without_cross_turn_native_steps(tmp_path):
     def dynamic_plan(call_number, transcript, kwargs):
         if call_number == 1:
             return create_plan()
@@ -578,11 +836,13 @@ def test_v2_passes_known_events_recent_turn_and_native_steps_to_next_plan(tmp_pa
                 {
                     "type": "update",
                     "target_event_id": event_id,
+                    "recurrence_scope": None,
                     "event": None,
                     "patch": {"location": "переговорная А"},
                     "clear_fields": [],
                 }
             ],
+            "lookup": None,
             "clarification_question": None,
             "confidence": 0.97,
             "_interaction_input": {
@@ -617,21 +877,174 @@ def test_v2_passes_known_events_recent_turn_and_native_steps_to_next_plan(tmp_pa
 
     assert transcript == "Добавь ему место переговорная А"
     assert len(context["application_state"]["candidate_events"]) == 1
-    assert context["application_state"]["allowed_event_ids"]
+    assert context["application_state"]["allowed_event_ids"] == ["e1"]
+    assert context["application_state"]["candidate_events"][0]["event_id"] == "e1"
     assert context["recent_conversation"][0]["user_message"] == (
         "Запиши планёрку"
     )
     assert context["recent_conversation"][0]["actions"][0]["event_id"]
-    assert [step["type"] for step in context["history_steps"]] == [
-        "user_input",
-        "model_output",
-    ]
+    assert context["history_steps"] == ()
     assert [call[0] for call in calendar.calls].count("create") == 1
     assert [call[0] for call in calendar.calls].count("update") == 1
     assert len(gateway.read_calls) == 1
     assert len(gateway.write_calls) == 1
     active = next(event for event in calendar.events.values() if event.status == "confirmed")
     assert active.location == "переговорная А"
+
+
+def test_two_recent_creates_are_directly_editable_by_alias_without_calendar_read(
+    tmp_path,
+):
+    first = create_plan()
+    first["operations"][0]["event"] = calendar_event(title="Первый дейлик")
+    second = create_plan()
+    second["operations"][0]["event"] = calendar_event(
+        title="Второй дейлик",
+        start_at="2026-08-24T18:30:00+03:00",
+        end_at="2026-08-24T19:00:00+03:00",
+    )
+
+    def dynamic_plan(call_number, _transcript, kwargs):
+        if call_number == 1:
+            return first
+        if call_number == 2:
+            return second
+        candidates = kwargs["application_state"]["candidate_events"]
+        refs_by_title = {
+            candidate["title"]: candidate["event_id"] for candidate in candidates
+        }
+        return {
+            "action": "execute",
+            "operations": [
+                {
+                    "type": "update",
+                    "target_event_id": refs_by_title["Первый дейлик"],
+                    "recurrence_scope": None,
+                    "event": None,
+                    "patch": {"location": "Ссылка 1"},
+                    "clear_fields": [],
+                },
+                {
+                    "type": "update",
+                    "target_event_id": refs_by_title["Второй дейлик"],
+                    "recurrence_scope": None,
+                    "event": None,
+                    "patch": {"location": "Ссылка 2"},
+                    "clear_fields": [],
+                },
+            ],
+            "lookup": None,
+            "clarification_question": None,
+            "confidence": 0.99,
+        }
+
+    async def scenario():
+        calendar = FakeCalendar()
+        gemini = FakeGemini(dynamic=dynamic_plan)
+        service, _state, _pipeline = make_service(
+            tmp_path,
+            bot=FakeBot(),
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+        )
+        await process_text(
+            service, "Создай первый дейлик", update_id=82, bot_message_id=502
+        )
+        await process_text(
+            service, "Создай второй дейлик", update_id=83, bot_message_id=503
+        )
+        calendar.calls.clear()
+        await process_text(
+            service,
+            "Добавь обоим этим дейликам ссылки",
+            update_id=84,
+            bot_message_id=504,
+        )
+        return calendar, gemini
+
+    calendar, gemini = asyncio.run(scenario())
+
+    assert len(gemini.calls[2][1]["application_state"]["candidate_events"]) == 2
+    # Direct aliases skip discovery; provider-fresh baselines still protect
+    # Undo from edits made outside the bot.
+    assert [call[0] for call in calendar.calls] == [
+        "get",
+        "get",
+        "update",
+        "update",
+    ]
+    by_title = {event.title: event for event in calendar.events.values()}
+    assert by_title["Первый дейлик"].location == "Ссылка 1"
+    assert by_title["Второй дейлик"].location == "Ссылка 2"
+
+
+def test_unknown_model_event_alias_is_rejected_before_calendar_access(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        bot = FakeBot()
+        service, state, pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=FakeGemini([update_plan("e999")]),
+            calendar=calendar,
+        )
+        await process_text(
+            service,
+            "Измени неизвестное событие",
+            update_id=85,
+            bot_message_id=505,
+        )
+        return bot, calendar, state, pipeline
+
+    bot, calendar, state, pipeline = asyncio.run(scenario())
+
+    assert calendar.calls == []
+    assert "вне доступного контекста" in bot.edited_html[-1]["html"]
+    assert "Google Calendar не изменён" in bot.edited_html[-1]["html"]
+    assert pipeline.store.find_by_source("telegram-update:85") is None
+    assert state.job(85)["status"] == "sent"
+
+
+def test_gemini_timeout_has_specific_copy_and_safe_diagnostic_log(
+    tmp_path, caplog
+):
+    class TimedOutGemini(FakeGemini):
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            self.calls.append((transcript, kwargs))
+            raise GeminiApiError("Gemini API transport error: ReadTimeout")
+
+    async def scenario():
+        calendar = FakeCalendar()
+        bot = FakeBot()
+        service, state, pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=TimedOutGemini(),
+            calendar=calendar,
+        )
+        await process_text(
+            service,
+            "Перенеси встречу на завтра",
+            update_id=86,
+            bot_message_id=506,
+        )
+        return bot, calendar, state, pipeline
+
+    with caplog.at_level("WARNING", logger="tg_voice_transcriber_bot"):
+        bot, calendar, state, pipeline = asyncio.run(scenario())
+
+    final_html = bot.edited_html[-1]["html"]
+    assert "не успела обработать команду за отведённое время" in final_html
+    assert "не смогла надёжно разобрать" not in final_html
+    assert calendar.calls == []
+    assert pipeline.store.find_by_source("telegram-update:86") is None
+    assert state.job(86)["status"] == "sent"
+    assert "error_type=GeminiApiError" in caplog.text
+    assert "error=Gemini API transport error: ReadTimeout" in caplog.text
+    assert "elapsed=" in caplog.text
 
 
 def test_intermediate_status_edit_failure_does_not_block_calendar_mutation(tmp_path):
@@ -836,9 +1249,7 @@ def test_lookup_then_second_gemini_updates_exact_external_event(tmp_path):
             query_result=CalendarEventQueryResult((candidate,), 1)
         )
         calendar.events[candidate.event_id] = candidate
-        gemini = FakeGemini(
-            [discovery_plan(), update_plan(candidate.event_id)]
-        )
+        gemini = FakeGemini([discovery_plan(), update_plan("c1")])
         bot = FakeBot()
         service, state, pipeline = make_service(
             tmp_path,
@@ -861,12 +1272,29 @@ def test_lookup_then_second_gemini_updates_exact_external_event(tmp_path):
     ]
     second_context = gemini.calls[1][1]
     persisted_candidates = state.job(111)["calendar_lookup_candidates"]
-    assert second_context["application_state"]["candidate_events"] == [
-        {**persisted_candidates[0], "display_index": 1}
+    model_candidates = second_context["application_state"]["candidate_events"]
+    assert model_candidates == [
+        {
+            "event_id": "c1",
+            "display_index": 1,
+            "title": "Планёрка",
+            "start_at": "2026-08-24T17:30:00+03:00",
+            "end_at": "2026-08-24T18:00:00+03:00",
+            "all_day": False,
+            "timezone": "Europe/Moscow",
+            "location": None,
+            "description": "Повторная встреча",
+            "recurrence_rrule": None,
+            "recurring": False,
+            "recurring_instance": False,
+            "status": "confirmed",
+        }
     ]
-    assert second_context["application_state"]["allowed_event_ids"] == [
-        "external-update-event"
-    ]
+    assert persisted_candidates[0]["event_id"] == "external-update-event"
+    assert "html_link" in persisted_candidates[0]
+    assert "html_link" not in model_candidates[0]
+    assert "creator_email" not in model_candidates[0]
+    assert second_context["application_state"]["allowed_event_ids"] == ["c1"]
     assert second_context["application_state"]["lookup_permitted"] is False
     assert second_context["application_state"]["lookup_request"] == (
         discovery_plan(metadata=False)["lookup"]
@@ -878,11 +1306,7 @@ def test_lookup_then_second_gemini_updates_exact_external_event(tmp_path):
     assert second_context["history_steps"][0]["content"][0]["text"] == (
         "lookup-input"
     )
-    assert [call[0] for call in calendar.calls] == [
-        "search",
-        "get",
-        "update",
-    ]
+    assert [call[0] for call in calendar.calls] == ["search", "get", "update"]
     assert calendar.calls[0][2] == "планёрка"
     assert calendar.events["external-update-event"].location == "переговорная А"
     progress = "\n".join(edit["html"] for edit in bot.edited_html)
@@ -900,11 +1324,132 @@ def test_lookup_then_second_gemini_updates_exact_external_event(tmp_path):
         for event in record["displayed_candidates"]
     ] == [(1, "external-update-event")]
     assert record["items"][0]["target_event_id"] == "external-update-event"
+
+
+def test_lookup_recurrence_update_targets_trusted_series_master(tmp_path):
+    async def scenario():
+        master = FakeCalendar.snapshot(
+            "provider-master-secret",
+            calendar_event(
+                title="Дейлик",
+                recurrence_rrule="RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            ),
+        )
+        instance = replace(
+            master,
+            event_id="provider-instance-secret",
+            recurrence_rrules=(),
+            recurring_event_id=master.event_id,
+            original_start_at=master.start_at,
+        )
+        calendar = FakeCalendar(
+            query_result=CalendarEventQueryResult((instance,), 1)
+        )
+        calendar.events[master.event_id] = master
+        calendar.events[instance.event_id] = instance
+        recurrence_plan = update_plan("c1")
+        recurrence_plan["operations"][0]["patch"] = {
+            "recurrence_rrule": "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"
+        }
+        recurrence_plan["operations"][0]["recurrence_scope"] = "series"
+        gemini = FakeGemini([discovery_plan(), recurrence_plan])
+        service, state, pipeline = make_service(
+            tmp_path,
+            bot=FakeBot(),
+            gateway=FakeGateway(["Оставь дейлик только в понедельник, среду и пятницу"]),
+            gemini=gemini,
+            calendar=calendar,
+        )
+
+        await process_voice(service, update_id=115, bot_message_id=615)
+        return calendar, gemini, state, pipeline
+
+    calendar, gemini, state, pipeline = asyncio.run(scenario())
+
+    model_candidate = gemini.calls[1][1]["application_state"][
+        "candidate_events"
+    ][0]
+    assert model_candidate["event_id"] == "c1"
+    assert model_candidate["recurring"] is True
+    assert model_candidate["recurring_instance"] is True
+    assert model_candidate["recurrence_rrule"] == (
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+    )
+    assert model_candidate["series_context"] == {
+        "start_at": "2026-08-24T17:30:00+03:00",
+        "end_at": "2026-08-24T18:00:00+03:00",
+        "all_day": False,
+        "timezone": "Europe/Moscow",
+        "recurrence_rrule": "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+    }
+    assert "provider-master-secret" not in str(model_candidate)
+    assert "provider-instance-secret" not in str(model_candidate)
+    assert [call[0] for call in calendar.calls] == [
+        "search",
+        "get",  # hydrate the master before Gemini computes a relative RRULE
+        "get",  # provider-fresh mutation preflight for safe Undo
+        "update",
+    ]
+    assert calendar.events["provider-master-secret"].recurrence_rrules == (
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR",
+    )
+    assert calendar.events["provider-instance-secret"].recurrence_rrules == ()
+    record = pipeline.store.find_by_source("telegram-update:115")
+    assert record["items"][0]["target_event_id"] == "provider-master-secret"
+    assert state.job(115)["status"] == "sent"
     assert [step["type"] for step in record["interaction_steps"]] == [
         "model_output",
         "user_input",
         "model_output",
     ]
+
+
+def test_lookup_series_delete_targets_master_not_visible_occurrence(tmp_path):
+    async def scenario():
+        master = FakeCalendar.snapshot(
+            "series-delete-master",
+            calendar_event(
+                title="Дейлик",
+                recurrence_rrule="RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            ),
+        )
+        instance = replace(
+            master,
+            event_id="series-delete-occurrence",
+            recurrence_rrules=(),
+            recurring_event_id=master.event_id,
+            original_start_at=master.start_at,
+        )
+        calendar = FakeCalendar(
+            query_result=CalendarEventQueryResult((instance,), 1)
+        )
+        calendar.events[master.event_id] = master
+        calendar.events[instance.event_id] = instance
+        gemini = FakeGemini(
+            [
+                discovery_plan(query="дейлик"),
+                delete_plan("c1", recurrence_scope="series"),
+            ]
+        )
+        service, state, pipeline = make_service(
+            tmp_path,
+            bot=FakeBot(),
+            gateway=FakeGateway(["Удали весь дейлик"]),
+            gemini=gemini,
+            calendar=calendar,
+        )
+
+        await process_voice(service, update_id=116, bot_message_id=616)
+        return calendar, state, pipeline
+
+    calendar, state, pipeline = asyncio.run(scenario())
+
+    assert calendar.events["series-delete-master"].status == "cancelled"
+    assert calendar.events["series-delete-occurrence"].status == "confirmed"
+    record = pipeline.store.find_by_source("telegram-update:116")
+    assert record["items"][0]["target_event_id"] == "series-delete-master"
+    assert record["items"][0]["request"]["recurrence_scope"] == "series"
+    assert state.job(116)["status"] == "sent"
 
 
 def test_lookup_then_second_gemini_deletes_external_event(tmp_path):
@@ -920,7 +1465,7 @@ def test_lookup_then_second_gemini_deletes_external_event(tmp_path):
         gemini = FakeGemini(
             [
                 discovery_plan(query="отменяемая встреча"),
-                delete_plan(candidate.event_id),
+                delete_plan("c1"),
             ]
         )
         bot = FakeBot()
@@ -937,11 +1482,7 @@ def test_lookup_then_second_gemini_deletes_external_event(tmp_path):
     bot, calendar, gemini, state, pipeline = asyncio.run(scenario())
 
     assert len(gemini.calls) == 2
-    assert [call[0] for call in calendar.calls] == [
-        "search",
-        "get",
-        "delete",
-    ]
+    assert [call[0] for call in calendar.calls] == ["search", "get", "delete"]
     assert calendar.events["external-delete-event"].status == "cancelled"
     assert "Событие удалено" in bot.edited_html[-1]["html"]
     assert bot.edited_html[-1]["reply_markup"]["inline_keyboard"][0][0][
@@ -1107,12 +1648,12 @@ def test_lookup_clarification_persists_exact_visible_provider_order(tmp_path):
     visible_ids = provider_ids[:5]
     second_state = gemini.calls[1][1]["application_state"]
     assert [event["event_id"] for event in second_state["candidate_events"]] == (
-        visible_ids
+        ["c1", "c2", "c3", "c4", "c5"]
     )
     assert [event["display_index"] for event in second_state["candidate_events"]] == (
         [1, 2, 3, 4, 5]
     )
-    assert second_state["allowed_event_ids"] == visible_ids
+    assert second_state["allowed_event_ids"] == ["c1", "c2", "c3", "c4", "c5"]
     assert [
         event["event_id"] for event in state.job(118)["calendar_lookup_candidates"]
     ] == visible_ids
@@ -1135,7 +1676,7 @@ def test_lookup_clarification_persists_exact_visible_provider_order(tmp_path):
     assert context.allowed_event_ids == tuple(visible_ids)
     assert [
         event["event_id"] for event in context.application_state["candidate_events"]
-    ] == visible_ids
+    ] == ["e1", "e2", "e3", "e4", "e5"]
     assert [
         event["display_index"]
         for event in context.application_state["candidate_events"]
@@ -1168,7 +1709,7 @@ def test_read_order_survives_restart_and_followup_targets_second_visible_event(
 
     def followup_plan(_call_number, _transcript, kwargs):
         captured_state.update(kwargs["application_state"])
-        return update_plan(provider_ids[1], location="второй кабинет")
+        return update_plan("e2", location="второй кабинет")
 
     async def scenario():
         calendar = FakeCalendar(
@@ -1206,12 +1747,14 @@ def test_read_order_survives_restart_and_followup_targets_second_visible_event(
         event["event_id"] for event in read_record["displayed_candidates"]
     ] == visible_ids
     assert [event["event_id"] for event in captured_state["candidate_events"]] == (
-        visible_ids
+        [f"e{index}" for index in range(1, 9)]
     )
     assert [event["display_index"] for event in captured_state["candidate_events"]] == (
         list(range(1, 9))
     )
-    assert captured_state["allowed_event_ids"] == visible_ids
+    assert captured_state["allowed_event_ids"] == [
+        f"e{index}" for index in range(1, 9)
+    ]
     assert calendar.events[provider_ids[1]].location == "второй кабинет"
     assert calendar.events[provider_ids[8]].location is None
     assert "Встреча 8" in first_bot.edited_html[-1]["html"]
@@ -1450,10 +1993,10 @@ def test_confirmed_partial_batch_prewrite_failure_stays_planned_and_replays(
             tmp_path,
             bot=bot,
             gateway=FakeGateway(),
-            gemini=FakeGemini([create_then_update_plan(target.event_id)]),
+            gemini=FakeGemini([create_then_update_plan("e1")]),
             calendar=calendar,
         )
-        pipeline.observe_lookup_events("personal", [target])
+        await expose_candidate(pipeline, target, source_update_id=9125)
         original_merge = pipeline._merged_update
         failed_once = False
 
@@ -1571,7 +2114,9 @@ def test_definitive_create_rejection_does_not_consume_retry_budget(tmp_path):
     assert record["items"][0]["stage"] == "failed"
 
 
-def test_permanent_prewrite_failure_terminalizes_as_calendar_unchanged(tmp_path):
+def test_permanent_prewrite_failure_terminalizes_as_calendar_unchanged(
+    tmp_path, monkeypatch
+):
     class UnreadableTargetCalendar(FakeCalendar):
         async def get_event(self, *, account, event_id):
             self.calls.append(("get", account, event_id))
@@ -1586,10 +2131,16 @@ def test_permanent_prewrite_failure_terminalizes_as_calendar_unchanged(tmp_path)
             tmp_path,
             bot=bot,
             gateway=FakeGateway(["Добавь место переговорная А"]),
-            gemini=FakeGemini([update_plan(target.event_id)]),
+            gemini=FakeGemini([update_plan("e1")]),
             calendar=calendar,
         )
-        pipeline.observe_lookup_events("personal", [target])
+        await expose_candidate(pipeline, target, source_update_id=9124)
+        # Force the trusted cache past its TTL so this test still exercises
+        # the provider preflight failure path.
+        monkeypatch.setattr(
+            "tg_voice_transcriber_bot.operations._utc_now",
+            lambda: datetime(2030, 1, 1, tzinfo=timezone.utc),
+        )
         await process_voice(service, update_id=124, bot_message_id=624)
         return calendar, bot, state, pipeline
 

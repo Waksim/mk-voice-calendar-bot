@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import fields
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 from http import HTTPStatus
@@ -31,9 +32,11 @@ from .calendar import (
     CalendarConnectionError,
     CalendarEventQueryResult,
     CalendarEventSnapshot,
+    CalendarStateConflictError,
     CalendarWriteRejectedError,
     CreatedCalendarEvent,
     DeletedCalendarEvent,
+    UpdatedCalendarEvent,
 )
 
 
@@ -54,7 +57,15 @@ _AWARE_DATETIME_RE = re.compile(
     r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
 )
 _UPDATE_PATCH_FIELDS = frozenset(
-    {"title", "description", "location", "start_at", "end_at", "timezone"}
+    {
+        "title",
+        "description",
+        "location",
+        "start_at",
+        "end_at",
+        "timezone",
+        "recurrence_rrules",
+    }
 )
 _MAX_TEXT_RESPONSE_CHARS = 2_000_000
 _MAX_EVENT_ID_CHARS = 2048
@@ -833,6 +844,23 @@ def _normalize_update_patch(patch: Any) -> dict[str, Any]:
     for field in ("description", "location"):
         if field in normalized and not isinstance(normalized[field], str):
             raise CalendarMcpError("Calendar event patch is invalid")
+    if "recurrence_rrules" in normalized:
+        recurrence_rules = normalized["recurrence_rrules"]
+        if (
+            not isinstance(recurrence_rules, Sequence)
+            or isinstance(recurrence_rules, (str, bytes, bytearray))
+            or len(recurrence_rules) > _MAX_PROVIDER_COLLECTION_ITEMS
+            or any(
+                not isinstance(rule, str)
+                or not rule
+                or len(rule) > _MAX_PROVIDER_TEXT_CHARS
+                or "\r" in rule
+                or "\n" in rule
+                for rule in recurrence_rules
+            )
+        ):
+            raise CalendarMcpError("Calendar event recurrence patch is invalid")
+        normalized["recurrence_rrules"] = tuple(recurrence_rules)
 
     has_start = "start_at" in normalized
     has_end = "end_at" in normalized
@@ -892,11 +920,21 @@ def _snapshot_matches_patch(
                 return False
         elif actual != expected:
             return False
+    if "recurrence_rrules" in patch and snapshot.recurrence_rrules != tuple(
+        patch["recurrence_rrules"]
+    ):
+        return False
     if "start_at" in patch:
         expected_start = patch["start_at"]
         expected_end = patch["end_at"]
         expected_all_day = _DATE_RE.fullmatch(expected_start) is not None
         if snapshot.all_day != expected_all_day:
+            return False
+        if (
+            not expected_all_day
+            and "timezone" in patch
+            and snapshot.timezone != patch["timezone"]
+        ):
             return False
         if expected_all_day:
             if snapshot.start_at != expected_start or snapshot.end_at != expected_end:
@@ -914,6 +952,19 @@ def _snapshot_matches_patch(
             ):
                 return False
     return True
+
+
+def _snapshot_matches_precondition(
+    current: CalendarEventSnapshot,
+    expected: CalendarEventSnapshot,
+) -> bool:
+    """Compare mutation-relevant state while ignoring provider bookkeeping."""
+
+    return all(
+        getattr(current, field.name) == getattr(expected, field.name)
+        for field in fields(CalendarEventSnapshot)
+        if field.name not in {"html_link", "updated_at"}
+    )
 
 
 def _validate_query_range(time_min: Any, time_max: Any) -> tuple[str, str]:
@@ -1373,7 +1424,8 @@ class GoogleCalendarMcpClient:
         event_id: str,
         patch: Mapping[str, Any],
         idempotency_key: str,
-    ) -> CalendarEventSnapshot:
+        expected_current: CalendarEventSnapshot | None = None,
+    ) -> UpdatedCalendarEvent:
         """Apply a retry-safe patch and verify the provider's resulting state.
 
         The idempotency key belongs to the caller's durable operation journal.
@@ -1384,16 +1436,32 @@ class GoogleCalendarMcpClient:
         _validate_idempotency_key(idempotency_key)
         event_id = _validate_target_event_id(event_id)
         normalized_patch = _normalize_update_patch(patch)
+        if expected_current is not None and not isinstance(
+            expected_current, CalendarEventSnapshot
+        ):
+            raise CalendarMcpError("Calendar state precondition is invalid")
         try:
             before = await self._read_snapshot(account=account, event_id=event_id)
         except CalendarMcpError:
             raise
         except (_ToolFailure, _ResponseMismatch):
             raise CalendarMcpError("Calendar event update failed") from None
+        # Reconciliation takes precedence over the precondition: if a previous
+        # attempt already applied this exact patch, this call performs no write.
+        if _snapshot_matches_patch(before, normalized_patch):
+            return UpdatedCalendarEvent(
+                previous=before,
+                current=before,
+                already_applied=True,
+            )
+        if expected_current is not None and not _snapshot_matches_precondition(
+            before, expected_current
+        ):
+            raise CalendarStateConflictError(
+                "Calendar event changed after it was observed"
+            ) from None
         if before.status == "cancelled":
             raise CalendarMcpError("Calendar event is deleted")
-        if _snapshot_matches_patch(before, normalized_patch):
-            return before
 
         mcp_account, calendar_id = self._target(account)
         arguments: dict[str, Any] = {
@@ -1413,7 +1481,11 @@ class GoogleCalendarMcpClient:
             "timezone": "timeZone",
         }
         for field, value in normalized_patch.items():
-            arguments[field_mapping[field]] = value
+            if field == "recurrence_rrules":
+                arguments["recurrence"] = list(value)
+                arguments["modificationScope"] = "all"
+            else:
+                arguments[field_mapping[field]] = value
 
         try:
             payload = await self._tool("update-event", arguments)
@@ -1425,7 +1497,7 @@ class GoogleCalendarMcpClient:
                 expected_event_id=event_id,
             )
             if _snapshot_matches_patch(updated, normalized_patch):
-                return updated
+                return UpdatedCalendarEvent(previous=before, current=updated)
         except (_ToolFailure, _ResponseMismatch):
             pass
 
@@ -1433,7 +1505,7 @@ class GoogleCalendarMcpClient:
         if recovered is not None and _snapshot_matches_patch(
             recovered, normalized_patch
         ):
-            return recovered
+            return UpdatedCalendarEvent(previous=before, current=recovered)
         raise CalendarMcpError("Calendar event update failed") from None
 
     async def delete_event(
@@ -1442,10 +1514,15 @@ class GoogleCalendarMcpClient:
         account: str,
         event_id: str,
         idempotency_key: str,
+        expected_current: CalendarEventSnapshot | None = None,
     ) -> DeletedCalendarEvent:
         """Delete one target without guest notifications, with retry probing."""
         _validate_idempotency_key(idempotency_key)
         event_id = _validate_target_event_id(event_id)
+        if expected_current is not None and not isinstance(
+            expected_current, CalendarEventSnapshot
+        ):
+            raise CalendarMcpError("Calendar state precondition is invalid")
         try:
             previous = await self._read_snapshot(account=account, event_id=event_id)
         except CalendarMcpError:
@@ -1459,6 +1536,12 @@ class GoogleCalendarMcpClient:
                 already_deleted=True,
                 verified_cancelled=True,
             )
+        if expected_current is not None and not _snapshot_matches_precondition(
+            previous, expected_current
+        ):
+            raise CalendarStateConflictError(
+                "Calendar event changed after it was observed"
+            ) from None
 
         mcp_account, calendar_id = self._target(account)
         try:

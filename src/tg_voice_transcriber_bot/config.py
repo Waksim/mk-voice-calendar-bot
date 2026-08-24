@@ -127,7 +127,7 @@ class Config:
     gemini_keychain_service: str = "mk_voice_calendar_bot"
     gemini_api_key_environment: str = "GEMINI_API_KEY"
     gemini_model: str = "gemini-3.7-flash"
-    gemini_timeout_seconds: int = 90
+    gemini_timeout_seconds: int = 45
     gemini_cli_path: Path = field(
         default_factory=lambda: _environment_path(
             "GEMINI_CLI_PATH", Path.home() / ".local" / "bin" / "agy"

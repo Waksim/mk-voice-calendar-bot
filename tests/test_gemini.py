@@ -13,6 +13,8 @@ from tg_voice_transcriber_bot.gemini import (
     GeminiApi,
     GeminiApiError,
     GeminiCli,
+    GeminiCliError,
+    GeminiError,
     GeminiFallback,
 )
 from tg_voice_transcriber_bot.intent import (
@@ -46,11 +48,13 @@ CALENDAR_OPERATION_RESULT = {
         {
             "type": "update",
             "target_event_id": "event-planning",
+            "recurrence_scope": None,
             "event": None,
             "patch": {"location": "переговорная А"},
             "clear_fields": [],
         }
     ],
+    "lookup": None,
     "clarification_question": None,
     "confidence": 0.97,
 }
@@ -306,6 +310,71 @@ def test_direct_api_retries_interactions_too_many_requests_code():
     assert delays == [1]
 
 
+def test_direct_api_has_one_total_timeout_budget():
+    class HangingClient:
+        def __init__(self):
+            self.attempts = 0
+
+        async def request(self, *args, **kwargs):
+            self.attempts += 1
+            await asyncio.Event().wait()
+
+    async def scenario():
+        http_client = HangingClient()
+        client = GeminiApi(
+            "unit-test-secret-key",
+            model="gemini-3.7-flash",
+            timeout_seconds=0.01,
+            timezone="Europe/Moscow",
+            client=http_client,
+        )
+        with pytest.raises(GeminiApiError, match="request timed out"):
+            await client.extract_event(
+                "Завтра в десять позвонить врачу",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+        return http_client.attempts
+
+    assert asyncio.run(scenario()) == 1
+
+
+def test_direct_api_does_not_retry_read_timeout():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("unsafe provider detail", request=request)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=90,
+                timezone="Europe/Moscow",
+                max_retries=2,
+                client=http_client,
+            )
+            await client.extract_event(
+                "Завтра в десять позвонить врачу",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+
+    with pytest.raises(GeminiApiError, match="request timed out") as raised:
+        asyncio.run(scenario())
+    assert attempts == 1
+    assert "unsafe provider detail" not in str(raised.value)
+
+
 def test_direct_api_does_not_retry_daily_quota_or_expose_secret():
     api_key = "unit-test-secret-key"
     attempts = 0
@@ -395,6 +464,9 @@ def test_cli_is_used_when_direct_api_validation_fails():
             self.validated = False
             self.calls = 0
 
+        def is_available(self):
+            return True
+
         async def validate(self):
             self.validated = True
 
@@ -404,7 +476,7 @@ def test_cli_is_used_when_direct_api_validation_fails():
 
     async def scenario():
         cli = WorkingCli()
-        provider = GeminiFallback(FailedApi(), cli)
+        provider = GeminiFallback(FailedApi(), cli, timeout_seconds=90)
         await provider.validate()
         parsed = await provider.extract_event(
             "Завтра в десять позвонить врачу",
@@ -421,7 +493,7 @@ def test_cli_is_used_when_direct_api_validation_fails():
     assert parsed == CALENDAR_RESULT
 
 
-def test_planner_uses_system_instruction_native_history_and_json_safe_xml():
+def test_planner_uses_compact_prompt_and_exact_same_command_history():
     observed = {}
     response_body = planning_interaction_response()
     history_steps = [
@@ -492,9 +564,21 @@ def test_planner_uses_system_instruction_native_history_and_json_safe_xml():
     assert payload["model"] == "gemini-3.7-flash"
     assert payload["store"] is False
     assert payload["system_instruction"] == CALENDAR_PLANNER_SYSTEM_INSTRUCTION
+    assert len(payload["system_instruction"].encode("utf-8")) < 5_000
     assert "`display_index`" in payload["system_instruction"]
     assert "Не сортируй кандидатов" in payload["system_instruction"]
-    assert "точный активный набор событий" in payload["system_instruction"]
+    assert "короткие непрозрачные" in payload["system_instruction"]
+    assert "application_state.allowed_event_ids" in payload["system_instruction"]
+    assert "этой же команды после lookup" in payload["system_instruction"]
+    assert "Новая команда не зависит" in payload["system_instruction"]
+    assert "фактический результат Google Calendar" in payload["system_instruction"]
+    assert "`recurrence_scope` обязателен в каждой операции" in payload[
+        "system_instruction"
+    ]
+    assert "`recurring=true`" in payload["system_instruction"]
+    assert "`series`" in payload["system_instruction"]
+    assert "`occurrence`" in payload["system_instruction"]
+    assert "выбирай его по умолчанию" in payload["system_instruction"]
     assert payload["generation_config"] == {"thinking_level": "high"}
     assert payload["response_format"] == {
         "type": "text",
@@ -513,6 +597,8 @@ def test_planner_uses_system_instruction_native_history_and_json_safe_xml():
     assert '<latest_user_message format="application/json" trust="untrusted">' in current_text
     assert "</latest_user_message><application_state>" not in current_text
     assert "\\u003c/application_state\\u003e" in current_text
+    assert '"state":{' not in current_text
+    assert '"allowed_event_ids":["event-planning"]' in current_text
     assert '"display_index":2' in current_text
     assert transcript not in payload["system_instruction"]
 
@@ -520,6 +606,43 @@ def test_planner_uses_system_instruction_native_history_and_json_safe_xml():
     assert parsed["_interaction_input"] == current_input
     assert parsed["_interaction_steps"] == response_body["steps"]
     assert parsed["_interaction_input"] != payload["input"]
+
+
+def test_direct_api_rejects_oversized_planner_payload_before_request():
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=planning_interaction_response())
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=90,
+                timezone="Europe/Moscow",
+                client=http_client,
+            )
+            await client.plan_calendar_actions(
+                "Покажи события на завтра",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+                application_state={
+                    "allowed_event_ids": [],
+                    "unexpected_large_field": "x" * 70_000,
+                },
+                recent_conversation=[],
+            )
+
+    with pytest.raises(GeminiApiError, match="request is too large"):
+        asyncio.run(scenario())
+    assert calls == 0
 
 
 def test_planner_rejects_model_target_outside_application_allowlist():
@@ -645,6 +768,41 @@ def test_cli_planner_flattens_context_and_returns_empty_native_steps():
     assert observed["cwd"] is not None
 
 
+def test_cli_rejects_oversized_planner_payload_before_starting_process():
+    client = GeminiCli(
+        Path("/unused/agy"),
+        model="gemini-3.7-flash-high",
+        timeout_seconds=90,
+        timezone="Europe/Moscow",
+    )
+    calls = 0
+
+    async def fake_run(*arguments, cwd=None):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("oversized prompt must not start the CLI")
+
+    client._run = fake_run
+
+    async def scenario():
+        await client.plan_calendar_actions(
+            "Покажи события на завтра",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+            application_state={
+                "allowed_event_ids": [],
+                "unexpected_large_field": "x" * 70_000,
+            },
+            recent_conversation=[],
+        )
+
+    with pytest.raises(GeminiCliError, match="request is too large"):
+        asyncio.run(scenario())
+    assert calls == 0
+
+
 def test_fallback_planner_preserves_all_context_arguments():
     class FailedApi:
         async def plan_calendar_actions(self, transcript, **kwargs):
@@ -653,6 +811,9 @@ def test_fallback_planner_preserves_all_context_arguments():
     class WorkingCli:
         def __init__(self):
             self.call = None
+
+        def is_available(self):
+            return True
 
         async def plan_calendar_actions(self, transcript, **kwargs):
             self.call = (transcript, kwargs)
@@ -673,7 +834,7 @@ def test_fallback_planner_preserves_all_context_arguments():
 
     async def scenario():
         cli = WorkingCli()
-        provider = GeminiFallback(FailedApi(), cli)
+        provider = GeminiFallback(FailedApi(), cli, timeout_seconds=90)
         result = await provider.plan_calendar_actions(
             "Добавь место",
             reference_time=reference_time,
@@ -696,3 +857,232 @@ def test_fallback_planner_preserves_all_context_arguments():
             "history_steps": history_steps,
         },
     )
+
+
+def test_fallback_deadline_cancels_hanging_primary_before_cli():
+    class HangingApi:
+        def __init__(self):
+            self.cancelled = False
+
+        async def extract_event(self, transcript, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    class UnexpectedCli:
+        def __init__(self):
+            self.calls = 0
+
+        def is_available(self):
+            return True
+
+        async def extract_event(self, transcript, **kwargs):
+            self.calls += 1
+            return CALENDAR_RESULT
+
+    async def scenario():
+        primary = HangingApi()
+        cli = UnexpectedCli()
+        provider = GeminiFallback(primary, cli, timeout_seconds=0.01)
+        with pytest.raises(GeminiError, match="provider chain timed out"):
+            await provider.extract_event(
+                "Завтра встреча",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+        return primary, cli
+
+    primary, cli = asyncio.run(scenario())
+    assert primary.cancelled is True
+    assert cli.calls == 0
+
+
+def test_fallback_deadline_cancels_slow_cli_after_fast_primary_failure():
+    class FailedApi:
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            raise GeminiApiError("direct planning failed immediately")
+
+    class HangingCli:
+        def __init__(self):
+            self.calls = 0
+            self.cancelled = False
+
+        def is_available(self):
+            return True
+
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            self.calls += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    async def scenario():
+        cli = HangingCli()
+        provider = GeminiFallback(FailedApi(), cli, timeout_seconds=0.01)
+        with pytest.raises(GeminiError, match="provider chain timed out"):
+            await provider.plan_calendar_actions(
+                "Добавь место",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+                application_state={"allowed_event_ids": []},
+                recent_conversation=[],
+            )
+        return cli
+
+    cli = asyncio.run(scenario())
+    assert cli.calls == 1
+    assert cli.cancelled is True
+
+
+def test_fast_primary_failure_allows_successful_fallback_within_deadline():
+    class FailedApi:
+        async def extract_event(self, transcript, **kwargs):
+            raise GeminiApiError("direct extraction failed immediately")
+
+    class WorkingCli:
+        def __init__(self):
+            self.calls = 0
+
+        def is_available(self):
+            return True
+
+        async def extract_event(self, transcript, **kwargs):
+            self.calls += 1
+            return CALENDAR_RESULT
+
+    async def scenario():
+        cli = WorkingCli()
+        provider = GeminiFallback(FailedApi(), cli, timeout_seconds=0.05)
+        result = await provider.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+        return cli, result
+
+    cli, result = asyncio.run(scenario())
+    assert cli.calls == 1
+    assert result == CALENDAR_RESULT
+
+
+def test_missing_cli_preserves_primary_api_error(tmp_path):
+    primary_error = GeminiApiError("Gemini API request timed out")
+
+    class FailedApi:
+        async def extract_event(self, transcript, **kwargs):
+            raise primary_error
+
+    cli = GeminiCli(
+        tmp_path / "missing-antigravity",
+        model="gemini-3.7-flash-high",
+        timeout_seconds=45,
+        timezone="Europe/Moscow",
+    )
+
+    async def scenario():
+        provider = GeminiFallback(FailedApi(), cli, timeout_seconds=45)
+        await provider.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+
+    with pytest.raises(GeminiApiError) as raised:
+        asyncio.run(scenario())
+    assert raised.value is primary_error
+
+
+def test_fallback_combines_provider_error_types_without_details():
+    class FailedApi:
+        async def extract_event(self, transcript, **kwargs):
+            raise GeminiApiError("unsafe primary response detail")
+
+    class FailedCli:
+        def is_available(self):
+            return True
+
+        async def extract_event(self, transcript, **kwargs):
+            raise GeminiCliError("unsafe fallback response detail")
+
+    async def scenario():
+        provider = GeminiFallback(
+            FailedApi(), FailedCli(), timeout_seconds=45
+        )
+        await provider.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+
+    with pytest.raises(GeminiError) as raised:
+        asyncio.run(scenario())
+    message = str(raised.value)
+    assert "primary=GeminiApiError" in message
+    assert "fallback=GeminiCliError" in message
+    assert "unsafe primary response detail" not in message
+    assert "unsafe fallback response detail" not in message
+
+
+def test_cli_availability_requires_an_executable_regular_file(tmp_path):
+    binary = tmp_path / "agy"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o644)
+    client = GeminiCli(
+        binary,
+        model="gemini-3.7-flash-high",
+        timeout_seconds=45,
+        timezone="Europe/Moscow",
+    )
+
+    assert client.is_available() is False
+    binary.chmod(0o755)
+    assert client.is_available() is True
+
+
+def test_cli_process_wait_uses_exact_configured_timeout(monkeypatch):
+    observed = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return Process()
+
+    async def recording_wait_for(awaitable, timeout):
+        observed["timeout"] = timeout
+        return await awaitable
+
+    monkeypatch.setattr(
+        "tg_voice_transcriber_bot.gemini.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(
+        "tg_voice_transcriber_bot.gemini.asyncio.wait_for",
+        recording_wait_for,
+    )
+    client = GeminiCli(
+        Path("/unused/agy"),
+        model="gemini-3.7-flash-high",
+        timeout_seconds=45,
+        timezone="Europe/Moscow",
+    )
+
+    assert asyncio.run(client._run("models")) == b"ok"
+    assert observed["timeout"] == 45
