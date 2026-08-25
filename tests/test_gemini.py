@@ -1,7 +1,7 @@
 import asyncio
+import json
 from copy import deepcopy
 from datetime import datetime
-import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -12,17 +12,21 @@ from tg_voice_transcriber_bot.gemini import (
     CALENDAR_PLANNER_SYSTEM_INSTRUCTION,
     GeminiApi,
     GeminiApiError,
+    GeminiAuthenticationError,
     GeminiCli,
     GeminiCliError,
+    GeminiConfigurationError,
     GeminiError,
     GeminiFallback,
+    GeminiProviderChain,
+    GeminiProviderStage,
     GeminiRateLimitError,
+    ProviderPermanentError,
 )
 from tg_voice_transcriber_bot.intent import (
     CALENDAR_INTENT_SCHEMA,
     CALENDAR_OPERATION_SCHEMA,
 )
-
 
 CALENDAR_RESULT = {
     "action": "create",
@@ -211,6 +215,66 @@ def test_direct_api_model_validation_uses_header_not_query_string():
     assert request.method == "GET"
     assert request.url.query == b""
     assert request.headers["x-goog-api-key"] == api_key
+
+
+def test_direct_api_classifies_invalid_api_key_as_permanent_without_leak():
+    api_key = "unit-test-secret-key"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": 400,
+                    "status": "INVALID_ARGUMENT",
+                    "message": f"rejected {api_key}",
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                            "reason": "API_KEY_INVALID",
+                        }
+                    ],
+                }
+            },
+        )
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                api_key,
+                model="gemini-3.7-flash",
+                timeout_seconds=90,
+                timezone="Europe/Moscow",
+                client=http_client,
+            )
+            await client.validate()
+
+    with pytest.raises(GeminiAuthenticationError) as captured:
+        asyncio.run(scenario())
+    assert api_key not in str(captured.value)
+
+
+def test_direct_api_classifies_model_mismatch_as_permanent():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"name": "models/another-model"})
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                "unit-test-secret-key",
+                model="gemini-3.7-flash",
+                timeout_seconds=90,
+                timezone="Europe/Moscow",
+                client=http_client,
+            )
+            await client.validate()
+
+    with pytest.raises(GeminiConfigurationError):
+        asyncio.run(scenario())
 
 
 def test_direct_api_retries_rate_limit_with_bounded_server_delay():
@@ -1524,3 +1588,476 @@ def test_cli_process_wait_uses_exact_configured_timeout(monkeypatch):
 
     assert asyncio.run(client._run("models")) == b"ok"
     assert observed["timeout"] == 45
+
+
+def test_provider_chain_uses_strict_priority_and_falls_back_on_errors():
+    calls = []
+
+    class Provider:
+        def __init__(self, name, *, error=None, result=None):
+            self.name = name
+            self.error = error
+            self.result = result
+
+        async def extract_event(self, transcript, **kwargs):
+            calls.append(self.name)
+            if self.error is not None:
+                raise self.error
+            return self.result
+
+    nemotron = Provider(
+        "Nemotron 3 Super", error=GeminiError("nemotron failed")
+    )
+    glm = Provider(
+        "GLM 5.2 Free",
+        error=GeminiRateLimitError("GLM rate limit exceeded"),
+    )
+    gemini = Provider("Gemini", result=CALENDAR_RESULT)
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage("Nemotron 3 Super", nemotron, 0.1),
+                GeminiProviderStage("GLM 5.2 Free", glm, 0.1),
+                GeminiProviderStage("Gemini", gemini, 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        return await chain.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+
+    assert asyncio.run(scenario()) == CALENDAR_RESULT
+    assert calls == ["Nemotron 3 Super", "GLM 5.2 Free", "Gemini"]
+
+
+def test_provider_chain_short_circuits_after_first_success():
+    calls = []
+
+    class Provider:
+        def __init__(self, name, result=None):
+            self.name = name
+            self.result = result
+
+        async def extract_event(self, transcript, **kwargs):
+            calls.append(self.name)
+            if self.result is None:
+                raise AssertionError("lower-priority provider must not run")
+            return self.result
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super",
+                    Provider("Nemotron 3 Super", CALENDAR_RESULT),
+                    0.1,
+                ),
+                GeminiProviderStage(
+                    "GLM 5.2 Free", Provider("GLM 5.2 Free"), 0.1
+                ),
+                GeminiProviderStage("Gemini", Provider("Gemini"), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        return await chain.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+
+    assert asyncio.run(scenario()) == CALENDAR_RESULT
+    assert calls == ["Nemotron 3 Super"]
+
+
+def test_provider_chain_falls_back_after_stage_timeout():
+    calls = []
+
+    class HangingNemotron:
+        def __init__(self):
+            self.cancelled = False
+
+        async def extract_event(self, transcript, **kwargs):
+            calls.append("Nemotron 3 Super")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    class WorkingGlm:
+        async def extract_event(self, transcript, **kwargs):
+            calls.append("GLM 5.2 Free")
+            return CALENDAR_RESULT
+
+    class UnusedGemini:
+        async def extract_event(self, transcript, **kwargs):
+            calls.append("Gemini")
+            raise AssertionError("third provider must not run")
+
+    async def scenario():
+        nemotron = HangingNemotron()
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage("Nemotron 3 Super", nemotron, 0.01),
+                GeminiProviderStage("GLM 5.2 Free", WorkingGlm(), 0.1),
+                GeminiProviderStage("Gemini", UnusedGemini(), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        result = await chain.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+        return nemotron, result
+
+    nemotron, result = asyncio.run(scenario())
+    assert nemotron.cancelled is True
+    assert result == CALENDAR_RESULT
+    assert calls == ["Nemotron 3 Super", "GLM 5.2 Free"]
+
+
+def test_provider_chain_isolates_full_planner_context_between_stages():
+    reference_time = datetime(
+        2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+    )
+    application_state = {
+        "allowed_event_ids": ["event-planning"],
+        "candidate_events": [
+            {"event_id": "event-planning", "title": "Планёрка"}
+        ],
+    }
+    recent_conversation = [
+        {"transcript": "Создай планёрку", "result": {"status": "created"}}
+    ]
+    history_steps = [
+        {
+            "type": "user_input",
+            "content": [{"type": "text", "text": "previous exact input"}],
+        }
+    ]
+    expected_application_state = deepcopy(application_state)
+    expected_recent_conversation = deepcopy(recent_conversation)
+    expected_history_steps = deepcopy(history_steps)
+    observed = {}
+
+    class MutatingFailedProvider:
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            kwargs["application_state"]["candidate_events"][0][
+                "title"
+            ] = "corrupted by failed provider"
+            kwargs["recent_conversation"][0]["result"][
+                "status"
+            ] = "corrupted"
+            kwargs["history_steps"][0]["content"][0][
+                "text"
+            ] = "corrupted"
+            raise GeminiError("first provider failed")
+
+    class ObservingProvider:
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            observed["transcript"] = transcript
+            observed["kwargs"] = deepcopy(kwargs)
+            return CALENDAR_OPERATION_RESULT
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super", MutatingFailedProvider(), 0.1
+                ),
+                GeminiProviderStage(
+                    "GLM 5.2 Free", ObservingProvider(), 0.1
+                ),
+            ],
+            timeout_seconds=0.5,
+        )
+        return await chain.plan_calendar_actions(
+            "Добавь место",
+            reference_time=reference_time,
+            account="personal",
+            application_state=application_state,
+            recent_conversation=recent_conversation,
+            history_steps=history_steps,
+        )
+
+    assert asyncio.run(scenario()) == CALENDAR_OPERATION_RESULT
+    assert observed == {
+        "transcript": "Добавь место",
+        "kwargs": {
+            "reference_time": reference_time,
+            "account": "personal",
+            "application_state": expected_application_state,
+            "recent_conversation": expected_recent_conversation,
+            "history_steps": expected_history_steps,
+        },
+    }
+    assert application_state == expected_application_state
+    assert recent_conversation == expected_recent_conversation
+    assert history_steps == expected_history_steps
+
+
+def test_provider_chain_validation_succeeds_when_any_provider_is_available():
+    calls = []
+
+    class InvalidNemotron:
+        async def validate(self):
+            calls.append("validate Nemotron 3 Super")
+            raise ProviderPermanentError("invalid model")
+
+        async def extract_event(self, transcript, **kwargs):
+            raise AssertionError("invalid provider must be disabled")
+
+    class MissingGlm:
+        def is_available(self):
+            return False
+
+        async def validate(self):
+            raise AssertionError("unavailable provider must not be validated")
+
+        async def extract_event(self, transcript, **kwargs):
+            raise AssertionError("unavailable provider must be disabled")
+
+    class WorkingGemini:
+        async def validate(self):
+            calls.append("validate Gemini")
+
+        async def extract_event(self, transcript, **kwargs):
+            calls.append("call Gemini")
+            return CALENDAR_RESULT
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super", InvalidNemotron(), 0.1
+                ),
+                GeminiProviderStage("GLM 5.2 Free", MissingGlm(), 0.1),
+                GeminiProviderStage("Gemini", WorkingGemini(), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        await chain.validate()
+        result = await chain.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+        return chain, result
+
+    chain, result = asyncio.run(scenario())
+    assert result == CALENDAR_RESULT
+    assert calls == ["validate Nemotron 3 Super", "validate Gemini", "call Gemini"]
+    assert chain.primary_available is False
+    assert isinstance(chain.primary_validation_error, GeminiError)
+    assert chain.available_provider_names == ("Gemini",)
+
+
+def test_provider_chain_validation_fails_when_all_providers_are_unavailable():
+    calls = []
+
+    class InvalidProvider:
+        def __init__(self, name):
+            self.name = name
+
+        async def validate(self):
+            calls.append(self.name)
+            raise ProviderPermanentError(f"{self.name} unavailable")
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super",
+                    InvalidProvider("Nemotron 3 Super"),
+                    0.1,
+                ),
+                GeminiProviderStage(
+                    "GLM 5.2 Free", InvalidProvider("GLM 5.2 Free"), 0.1
+                ),
+                GeminiProviderStage(
+                    "Gemini", InvalidProvider("Gemini"), 0.1
+                ),
+            ],
+            timeout_seconds=0.5,
+        )
+        with pytest.raises(ProviderPermanentError, match="unavailable"):
+            await chain.validate()
+        return chain
+
+    chain = asyncio.run(scenario())
+    assert calls == ["Nemotron 3 Super", "GLM 5.2 Free", "Gemini"]
+    assert chain.available_provider_names == ()
+
+
+def test_provider_chain_retries_transiently_unavailable_primary_at_runtime():
+    calls = []
+
+    class RecoveringNemotron:
+        async def validate(self):
+            calls.append("validate Nemotron 3 Super")
+            raise GeminiRateLimitError("startup rate limit")
+
+        async def extract_event(self, transcript, **kwargs):
+            calls.append("call Nemotron 3 Super")
+            return CALENDAR_RESULT
+
+    class WorkingGemini:
+        async def validate(self):
+            calls.append("validate Gemini")
+
+        async def extract_event(self, transcript, **kwargs):
+            raise AssertionError("recovered primary must retain priority")
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super", RecoveringNemotron(), 0.1
+                ),
+                GeminiProviderStage("Gemini", WorkingGemini(), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        await chain.validate()
+        result = await chain.extract_event(
+            "Завтра встреча",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+        )
+        return chain, result
+
+    chain, result = asyncio.run(scenario())
+    assert result == CALENDAR_RESULT
+    assert chain.primary_available is True
+    assert isinstance(chain.primary_validation_error, GeminiRateLimitError)
+    assert chain.available_provider_names == ("Nemotron 3 Super", "Gemini")
+    assert calls == [
+        "validate Nemotron 3 Super",
+        "validate Gemini",
+        "call Nemotron 3 Super",
+    ]
+
+
+def test_provider_chain_global_deadline_is_bounded():
+    calls = []
+
+    class HangingProvider:
+        def __init__(self, name):
+            self.name = name
+            self.cancelled = False
+
+        async def extract_event(self, transcript, **kwargs):
+            calls.append(self.name)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    async def scenario():
+        nemotron = HangingProvider("Nemotron 3 Super")
+        glm = HangingProvider("GLM 5.2 Free")
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage("Nemotron 3 Super", nemotron, 1),
+                GeminiProviderStage("GLM 5.2 Free", glm, 1),
+            ],
+            timeout_seconds=0.02,
+        )
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(GeminiError, match="provider chain timed out"):
+            await chain.extract_event(
+                "Завтра встреча",
+                reference_time=datetime(
+                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+        return nemotron, glm, asyncio.get_running_loop().time() - started
+
+    nemotron, glm, elapsed = asyncio.run(scenario())
+    assert elapsed < 0.25
+    assert nemotron.cancelled is True
+    assert glm.cancelled is False
+    assert calls == ["Nemotron 3 Super"]
+
+
+def test_provider_chain_closes_every_provider_in_priority_order():
+    calls = []
+
+    class Provider:
+        def __init__(self, name):
+            self.name = name
+
+        async def aclose(self):
+            calls.append(self.name)
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super", Provider("Nemotron 3 Super"), 0.1
+                ),
+                GeminiProviderStage(
+                    "GLM 5.2 Free", Provider("GLM 5.2 Free"), 0.1
+                ),
+                GeminiProviderStage("Gemini", Provider("Gemini"), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        await chain.aclose()
+
+    asyncio.run(scenario())
+    assert calls == ["Nemotron 3 Super", "GLM 5.2 Free", "Gemini"]
+
+
+def test_provider_chain_closes_later_providers_after_close_failure():
+    calls = []
+
+    class Provider:
+        def __init__(self, name, *, fail=False):
+            self.name = name
+            self.fail = fail
+
+        async def aclose(self):
+            calls.append(self.name)
+            if self.fail:
+                raise RuntimeError("sensitive provider cleanup detail")
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super",
+                    Provider("Nemotron 3 Super", fail=True),
+                    0.1,
+                ),
+                GeminiProviderStage(
+                    "GLM 5.2 Free", Provider("GLM 5.2 Free"), 0.1
+                ),
+                GeminiProviderStage("Gemini", Provider("Gemini"), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        with pytest.raises(
+            GeminiError, match="provider cleanup failed"
+        ) as captured:
+            await chain.aclose()
+        assert "sensitive" not in str(captured.value)
+
+    asyncio.run(scenario())
+    assert calls == ["Nemotron 3 Super", "GLM 5.2 Free", "Gemini"]

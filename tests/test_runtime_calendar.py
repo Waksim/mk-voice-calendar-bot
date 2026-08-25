@@ -18,6 +18,16 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         state_path=tmp_path / "state.json",
         confirmation_state_path=tmp_path / "calendar-confirmations.json",
         gateway_cache_root=gateway_root,
+        openrouter_model="nvidia/nemotron-3-super-120b-a12b:free",
+        openrouter_timeout_seconds=35,
+        openrouter_reasoning_effort="medium",
+        openrouter_fallback_model="z-ai/glm-5.2:free",
+        openrouter_fallback_timeout_seconds=15,
+        openrouter_fallback_reasoning_effort="high",
+        openrouter_max_tokens=8192,
+        gemini_model="gemini-3.7-flash",
+        gemini_timeout_seconds=25,
+        calendar_planner_timeout_seconds=80,
         calendar_mcp_working_directory=calendar_root,
         calendar_mcp_binary_path=binary,
         calendar_mcp_oauth_credentials_path=tmp_path / "oauth.json",
@@ -32,23 +42,34 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         if environment == config.openrouter_api_key_environment:
             assert account == config.openrouter_keychain_account
             assert service == config.openrouter_keychain_service
+            sequence.append("openrouter_secret_read")
             return "fake-openrouter-key"
+        if environment == config.gemini_api_key_environment:
+            assert account == config.gemini_keychain_account
+            assert service == config.gemini_keychain_service
+            sequence.append("gemini_secret_read")
+            return "fake-gemini-key"
         raise RuntimeError("Unexpected secret request")
 
     class FakeOpenRouterApi:
         def __init__(self, api_key, **kwargs):
             assert api_key == "fake-openrouter-key"
-            captured["openrouter_kwargs"] = kwargs
+            self.model = kwargs["model"]
+            self.kwargs = kwargs
+            captured.setdefault("openrouter_clients", []).append(self)
 
         async def aclose(self):
-            sequence.append("openrouter_close")
+            sequence.append(f"provider_close:{self.model}")
 
-    class FakePlannerFallback:
-        def __init__(self, primary, fallback, *, timeout_seconds):
-            captured["fallback_provider"] = self
-            captured["openrouter_primary"] = primary
-            captured["cli_fallback"] = fallback
-            captured["planner_timeout_seconds"] = timeout_seconds
+    class FakeGeminiApi:
+        def __init__(self, api_key, **kwargs):
+            assert api_key == "fake-gemini-key"
+            self.model = kwargs["model"]
+            self.kwargs = kwargs
+            captured["gemini_client"] = self
+
+        async def aclose(self):
+            sequence.append(f"provider_close:{self.model}")
 
     class FakeBotApi:
         def __init__(self, token):
@@ -112,7 +133,7 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
     )
     monkeypatch.setattr(service_module, "BotApi", FakeBotApi)
     monkeypatch.setattr(service_module, "OpenRouterApi", FakeOpenRouterApi)
-    monkeypatch.setattr(service_module, "GeminiFallback", FakePlannerFallback)
+    monkeypatch.setattr(service_module, "GeminiApi", FakeGeminiApi)
     monkeypatch.setattr(service_module, "open_gateway", fake_open_gateway)
     monkeypatch.setattr(
         service_module, "open_calendar_mcp", fake_open_calendar_mcp
@@ -136,17 +157,48 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
             "DEBUG": "false",
         },
     }
-    assert captured["openrouter_kwargs"] == {
-        "model": "meta/muse-spark-1.2-contributor",
-        "timeout_seconds": 45,
+    openrouter_clients = captured["openrouter_clients"]
+    assert len(openrouter_clients) == 2
+    assert openrouter_clients[0].kwargs == {
+        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+        "timeout_seconds": 35,
+        "timezone": "Europe/Moscow",
+        "reasoning_effort": "medium",
+        "max_tokens": 8192,
+        "max_retries": 0,
+    }
+    assert openrouter_clients[1].kwargs == {
+        "model": "z-ai/glm-5.2:free",
+        "timeout_seconds": 15,
         "timezone": "Europe/Moscow",
         "reasoning_effort": "high",
         "max_tokens": 8192,
+        "max_retries": 0,
     }
-    assert captured["planner"] is captured["fallback_provider"]
-    assert captured["planner_timeout_seconds"] == 45
-    assert captured["cli_fallback"].model == "gemini-3.7-flash-high"
+    gemini_client = captured["gemini_client"]
+    assert gemini_client.kwargs == {
+        "model": "gemini-3.7-flash",
+        "timeout_seconds": 25,
+        "timezone": "Europe/Moscow",
+        "max_retries": 1,
+    }
+    planner = captured["planner"]
+    assert isinstance(planner, service_module.GeminiProviderChain)
+    assert planner.timeout_seconds == 80
+    assert [stage.name for stage in planner.stages] == [
+        "Nemotron 3 Super",
+        "GLM 5.2 Free",
+        "Gemini 3.7 Flash",
+    ]
+    assert [stage.timeout_seconds for stage in planner.stages] == [35, 15, 25]
+    assert [stage.provider for stage in planner.stages] == [
+        openrouter_clients[0],
+        openrouter_clients[1],
+        gemini_client,
+    ]
     assert sequence == [
+        "openrouter_secret_read",
+        "gemini_secret_read",
         "bot_open",
         "gateway_open",
         "calendar_open",
@@ -156,7 +208,9 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         "calendar_close",
         "gateway_close",
         "bot_close",
-        "openrouter_close",
+        "provider_close:nvidia/nemotron-3-super-120b-a12b:free",
+        "provider_close:z-ai/glm-5.2:free",
+        "provider_close:gemini-3.7-flash",
     ]
 
 
@@ -187,6 +241,8 @@ def test_webhook_listener_registration_ownership(
             return "fake-bot-token"
         if environment == config.webhook_secret_environment:
             return "webhook_secret-123"
+        if environment == config.gemini_api_key_environment:
+            return "fake-gemini-key"
         raise RuntimeError("OpenRouter key intentionally absent")
 
     class FakeBotApi:
@@ -262,5 +318,42 @@ def test_webhook_listener_registration_ownership(
     assert "webhook_run" in sequence
     assert "webhook_close" in sequence
     assert len(planners) == 1
-    assert isinstance(planners[0], service_module.GeminiCli)
+    assert isinstance(planners[0], service_module.GeminiProviderChain)
+    assert planners[0].timeout_seconds == config.calendar_planner_timeout_seconds
+    assert [stage.name for stage in planners[0].stages] == [
+        "Gemini 3.7 Flash"
+    ]
+    assert isinstance(planners[0].stages[0].provider, service_module.GeminiApi)
+    assert (
+        planners[0].stages[0].timeout_seconds
+        == config.gemini_timeout_seconds
+    )
     assert sequence[-3:] == ["calendar_close", "gateway_close", "bot_close"]
+
+
+def test_webhook_mode_requires_direct_gemini_api_key(tmp_path, monkeypatch):
+    launcher = tmp_path / "telegram-gateway"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    config = Config(
+        bot_update_mode="webhook",
+        webhook_public_url="https://calendar.example.test/telegram/bot/webhook",
+        gateway_launcher_path=launcher,
+        state_path=tmp_path / "state.json",
+        confirmation_state_path=tmp_path / "confirmations.json",
+        operation_state_path=tmp_path / "operations.json",
+    )
+
+    def fake_read_secret(*, environment, account=None, service=None):
+        if environment == config.bot_token_environment:
+            return "fake-bot-token"
+        if environment == config.webhook_secret_environment:
+            return "webhook_secret-123"
+        raise RuntimeError("Provider key intentionally absent")
+
+    monkeypatch.setattr(service_module, "Config", lambda: config)
+    monkeypatch.setattr(service_module, "read_secret", fake_read_secret)
+
+    with pytest.raises(
+        RuntimeError, match="Gemini API key is required in webhook mode"
+    ):
+        asyncio.run(service_module.async_main())

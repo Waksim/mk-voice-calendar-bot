@@ -31,10 +31,13 @@ from .gateway import (
     open_gateway,
 )
 from .gemini import (
+    GeminiApi,
     GeminiCli,
     GeminiError,
     GeminiFallback,
     GeminiProvider,
+    GeminiProviderChain,
+    GeminiProviderStage,
     GeminiRateLimitError,
 )
 from .intent import format_calendar_preview
@@ -75,15 +78,15 @@ LOGGER = logging.getLogger("tg_voice_transcriber_bot")
 START_TEXT = (
     "Пришлите голосовое сообщение или напишите календарную команду текстом. "
     "Для голосового я найду исходное сообщение через вашу пользовательскую "
-    "Telegram-сессию и запрошу серверную расшифровку Telegram. Muse Spark 1.2 "
-    "через OpenRouter выделит событие и покажет предпросмотр. После проверки нажмите "
+    "Telegram-сессию и запрошу серверную расшифровку Telegram. ИИ-планировщик "
+    "выделит событие и покажет предпросмотр. После проверки нажмите "
     "«Добавить», и событие попадёт в основной Google Calendar. Аудиофайл не "
     "скачивается. Без этого подтверждения календарь не изменяется."
 )
 
 START_TEXT_V2 = (
     "Пришлите голосовое сообщение или напишите календарную команду текстом. "
-    "Голосовое Telegram расшифрует на своих серверах, а Muse Spark 1.2 через OpenRouter "
+    "Голосовое Telegram расшифрует на своих серверах, а ИИ-планировщик "
     "с учётом последних команд сразу добавит, изменит или удалит событие в "
     "основном Google Calendar. Вы увидите ход обработки в одном обновляемом "
     "сообщении и итоговую карточку со временем выполнения. Если результат не "
@@ -615,23 +618,23 @@ def _planner_timed_out(exc: GeminiError) -> bool:
 def _planner_failure_copy(exc: GeminiError, *, matching: bool = False) -> str:
     if isinstance(exc, OpenRouterAuthenticationError):
         return (
-            "OpenRouter отклонил API-ключ или доступ к Muse. "
+            "OpenRouter отклонил API-ключ, а резервные модели тоже не ответили. "
             "Проверьте ключ и его ограничения, затем повторите команду."
         )
     if isinstance(exc, OpenRouterRequestRejectedError):
         return (
-            "OpenRouter отклонил этот запрос или доступ к Muse. "
+            "OpenRouter отклонил запрос, а резервные модели тоже не ответили. "
             "Google Calendar не изменён; уточните формулировку и повторите."
         )
     if isinstance(exc, OpenRouterCreditError):
         return (
-            "На балансе OpenRouter недостаточно средств для запроса к Muse. "
-            "Пополните баланс и повторите команду."
+            "OpenRouter отклонил запрос из-за лимита ключа или баланса, "
+            "а резервные модели тоже не ответили. Проверьте аккаунт и повторите."
         )
     if isinstance(exc, OpenRouterRateLimitError):
         return (
-            "OpenRouter временно ограничил запросы к Muse. Подождите немного "
-            "и повторите команду."
+            "Провайдеры ИИ-планировщика временно ограничили запросы. "
+            "Подождите немного и повторите команду."
         )
     if isinstance(exc, GeminiRateLimitError):
         return (
@@ -640,16 +643,16 @@ def _planner_failure_copy(exc: GeminiError, *, matching: bool = False) -> str:
         )
     if _planner_timed_out(exc):
         return (
-            "Muse не успела обработать команду за отведённое время. "
+            "ИИ-планировщик не успел обработать команду за отведённое время. "
             "Попробуйте повторить её через несколько минут."
         )
     if matching:
         return (
-            "Muse не смогла выбрать точное событие. Уточните название "
+            "ИИ-планировщик не смог выбрать точное событие. Уточните название "
             "или время новым сообщением."
         )
     return (
-        "Muse не смогла надёжно разобрать календарную команду. "
+        "ИИ-планировщик не смог надёжно разобрать календарную команду. "
         "Попробуйте уточнить её новым сообщением."
     )
 
@@ -763,6 +766,14 @@ class VoiceBotService:
         try:
             await self.gemini.validate()
             if (
+                self.config.bot_update_mode == "webhook"
+                and isinstance(self.gemini, GeminiProviderChain)
+                and not self.gemini.terminal_available
+            ):
+                raise self.gemini.terminal_validation_error or GeminiError(
+                    "Direct Gemini terminal provider is unavailable"
+                )
+            if (
                 isinstance(self.gemini, GeminiFallback)
                 and not self.gemini.primary_available
                 and self.calendar_operations is not None
@@ -774,11 +785,11 @@ class VoiceBotService:
             self.gemini_available = False
             if self.calendar_operations is not None:
                 LOGGER.error(
-                    "Muse/OpenRouter validation failed; calendar bot startup aborted"
+                    "AI planner validation failed; calendar bot startup aborted"
                 )
                 raise
             LOGGER.warning(
-                "Muse/OpenRouter validation failed; transcript fallback enabled"
+                "AI planner validation failed; transcript fallback enabled"
             )
         LOGGER.info(
             "Bot, %d user session(s), and local integrations validated",
@@ -875,19 +886,26 @@ class VoiceBotService:
                 or account in self.enabled_accounts
                 else "Telegram-сессия этого аккаунта временно не подключена"
             )
-            fallback_active = (
-                isinstance(self.gemini, GeminiFallback)
-                and not self.gemini.primary_available
+            available_provider_names = getattr(
+                self.gemini, "available_provider_names", ()
             )
-            if self.gemini_available and fallback_active:
+            fallback_active = isinstance(
+                self.gemini, GeminiFallback
+            ) and not self.gemini.primary_available
+            if self.gemini_available and available_provider_names:
                 gemini_status = (
-                    "Muse/OpenRouter недоступна; активен резервный Gemini CLI"
+                    "ИИ-планировщик доступен: "
+                    + " → ".join(available_provider_names)
+                )
+            elif self.gemini_available and fallback_active:
+                gemini_status = (
+                    "Основной ИИ-провайдер недоступен; активен резервный Gemini"
                 )
             elif self.gemini_available:
-                gemini_status = "Muse Spark 1.2 через OpenRouter доступна"
+                gemini_status = "ИИ-планировщик доступен"
             else:
                 gemini_status = (
-                    "Muse сейчас недоступна; останется обычная расшифровка"
+                    "ИИ-планировщик сейчас недоступен; останется обычная расшифровка"
                 )
             calendar_status = (
                 "Google Calendar подключён; изменения применяются сразу с кнопкой отмены"
@@ -1399,7 +1417,7 @@ class VoiceBotService:
                 self.state.save_job(update_id, job)
             elif not self.gemini_available:
                 job["final_html"] = format_error_card(
-                    "Muse сейчас недоступна. Команда сохранена в этой карточке.",
+                    "ИИ-планировщик сейчас недоступен. Команда сохранена в этой карточке.",
                     transcript=transcript,
                     elapsed_seconds=self._elapsed(job),
                 )
@@ -1444,12 +1462,12 @@ class VoiceBotService:
                     )
                 except _UnknownEventReference:
                     LOGGER.warning(
-                        "Muse planning returned an unknown event reference "
+                        "AI planner returned an unknown event reference "
                         "for update %s; calendar unchanged",
                         update_id,
                     )
                     job["final_html"] = format_error_card(
-                        "Muse выбрала событие вне доступного контекста. "
+                        "ИИ-планировщик выбрал событие вне доступного контекста. "
                         "Уточните его название или время новым сообщением.",
                         transcript=transcript,
                         elapsed_seconds=self._elapsed(job),
@@ -1459,7 +1477,7 @@ class VoiceBotService:
                 except GeminiError as exc:
                     planning_elapsed = time.monotonic() - planning_started
                     LOGGER.warning(
-                        "Muse/OpenRouter planning failed for update %s; error_type=%s "
+                        "AI planner failed for update %s; error_type=%s "
                         "error=%s elapsed=%.3fs; calendar unchanged",
                         update_id,
                         type(exc).__name__,
@@ -1712,12 +1730,12 @@ class VoiceBotService:
                 )
             except _UnknownEventReference:
                 LOGGER.warning(
-                    "Muse candidate matching returned an unknown event "
+                    "AI planner candidate matching returned an unknown event "
                     "reference for update %s; calendar unchanged",
                     update_id,
                 )
                 job["final_html"] = format_error_card(
-                    "Muse выбрала событие вне показанного списка. Уточните "
+                    "ИИ-планировщик выбрал событие вне показанного списка. Уточните "
                     "его название или время новым сообщением.",
                     transcript=transcript,
                     elapsed_seconds=self._elapsed(job),
@@ -1727,7 +1745,7 @@ class VoiceBotService:
             except GeminiError as exc:
                 planning_elapsed = time.monotonic() - planning_started
                 LOGGER.warning(
-                    "Muse/OpenRouter candidate matching failed for update %s; "
+                    "AI planner candidate matching failed for update %s; "
                     "error_type=%s error=%s elapsed=%.3fs; calendar unchanged",
                     update_id,
                     type(exc).__name__,
@@ -2081,12 +2099,12 @@ class VoiceBotService:
                     )
                 except GeminiError:
                     LOGGER.warning(
-                        "Muse/OpenRouter extraction failed for update %s; transcript fallback used",
+                        "AI planner extraction failed for update %s; transcript fallback used",
                         update_id,
                     )
                     job["reply"] = (
                         f"Расшифровка:\n{transcript}\n\n"
-                        "⚠️ Muse сейчас не смогла разобрать событие."
+                        "⚠️ ИИ-планировщик сейчас не смог разобрать событие."
                     )
                 else:
                     job["intent"] = intent
@@ -2098,7 +2116,7 @@ class VoiceBotService:
             else:
                 job["reply"] = (
                     f"Расшифровка:\n{transcript}\n\n"
-                    "⚠️ Muse сейчас недоступна."
+                    "⚠️ ИИ-планировщик сейчас недоступен."
                 )
             if job.get("status") != "intent_extracted":
                 job["next_chunk"] = 0
@@ -2187,14 +2205,7 @@ async def async_main() -> None:
         config.state_path,
         completed_update_limit=config.webhook_completed_ids_limit,
     )
-    gemini_cli = GeminiCli(
-        config.gemini_cli_path,
-        model=config.gemini_cli_model,
-        timeout_seconds=config.gemini_timeout_seconds,
-        timezone=config.calendar_timezone,
-    )
-    gemini: GeminiProvider = gemini_cli
-    openrouter_api: OpenRouterApi | None = None
+    planner_stages: list[GeminiProviderStage] = []
     try:
         openrouter_api_key = read_secret(
             environment=config.openrouter_api_key_environment,
@@ -2202,24 +2213,96 @@ async def async_main() -> None:
             service=config.openrouter_keychain_service,
         )
     except RuntimeError:
-        LOGGER.warning(
-            "OpenRouter API key unavailable; Antigravity CLI fallback enabled"
-        )
+        LOGGER.warning("OpenRouter API key unavailable; skipping free models")
     else:
-        openrouter_api = OpenRouterApi(
-            openrouter_api_key,
-            model=config.openrouter_model,
-            timeout_seconds=config.openrouter_timeout_seconds,
-            timezone=config.calendar_timezone,
-            reasoning_effort=config.openrouter_reasoning_effort,
-            max_tokens=config.openrouter_max_tokens,
+        planner_stages.extend(
+            (
+                GeminiProviderStage(
+                    "Nemotron 3 Super",
+                    OpenRouterApi(
+                        openrouter_api_key,
+                        model=config.openrouter_model,
+                        timeout_seconds=config.openrouter_timeout_seconds,
+                        timezone=config.calendar_timezone,
+                        reasoning_effort=config.openrouter_reasoning_effort,
+                        max_tokens=config.openrouter_max_tokens,
+                        max_retries=0,
+                    ),
+                    config.openrouter_timeout_seconds,
+                ),
+                GeminiProviderStage(
+                    "GLM 5.2 Free",
+                    OpenRouterApi(
+                        openrouter_api_key,
+                        model=config.openrouter_fallback_model,
+                        timeout_seconds=config.openrouter_fallback_timeout_seconds,
+                        timezone=config.calendar_timezone,
+                        reasoning_effort=(
+                            config.openrouter_fallback_reasoning_effort
+                        ),
+                        max_tokens=config.openrouter_max_tokens,
+                        max_retries=0,
+                    ),
+                    config.openrouter_fallback_timeout_seconds,
+                ),
+            )
         )
         del openrouter_api_key
-        gemini = GeminiFallback(
-            openrouter_api,
-            gemini_cli,
-            timeout_seconds=config.openrouter_timeout_seconds,
+
+    try:
+        gemini_api_key = read_secret(
+            environment=config.gemini_api_key_environment,
+            account=config.gemini_keychain_account,
+            service=config.gemini_keychain_service,
         )
+    except RuntimeError:
+        if config.bot_update_mode == "webhook":
+            if planner_stages:
+                cleanup_chain = GeminiProviderChain(
+                    planner_stages,
+                    timeout_seconds=config.calendar_planner_timeout_seconds,
+                )
+                try:
+                    await cleanup_chain.aclose()
+                except GeminiError:
+                    LOGGER.warning(
+                        "OpenRouter client cleanup failed during startup abort"
+                    )
+            raise RuntimeError(
+                "Gemini API key is required in webhook mode"
+            ) from None
+        LOGGER.warning(
+            "Gemini API key unavailable; local Antigravity CLI is the last fallback"
+        )
+        terminal_provider: GeminiProvider = GeminiCli(
+            config.gemini_cli_path,
+            model=config.gemini_cli_model,
+            timeout_seconds=config.gemini_timeout_seconds,
+            timezone=config.calendar_timezone,
+        )
+        terminal_name = "Gemini CLI"
+    else:
+        terminal_provider = GeminiApi(
+            gemini_api_key,
+            model=config.gemini_model,
+            timeout_seconds=config.gemini_timeout_seconds,
+            timezone=config.calendar_timezone,
+            max_retries=1,
+        )
+        terminal_name = "Gemini 3.7 Flash"
+        del gemini_api_key
+
+    planner_stages.append(
+        GeminiProviderStage(
+            terminal_name,
+            terminal_provider,
+            config.gemini_timeout_seconds,
+        )
+    )
+    gemini = GeminiProviderChain(
+        planner_stages,
+        timeout_seconds=config.calendar_planner_timeout_seconds,
+    )
 
     try:
         async with BotApi(token) as bot:
@@ -2288,8 +2371,7 @@ async def async_main() -> None:
                         finally:
                             await webhook.close()
     finally:
-        if openrouter_api is not None:
-            await openrouter_api.aclose()
+        await gemini.aclose()
 
 
 def main() -> None:

@@ -229,21 +229,20 @@ def format_progress_card(
             "🎙️ <b>Обрабатываю голосовое</b>\n\n"
             "⏳ Ищу сообщение в Telegram…\n"
             "▫️ Расшифровка\n"
-            "▫️ Muse Spark 1.2 · OpenRouter\n"
+            "▫️ ИИ-планировщик\n"
             "▫️ Google Calendar"
         ),
         "transcribing": (
             "🎙️ <b>Обрабатываю голосовое</b>\n\n"
             "✅ Голосовое найдено\n"
             "⏳ Получаю расшифровку от Telegram…\n"
-            "▫️ Muse Spark 1.2 · OpenRouter\n"
+            "▫️ ИИ-планировщик\n"
             "▫️ Google Calendar"
         ),
         "gemini": (
             f"{processing_header}\n\n"
             f"{command_received}\n"
-            "⏳ Muse Spark 1.2 разбирает команду и контекст "
-            "через OpenRouter…\n"
+            "⏳ ИИ-планировщик разбирает команду и контекст…\n"
             "▫️ Google Calendar"
         ),
     }
@@ -258,14 +257,14 @@ def format_progress_card(
         return _bounded(
             f"{processing_header}\n\n"
             f"{command_received}\n"
-            f"✅ Muse Spark 1.2: {operation}\n"
+            f"✅ ИИ-планировщик: {operation}\n"
             f"⏳ {verb}"
         )
     if phase == "calendar_lookup":
         return _bounded(
             f"{processing_header}\n\n"
             f"{command_received}\n"
-            "✅ Muse Spark 1.2 определила период поиска\n"
+            "✅ ИИ-планировщик определил период поиска\n"
             "⏳ Ищу события в Google Calendar…"
         )
     if phase == "gemini_match":
@@ -273,7 +272,7 @@ def format_progress_card(
             f"{processing_header}\n\n"
             f"{command_received}\n"
             "✅ Подходящие события найдены\n"
-            "⏳ Muse Spark 1.2 выбирает точную запись…"
+            "⏳ ИИ-планировщик выбирает точную запись…"
         )
     try:
         return _bounded(cards[phase])
@@ -720,7 +719,7 @@ def format_ignore_card(
     """Render a non-error response when no calendar command was present."""
     parts = [
         "ℹ️ <b>Календарь не изменён</b>",
-        "Muse Spark 1.2 не нашла в сообщении команды для календаря.",
+        "ИИ-планировщик не нашёл в сообщении команды для календаря.",
     ]
     transcript_block = _transcript_block(transcript, limit=650)
     if transcript_block:

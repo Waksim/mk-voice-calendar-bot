@@ -131,7 +131,7 @@ class OpenRouterApi:
     """OpenRouter Chat Completions implementation of ``GeminiProvider``."""
 
     _BASE_URL = "https://openrouter.ai/api/v1"
-    _DEFAULT_MODEL = "meta/muse-spark-1.2-contributor"
+    _DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
     _MAX_REQUEST_BYTES = 64 * 1024
     _MAX_RESPONSE_BYTES = 1_000_000
     _REASONING_EFFORTS = frozenset({"low", "medium", "high"})
@@ -143,7 +143,7 @@ class OpenRouterApi:
         timeout_seconds: float,
         timezone: str,
         model: str = _DEFAULT_MODEL,
-        reasoning_effort: str = "high",
+        reasoning_effort: str = "medium",
         max_tokens: int = 8192,
         max_retries: int = 2,
         max_retry_delay_seconds: float = 30,
@@ -156,7 +156,9 @@ class OpenRouterApi:
         if not re.fullmatch(r"[A-Za-z0-9._-]+", normalized_api_key):
             raise OpenRouterApiError("OpenRouter API key is invalid")
         if not isinstance(model, str) or not re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*",
+            r"[A-Za-z0-9][A-Za-z0-9._-]*/"
+            r"[A-Za-z0-9][A-Za-z0-9._-]*"
+            r"(?::[A-Za-z0-9][A-Za-z0-9._-]*)?",
             model,
         ):
             raise OpenRouterApiError("Configured OpenRouter model name is invalid")
@@ -215,6 +217,10 @@ class OpenRouterApi:
     @property
     def _model_url(self) -> str:
         return f"{self._BASE_URL}/model/{quote(self.model, safe='/')}"
+
+    @property
+    def _is_free_model(self) -> bool:
+        return self.model.endswith(":free")
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -435,7 +441,10 @@ class OpenRouterApi:
             for value in (total_credits, total_usage)
         ):
             raise OpenRouterApiError("OpenRouter credit validation failed")
-        if float(total_credits) - float(total_usage) <= 0:
+        remaining_credits = float(total_credits) - float(total_usage)
+        if remaining_credits < 0 or (
+            remaining_credits == 0 and not self._is_free_model
+        ):
             raise OpenRouterCreditError("OpenRouter API credits are exhausted")
 
         model_response = await self._request("GET", self._model_url)
