@@ -124,6 +124,52 @@ def client(session):
     )
 
 
+def test_calendar_mcp_tool_lifecycle_logs_are_secret_safe(caplog):
+    session = FakeSession(
+        [
+            result(
+                {
+                    "calendars": [
+                        {
+                            "id": "private-calendar-id",
+                            "summary": "PRIVATE_RESULT_TEXT",
+                        }
+                    ]
+                }
+            ),
+            RuntimeError("PRIVATE_PROVIDER_DIAGNOSTIC"),
+        ]
+    )
+    calendar = client(session)
+
+    async def scenario():
+        calendars = await calendar.list_calendars("personal")
+        assert calendars[0]["summary"] == "PRIVATE_RESULT_TEXT"
+        with pytest.raises(CalendarMcpError, match="validation failed"):
+            await calendar.list_calendars("personal")
+
+    with caplog.at_level(
+        "INFO", logger="tg_voice_transcriber_bot.calendar_mcp"
+    ):
+        asyncio.run(scenario())
+
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "tg_voice_transcriber_bot.calendar_mcp"
+    )
+    assert "tool=list-calendars" in messages
+    assert "account=google_personal" in messages
+    assert "status=started" in messages
+    assert "status=success" in messages
+    assert "status=transport_error" in messages
+    assert "error_type=RuntimeError" in messages
+    assert "elapsed=" in messages
+    assert "PRIVATE_RESULT_TEXT" not in messages
+    assert "private-calendar-id" not in messages
+    assert "PRIVATE_PROVIDER_DIAGNOSTIC" not in messages
+
+
 SNAPSHOT_FIELDS = [
     "description",
     "attendees",

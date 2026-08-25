@@ -3,6 +3,7 @@ from dataclasses import replace
 from datetime import datetime
 import hashlib
 import json
+import logging
 import stat
 from zoneinfo import ZoneInfo
 
@@ -10,6 +11,7 @@ import pytest
 
 from tg_voice_transcriber_bot.calendar import (
     CalendarConnectionError,
+    CalendarEventQueryResult,
     CalendarEventSnapshot,
     CalendarStateConflictError,
     CalendarWriteRejectedError,
@@ -3217,3 +3219,310 @@ def test_manual_rich_metadata_change_blocks_old_undo(tmp_path):
     assert writes_after[:-1] == writes_before
     assert writes_after[-1][0] == "get"
     assert not any(call[0] == "delete" for call in writes_after)
+
+
+def test_calendar_lifecycle_logs_cover_crud_read_and_undo_without_content(
+    tmp_path, caplog
+):
+    class ReadableCalendar(FakeCalendar):
+        async def search_events(self, *, account, query, time_min, time_max, limit):
+            self.calls.append(("search", query, time_min, time_max, limit))
+            visible = tuple(
+                snapshot
+                for snapshot in self.events.values()
+                if snapshot.status in {"confirmed", "tentative"}
+            )
+            return CalendarEventQueryResult(visible[:limit], len(visible), False)
+
+        async def list_events(self, *, account, time_min, time_max, limit):
+            return await self.search_events(
+                account=account,
+                query=None,
+                time_min=time_min,
+                time_max=time_max,
+                limit=limit,
+            )
+
+    caplog.set_level(
+        logging.INFO, logger="tg_voice_transcriber_bot.calendar_operations"
+    )
+    secrets = {
+        "transcript": "PRIVATE_TRANSCRIPT_4ea24e",
+        "title": "PRIVATE_TITLE_6fd13b",
+        "description": "PRIVATE_DESCRIPTION_f80b7c",
+        "location": "PRIVATE_LOCATION_8f9d12",
+        "query": "PRIVATE_QUERY_c029f4",
+        "update_event_id": "PRIVATE_EVENT_ID_UPDATE_8194",
+        "delete_event_id": "PRIVATE_EVENT_ID_DELETE_6127",
+    }
+
+    async def scenario():
+        calendar = ReadableCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        update_target = provider_event(
+            secrets["update_event_id"], location="Before update"
+        )
+        delete_target = provider_event(secrets["delete_event_id"])
+        calendar.events[update_target.event_id] = update_target
+        calendar.events[delete_target.event_id] = delete_target
+        pipeline.observe_lookup_events("personal", [update_target, delete_target])
+
+        read_result = await pipeline.query_events(
+            account="personal",
+            query=secrets["query"],
+            time_min="2026-08-24T00:00:00+03:00",
+            time_max="2026-08-25T00:00:00+03:00",
+            source_update_id=701_230,
+        )
+        await pipeline.record_read(
+            source_update_id=701_231,
+            account="personal",
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+            transcript=secrets["transcript"],
+            reference_time=NOW,
+            lookup={
+                "query": secrets["query"],
+                "time_min": "2026-08-24T00:00:00+03:00",
+                "time_max": "2026-08-25T00:00:00+03:00",
+            },
+            events=read_result.events,
+            total_count=read_result.total_count,
+            may_be_incomplete=False,
+        )
+        created_payload = event(
+            title=secrets["title"],
+            description=secrets["description"],
+            location=secrets["location"],
+        )
+        result = await apply(
+            pipeline,
+            701_232,
+            plan(
+                create_op(created_payload),
+                update_op(
+                    update_target.event_id,
+                    {"location": secrets["location"]},
+                ),
+                delete_op(delete_target.event_id),
+            ),
+            transcript=secrets["transcript"],
+        )
+        undo_result = await pipeline.undo(
+            operation_id=result.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+            source_update_id=701_233,
+            assistant_text="PRIVATE_ASSISTANT_TEXT_73f5",
+        )
+        return result, undo_result
+
+    result, undo_result = asyncio.run(scenario())
+
+    assert result.stage == "applied"
+    assert undo_result.outcome == "undone"
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "tg_voice_transcriber_bot.calendar_operations"
+    ]
+    joined = "\n".join(messages)
+    assert "phase=provider_read status=started operation_type=read" in joined
+    assert "phase=provider_read status=success operation_type=read" in joined
+    assert "phase=record_read status=success operation_type=read" in joined
+    assert (
+        "phase=apply status=started operation_type=create,update,delete "
+        "target_operation_type=none operation_count=3 account=personal "
+        "source_update_id=701232"
+    ) in joined
+    assert "phase=apply status=success operation_type=create,update,delete" in joined
+    assert (
+        "phase=undo status=rollback operation_type=undo "
+        "target_operation_type=create,update,delete operation_count=3 "
+        "account=personal source_update_id=701233"
+    ) in joined
+    assert "phase=undo status=success operation_type=undo" in joined
+    assert all("elapsed=" in message for message in messages)
+
+    forbidden = (
+        *secrets.values(),
+        result.operation_id,
+        "PRIVATE_ASSISTANT_TEXT_73f5",
+        "Before update",
+        "calendar-operation:",
+    )
+    assert all(value not in joined for value in forbidden)
+
+
+def test_calendar_lifecycle_logs_sanitize_errors_and_report_conflicts(
+    tmp_path, caplog
+):
+    class FailingReadCalendar(FakeCalendar):
+        async def search_events(self, **kwargs):
+            raise RuntimeError("PRIVATE_PROVIDER_RESULT_51f1")
+
+    caplog.set_level(
+        logging.INFO, logger="tg_voice_transcriber_bot.calendar_operations"
+    )
+
+    async def scenario():
+        failing = CalendarOperationPipeline(
+            OperationStore(tmp_path / "failing.json"), FailingReadCalendar()
+        )
+        with pytest.raises(CalendarOperationError):
+            await failing.query_events(
+                account="personal",
+                query="PRIVATE_TOOL_ARGUMENT_8c40",
+                time_min="2026-08-24T00:00:00+03:00",
+                time_max="2026-08-25T00:00:00+03:00",
+                source_update_id=702_100,
+            )
+
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "conflict.json"), calendar
+        )
+        created = await apply(
+            pipeline,
+            702_101,
+            plan(create_op(event(title="PRIVATE_CONFLICT_TITLE_2e8b"))),
+        )
+        event_id = created.record["items"][0]["after"]["event_id"]
+        calendar.events[event_id] = replace(
+            calendar.events[event_id], location="PRIVATE_EXTERNAL_EDIT_c185"
+        )
+        blocked = await pipeline.undo(
+            operation_id=created.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+            source_update_id=702_102,
+        )
+        return created, event_id, blocked
+
+    created, event_id, blocked = asyncio.run(scenario())
+
+    assert blocked.outcome == "blocked"
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "tg_voice_transcriber_bot.calendar_operations"
+    ]
+    joined = "\n".join(messages)
+    assert (
+        "phase=provider_read status=error operation_type=read "
+        "target_operation_type=none operation_count=1 account=personal "
+        "source_update_id=702100"
+    ) in joined
+    assert "error_type=CalendarOperationError" in joined
+    assert (
+        "phase=undo status=conflict operation_type=undo "
+        "target_operation_type=create operation_count=1 account=personal "
+        "source_update_id=702102"
+    ) in joined
+    for forbidden in (
+        "PRIVATE_PROVIDER_RESULT_51f1",
+        "PRIVATE_TOOL_ARGUMENT_8c40",
+        "PRIVATE_CONFLICT_TITLE_2e8b",
+        "PRIVATE_EXTERNAL_EDIT_c185",
+        created.operation_id,
+        event_id,
+    ):
+        assert forbidden not in joined
+
+
+def test_calendar_lifecycle_logs_write_and_undo_errors_without_payloads(
+    tmp_path, caplog
+):
+    class FailingCalendar(FakeCalendar):
+        fail_create = True
+        fail_delete = False
+
+        async def create_events(self, *, account, events, idempotency_key):
+            if self.fail_create:
+                raise RuntimeError("PRIVATE_CREATE_RESULT_46cb")
+            return await super().create_events(
+                account=account,
+                events=events,
+                idempotency_key=idempotency_key,
+            )
+
+        async def delete_event(self, **kwargs):
+            if self.fail_delete:
+                raise RuntimeError("PRIVATE_UNDO_RESULT_91b8")
+            return await super().delete_event(**kwargs)
+
+    caplog.set_level(
+        logging.INFO, logger="tg_voice_transcriber_bot.calendar_operations"
+    )
+
+    async def scenario():
+        calendar = FailingCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        with pytest.raises(CalendarOperationError):
+            await apply(
+                pipeline,
+                703_100,
+                plan(
+                    create_op(
+                        event(
+                            title="PRIVATE_CREATE_TITLE_eac5",
+                            description="PRIVATE_CREATE_DESCRIPTION_785c",
+                        )
+                    )
+                ),
+                transcript="PRIVATE_CREATE_TRANSCRIPT_a822",
+            )
+
+        calendar.fail_create = False
+        created = await apply(
+            pipeline,
+            703_101,
+            plan(create_op(event(title="PRIVATE_UNDO_TITLE_866b"))),
+            transcript="PRIVATE_UNDO_TRANSCRIPT_baf1",
+        )
+        calendar.fail_delete = True
+        undo_result = await pipeline.undo(
+            operation_id=created.operation_id,
+            owner_user_id=OWNER,
+            chat_id=OWNER,
+            source_update_id=703_102,
+        )
+        return created, undo_result
+
+    created, undo_result = asyncio.run(scenario())
+
+    assert undo_result.outcome == "retryable_error"
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "tg_voice_transcriber_bot.calendar_operations"
+    ]
+    joined = "\n".join(messages)
+    assert (
+        "phase=apply status=error operation_type=create "
+        "target_operation_type=none operation_count=1 account=personal "
+        "source_update_id=703100"
+    ) in joined
+    assert "error_type=CalendarOperationError" in joined
+    assert (
+        "phase=undo status=error operation_type=undo "
+        "target_operation_type=create operation_count=1 account=personal "
+        "source_update_id=703102"
+    ) in joined
+    assert "error_type=UndoRetryableError" in joined
+    for forbidden in (
+        "PRIVATE_CREATE_RESULT_46cb",
+        "PRIVATE_UNDO_RESULT_91b8",
+        "PRIVATE_CREATE_TITLE_eac5",
+        "PRIVATE_CREATE_DESCRIPTION_785c",
+        "PRIVATE_CREATE_TRANSCRIPT_a822",
+        "PRIVATE_UNDO_TITLE_866b",
+        "PRIVATE_UNDO_TRANSCRIPT_baf1",
+        created.operation_id,
+        created.record["items"][0]["after"]["event_id"],
+    ):
+        assert forbidden not in joined

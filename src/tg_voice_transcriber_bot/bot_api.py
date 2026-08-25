@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -12,6 +14,9 @@ from urllib.parse import urlsplit
 import httpx
 
 from .text import telegram_text_chunks, utf16_units
+
+
+LOGGER = logging.getLogger("tg_voice_transcriber_bot.bot_api")
 
 
 class BotApiError(RuntimeError):
@@ -30,6 +35,22 @@ UNSET = _UnsetType()
 
 _SECRET_ENVIRONMENT_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+_BOT_API_METHODS = frozenset(
+    {
+        "answerCallbackQuery",
+        "deleteWebhook",
+        "editMessageReplyMarkup",
+        "editMessageText",
+        "getMe",
+        "getUpdates",
+        "sendChatAction",
+        "sendMessage",
+        "setMyCommands",
+        "setMyDescription",
+        "setMyShortDescription",
+        "setWebhook",
+    }
+)
 _MAX_SECRET_FILE_BYTES = 65_536
 
 
@@ -117,34 +138,92 @@ class BotApi:
         await self._client.aclose()
 
     async def call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
+        started = time.monotonic()
+        safe_method = (
+            method
+            if isinstance(method, str) and method in _BOT_API_METHODS
+            else "unknown"
+        )
+        LOGGER.info(
+            "Telegram Bot API call started; method=%s status=started",
+            safe_method,
+        )
         url = f"https://api.telegram.org/bot{self._token}/{method}"
         try:
             response = await self._client.post(url, json=payload or {})
         except httpx.HTTPError as exc:
             # HTTPX exceptions may contain the token-bearing URL, so never include
             # their string representation in logs or propagated errors.
+            LOGGER.warning(
+                "Telegram Bot API call finished; method=%s "
+                "status=transport_error elapsed=%.3fs error_type=%s",
+                safe_method,
+                time.monotonic() - started,
+                type(exc).__name__,
+            )
             raise BotApiError(
                 f"Bot API transport error: {type(exc).__name__}"
             ) from None
         try:
             body = response.json()
         except ValueError as exc:
+            LOGGER.warning(
+                "Telegram Bot API call finished; method=%s "
+                "status=invalid_response http_status=%d elapsed=%.3fs",
+                safe_method,
+                response.status_code,
+                time.monotonic() - started,
+            )
             if response.status_code != 200:
                 raise BotApiError(
                     f"Bot API HTTP status {response.status_code}"
                 ) from None
             raise BotApiError("Bot API returned invalid JSON") from exc
+        if not isinstance(body, dict):
+            LOGGER.warning(
+                "Telegram Bot API call finished; method=%s "
+                "status=invalid_response http_status=%d elapsed=%.3fs",
+                safe_method,
+                response.status_code,
+                time.monotonic() - started,
+            )
+            raise BotApiError("Bot API returned an invalid response")
         if not body.get("ok"):
             code = body.get("error_code", "unknown")
             description = str(body.get("description", "request failed"))
             parameters = body.get("parameters") or {}
             retry_after = parameters.get("retry_after")
+            safe_code = (
+                code if isinstance(code, int) and not isinstance(code, bool) else "unknown"
+            )
+            LOGGER.warning(
+                "Telegram Bot API call finished; method=%s status=api_error "
+                "http_status=%d error_code=%s elapsed=%.3fs",
+                safe_method,
+                response.status_code,
+                safe_code,
+                time.monotonic() - started,
+            )
             raise BotApiError(
                 f"Bot API error {code}: {description}",
                 retry_after=(int(retry_after) if retry_after is not None else None),
             )
         if response.status_code != 200:
+            LOGGER.warning(
+                "Telegram Bot API call finished; method=%s status=http_error "
+                "http_status=%d elapsed=%.3fs",
+                safe_method,
+                response.status_code,
+                time.monotonic() - started,
+            )
             raise BotApiError(f"Bot API HTTP status {response.status_code}")
+        LOGGER.info(
+            "Telegram Bot API call finished; method=%s status=success "
+            "http_status=%d elapsed=%.3fs",
+            safe_method,
+            response.status_code,
+            time.monotonic() - started,
+        )
         return body.get("result")
 
     async def get_updates(self, offset: int) -> list[dict[str, Any]]:

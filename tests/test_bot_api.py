@@ -106,6 +106,60 @@ def test_retry_after_is_preserved_without_token_in_error():
     asyncio.run(scenario())
 
 
+def test_bot_api_lifecycle_logs_are_secret_safe(caplog):
+    async def scenario():
+        calls = 0
+
+        def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise httpx.ConnectError(
+                    "PRIVATE_TRANSPORT_DIAGNOSTIC", request=request
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": {"text": "PRIVATE_BOT_API_RESULT"},
+                },
+            )
+
+        api = BotApi("PRIVATE_BOT_TOKEN")
+        await api._client.aclose()
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await api.call(
+                "sendMessage", {"text": "PRIVATE_BOT_API_ARGUMENT"}
+            )
+            assert result["text"] == "PRIVATE_BOT_API_RESULT"
+            with pytest.raises(BotApiError, match="ConnectError"):
+                await api.call("getMe")
+        finally:
+            await api._client.aclose()
+
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.bot_api"):
+        asyncio.run(scenario())
+
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "tg_voice_transcriber_bot.bot_api"
+    )
+    assert "method=sendMessage" in messages
+    assert "method=getMe" in messages
+    assert "status=started" in messages
+    assert "status=success" in messages
+    assert "status=transport_error" in messages
+    assert "error_type=ConnectError" in messages
+    assert "elapsed=" in messages
+    assert "PRIVATE_BOT_TOKEN" not in messages
+    assert "PRIVATE_BOT_API_ARGUMENT" not in messages
+    assert "PRIVATE_BOT_API_RESULT" not in messages
+    assert "PRIVATE_TRANSPORT_DIAGNOSTIC" not in messages
+    assert "api.telegram.org" not in messages
+
+
 def test_callbacks_are_polled_and_keyboard_is_attached_to_first_chunk_only():
     async def scenario():
         requests = []

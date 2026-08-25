@@ -168,6 +168,60 @@ def test_gateway_validation_rejects_empty_account_catalog():
         asyncio.run(gateway.validate_operations())
 
 
+def test_gateway_tool_lifecycle_logs_are_secret_safe(caplog):
+    class SecretSession:
+        def __init__(self):
+            self.calls = 0
+
+        async def call_tool(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("PRIVATE_GATEWAY_DIAGNOSTIC")
+            return SimpleNamespace(
+                isError=False,
+                structuredContent={
+                    "operation": "find_recent_outgoing_voice",
+                    "result": {"text": "PRIVATE_GATEWAY_RESULT"},
+                },
+            )
+
+    gateway = TelegramGateway(SecretSession(), default_timeout=30)
+
+    async def scenario():
+        result = await gateway.read(
+            "personal",
+            "find_recent_outgoing_voice",
+            {"query": "PRIVATE_GATEWAY_ARGUMENT"},
+        )
+        assert result["text"] == "PRIVATE_GATEWAY_RESULT"
+        with pytest.raises(RuntimeError, match="PRIVATE_GATEWAY_DIAGNOSTIC"):
+            await gateway.read(
+                "personal",
+                "find_recent_outgoing_voice",
+                {"query": "PRIVATE_GATEWAY_ARGUMENT"},
+            )
+
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.gateway"):
+        asyncio.run(scenario())
+
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "tg_voice_transcriber_bot.gateway"
+    )
+    assert "tool=telegram_read" in messages
+    assert "operation=find_recent_outgoing_voice" in messages
+    assert "account=personal" in messages
+    assert "status=started" in messages
+    assert "status=success" in messages
+    assert "status=transport_error" in messages
+    assert "error_type=RuntimeError" in messages
+    assert "elapsed=" in messages
+    assert "PRIVATE_GATEWAY_ARGUMENT" not in messages
+    assert "PRIVATE_GATEWAY_RESULT" not in messages
+    assert "PRIVATE_GATEWAY_DIAGNOSTIC" not in messages
+
+
 def test_gateway_wraps_stdio_start_failure(tmp_path, monkeypatch):
     launcher = tmp_path / "runtime" / "scripts" / "telegram-gateway"
     launcher.parent.mkdir(parents=True)

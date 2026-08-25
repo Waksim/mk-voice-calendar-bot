@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from typing import Any, Protocol
 
 from aiohttp import web
@@ -83,17 +84,32 @@ class WebhookRuntime:
         )
 
     async def _receive_update(self, request: web.Request) -> web.Response:
+        started = time.monotonic()
+        LOGGER.info("Telegram webhook receive; status=started")
         provided_secret = request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token", ""
         )
         if not secrets.compare_digest(provided_secret, self.secret_token):
+            LOGGER.warning(
+                "Telegram webhook receive; status=forbidden elapsed=%.3fs",
+                time.monotonic() - started,
+            )
             raise web.HTTPForbidden()
         if request.content_type != "application/json":
+            LOGGER.warning(
+                "Telegram webhook receive; status=unsupported_media_type "
+                "elapsed=%.3fs",
+                time.monotonic() - started,
+            )
             raise web.HTTPUnsupportedMediaType()
         if (
             request.content_length is not None
             and request.content_length > self.max_body_bytes
         ):
+            LOGGER.warning(
+                "Telegram webhook receive; status=body_too_large elapsed=%.3fs",
+                time.monotonic() - started,
+            )
             raise web.HTTPRequestEntityTooLarge(
                 max_size=self.max_body_bytes,
                 actual_size=request.content_length,
@@ -101,23 +117,60 @@ class WebhookRuntime:
         try:
             update = await request.json(loads=json.loads)
         except web.HTTPRequestEntityTooLarge:
+            LOGGER.warning(
+                "Telegram webhook receive; status=body_too_large elapsed=%.3fs",
+                time.monotonic() - started,
+            )
             raise
         except (json.JSONDecodeError, UnicodeError, ValueError):
+            LOGGER.warning(
+                "Telegram webhook receive; status=invalid_json elapsed=%.3fs",
+                time.monotonic() - started,
+            )
             raise web.HTTPBadRequest() from None
         if not isinstance(update, dict):
+            LOGGER.warning(
+                "Telegram webhook receive; status=invalid_update elapsed=%.3fs",
+                time.monotonic() - started,
+            )
             raise web.HTTPBadRequest()
+
+        raw_update_id = update.get("update_id")
+        update_id = (
+            raw_update_id
+            if isinstance(raw_update_id, int) and not isinstance(raw_update_id, bool)
+            else "unknown"
+        )
 
         try:
             inserted = self.state.enqueue_update(update)
         except ValueError:
+            LOGGER.warning(
+                "Telegram webhook receive; update_id=%s status=invalid_update "
+                "elapsed=%.3fs",
+                update_id,
+                time.monotonic() - started,
+            )
             raise web.HTTPBadRequest() from None
-        except Exception:
+        except Exception as exc:
             # A non-2xx response makes Telegram retry. Never acknowledge an
             # update whose atomic state-file write did not complete.
-            LOGGER.exception("Could not durably persist a Telegram webhook update")
+            LOGGER.error(
+                "Telegram webhook receive; update_id=%s status=persistence_error "
+                "elapsed=%.3fs error_type=%s",
+                update_id,
+                time.monotonic() - started,
+                type(exc).__name__,
+            )
             raise web.HTTPServiceUnavailable() from None
         if inserted:
             self._wake.set()
+        LOGGER.info(
+            "Telegram webhook receive; update_id=%s status=%s elapsed=%.3fs",
+            update_id,
+            "enqueued" if inserted else "duplicate",
+            time.monotonic() - started,
+        )
         return web.json_response({"ok": True})
 
     async def _wait_for_work(self) -> dict[str, Any]:
@@ -152,18 +205,38 @@ class WebhookRuntime:
         while not self._stop.is_set():
             update = await self._wait_for_work()
             update_id = int(update["update_id"])
+            started = time.monotonic()
+            LOGGER.info(
+                "Telegram webhook update; update_id=%s status=started",
+                update_id,
+            )
             try:
                 await self.handler.handle_update(update)
                 self.state.complete_webhook_update(update_id)
+                LOGGER.info(
+                    "Telegram webhook update; update_id=%s status=completed "
+                    "elapsed=%.3fs",
+                    update_id,
+                    time.monotonic() - started,
+                )
             except asyncio.CancelledError:
+                LOGGER.info(
+                    "Telegram webhook update; update_id=%s status=cancelled "
+                    "elapsed=%.3fs",
+                    update_id,
+                    time.monotonic() - started,
+                )
                 raise
-            except (GatewayConnectionError, CalendarConnectionError):
+            except (GatewayConnectionError, CalendarConnectionError) as exc:
                 # A dead stdio MCP session cannot recover in-process. Keep the
                 # durable update pending and let the container restart rebuild
                 # every subprocess before attempting it again.
                 LOGGER.critical(
-                    "Webhook update %s lost an MCP connection; stopping worker",
+                    "Telegram webhook update; update_id=%s "
+                    "status=fatal_connection_error elapsed=%.3fs error_type=%s",
                     update_id,
+                    time.monotonic() - started,
+                    type(exc).__name__,
                 )
                 self._stop.set()
                 raise
@@ -171,8 +244,10 @@ class WebhookRuntime:
                 # Log only the update ID and exception class: provider errors
                 # can contain private calendar or transcription content.
                 LOGGER.error(
-                    "Webhook update %s failed and will be retried: %s",
+                    "Telegram webhook update; update_id=%s status=retry "
+                    "elapsed=%.3fs error_type=%s",
                     update_id,
+                    time.monotonic() - started,
                     type(exc).__name__,
                 )
                 await self._retry_pause(exc)
@@ -180,14 +255,22 @@ class WebhookRuntime:
     async def start(self) -> None:
         if self._runner is not None:
             raise RuntimeError("webhook runtime is already started")
+        started = time.monotonic()
+        LOGGER.info("Telegram webhook runtime; status=starting")
         self._stop.clear()
         runner = web.AppRunner(self.application, access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, self.host, self.port)
         try:
             await site.start()
-        except BaseException:
+        except BaseException as exc:
             await runner.cleanup()
+            LOGGER.error(
+                "Telegram webhook runtime; status=startup_error elapsed=%.3fs "
+                "error_type=%s",
+                time.monotonic() - started,
+                type(exc).__name__,
+            )
             raise
         self._runner = runner
         self._site = site
@@ -196,6 +279,10 @@ class WebhookRuntime:
         )
         if self.state.pending_update_count:
             self._wake.set()
+        LOGGER.info(
+            "Telegram webhook runtime; status=ready elapsed=%.3fs",
+            time.monotonic() - started,
+        )
 
     async def run_forever(self) -> None:
         if self._runner is None:
@@ -222,6 +309,8 @@ class WebhookRuntime:
                 pass
 
     async def close(self) -> None:
+        started = time.monotonic()
+        LOGGER.info("Telegram webhook runtime; status=stopping")
         self._stop.set()
         self._wake.set()
         worker, self._worker = self._worker, None
@@ -240,6 +329,10 @@ class WebhookRuntime:
         self._site = None
         if runner is not None:
             await runner.cleanup()
+        LOGGER.info(
+            "Telegram webhook runtime; status=closed elapsed=%.3fs",
+            time.monotonic() - started,
+        )
 
     @property
     def bound_port(self) -> int | None:

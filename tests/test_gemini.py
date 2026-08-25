@@ -22,6 +22,7 @@ from tg_voice_transcriber_bot.gemini import (
     GeminiProviderStage,
     GeminiRateLimitError,
     ProviderPermanentError,
+    planner_diagnostic_context,
 )
 from tg_voice_transcriber_bot.intent import (
     CALENDAR_INTENT_SCHEMA,
@@ -1952,7 +1953,7 @@ def test_provider_chain_retries_transiently_unavailable_primary_at_runtime():
     ]
 
 
-def test_provider_chain_global_deadline_is_bounded():
+def test_provider_chain_global_deadline_is_bounded(caplog):
     calls = []
 
     class HangingProvider:
@@ -1979,21 +1980,27 @@ def test_provider_chain_global_deadline_is_bounded():
             timeout_seconds=0.02,
         )
         started = asyncio.get_running_loop().time()
-        with pytest.raises(GeminiError, match="provider chain timed out"):
-            await chain.extract_event(
-                "Завтра встреча",
-                reference_time=datetime(
-                    2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
-                ),
-                account="personal",
-            )
+        with planner_diagnostic_context("tg-update-global-deadline"):
+            with pytest.raises(GeminiError, match="provider chain timed out"):
+                await chain.extract_event(
+                    "Завтра встреча",
+                    reference_time=datetime(
+                        2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+                    ),
+                    account="personal",
+                )
         return nemotron, glm, asyncio.get_running_loop().time() - started
 
-    nemotron, glm, elapsed = asyncio.run(scenario())
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.planner"):
+        nemotron, glm, elapsed = asyncio.run(scenario())
     assert elapsed < 0.25
     assert nemotron.cancelled is True
     assert glm.cancelled is False
     assert calls == ["Nemotron 3 Super"]
+    assert "AI planner chain deadline exhausted" in caplog.text
+    assert "call_id=tg-update-global-deadline" in caplog.text
+    assert "operation=extract_event" in caplog.text
+    assert "error_type=GeminiError" in caplog.text
 
 
 def test_provider_chain_closes_every_provider_in_priority_order():
@@ -2061,3 +2068,187 @@ def test_provider_chain_closes_later_providers_after_close_failure():
 
     asyncio.run(scenario())
     assert calls == ["Nemotron 3 Super", "GLM 5.2 Free", "Gemini"]
+
+
+def test_provider_chain_logs_every_fallback_stage_without_logging_context(
+    caplog,
+):
+    transcript_secret = "planner-prompt-secret-DO-NOT-LOG"
+    state_secret = "calendar-state-secret-DO-NOT-LOG"
+    output_secret = "planner-output-secret-DO-NOT-LOG"
+    calls = []
+
+    class FailedNemotron:
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append("Nemotron 3 Super")
+            raise GeminiApiError("Nemotron returned invalid structured output")
+
+    class LimitedGlm:
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append("GLM 5.2 Free")
+            raise GeminiRateLimitError("GLM rate limit exceeded")
+
+    class WorkingGemini:
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append("Gemini 3.7 Flash")
+            result = deepcopy(CALENDAR_OPERATION_RESULT)
+            result["operations"][0]["patch"] = {"description": output_secret}
+            return result
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super", FailedNemotron(), 0.1
+                ),
+                GeminiProviderStage("GLM 5.2 Free", LimitedGlm(), 0.1),
+                GeminiProviderStage("Gemini 3.7 Flash", WorkingGemini(), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        with planner_diagnostic_context("tg-update-4242"):
+            return await chain.plan_calendar_actions(
+                transcript_secret,
+                reference_time=datetime(
+                    2026, 8, 25, 18, 40, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+                application_state={
+                    "allowed_event_ids": ["event-planning"],
+                    "candidate_events": [
+                        {"event_id": "event-planning", "title": state_secret}
+                    ],
+                },
+                recent_conversation=[{"transcript": state_secret}],
+            )
+
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.planner"):
+        result = asyncio.run(scenario())
+
+    assert result["operations"][0]["patch"] == {"description": output_secret}
+    assert calls == ["Nemotron 3 Super", "GLM 5.2 Free", "Gemini 3.7 Flash"]
+    assert "call_id=tg-update-4242" in caplog.text
+    assert (
+        "provider=Nemotron 3 Super operation=plan_calendar_actions"
+        in caplog.text
+    )
+    assert "error_type=GeminiApiError" in caplog.text
+    assert "provider=GLM 5.2 Free operation=plan_calendar_actions" in caplog.text
+    assert "error_type=GeminiRateLimitError" in caplog.text
+    assert "provider=Gemini 3.7 Flash operation=plan_calendar_actions" in caplog.text
+    assert "selected_provider=Gemini 3.7 Flash" in caplog.text
+    assert "prior_failures=GeminiApiError,GeminiRateLimitError" in caplog.text
+    assert "result_action=execute operation_count=1" in caplog.text
+    assert transcript_secret not in caplog.text
+    assert state_secret not in caplog.text
+    assert output_secret not in caplog.text
+
+
+def test_provider_chain_late_timeout_is_not_masked_by_earlier_rate_limits(
+    caplog,
+):
+    class LimitedProvider:
+        def __init__(self, message):
+            self.message = message
+
+        async def extract_event(self, transcript, **kwargs):
+            raise GeminiRateLimitError(self.message)
+
+    class HangingGemini:
+        async def extract_event(self, transcript, **kwargs):
+            await asyncio.Event().wait()
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super", LimitedProvider("Nemotron 429"), 0.1
+                ),
+                GeminiProviderStage(
+                    "GLM 5.2 Free", LimitedProvider("GLM 429"), 0.1
+                ),
+                GeminiProviderStage("Gemini 3.7 Flash", HangingGemini(), 0.01),
+            ],
+            timeout_seconds=0.5,
+        )
+        with planner_diagnostic_context("tg-update-429-timeout"):
+            await chain.extract_event(
+                "Завтра встреча",
+                reference_time=datetime(
+                    2026, 8, 25, 18, 40, tzinfo=ZoneInfo("Europe/Moscow")
+                ),
+                account="personal",
+            )
+
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.planner"):
+        with pytest.raises(
+            GeminiError,
+            match="Calendar planner stage timed out: Gemini 3.7 Flash",
+        ) as raised:
+            asyncio.run(scenario())
+
+    assert type(raised.value) is GeminiError
+    assert "provider=Nemotron 3 Super" in caplog.text
+    assert "error_type=GeminiRateLimitError error=Nemotron 429" in caplog.text
+    assert "provider=GLM 5.2 Free" in caplog.text
+    assert "error_type=GeminiRateLimitError error=GLM 429" in caplog.text
+    assert "AI planner stage timed out" in caplog.text
+    assert "provider=Gemini 3.7 Flash" in caplog.text
+    assert "error_type=GeminiError error=Calendar planner stage timed out" in caplog.text
+    assert (
+        "error_types=GeminiRateLimitError,GeminiRateLimitError,GeminiError"
+        in caplog.text
+    )
+
+
+def test_direct_api_logs_static_semantic_rejection_without_model_output(
+    caplog,
+):
+    forged_event_id = "provider-event-id-secret-DO-NOT-LOG"
+    transcript_secret = "planner-command-secret-DO-NOT-LOG"
+    api_key = "unit-test-secret-key"
+    forged = deepcopy(CALENDAR_OPERATION_RESULT)
+    forged["operations"][0]["target_event_id"] = forged_event_id
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=planning_interaction_response(forged))
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = GeminiApi(
+                api_key,
+                model="gemini-3.7-flash",
+                timeout_seconds=90,
+                timezone="Europe/Moscow",
+                client=http_client,
+            )
+            with planner_diagnostic_context("tg-update-semantic-gemini"):
+                await client.plan_calendar_actions(
+                    transcript_secret,
+                    reference_time=datetime(
+                        2026, 8, 25, 18, 40, tzinfo=ZoneInfo("Europe/Moscow")
+                    ),
+                    account="personal",
+                    application_state={"allowed_event_ids": ["event-planning"]},
+                    recent_conversation=[],
+                )
+
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.planner"):
+        with pytest.raises(GeminiApiError) as raised:
+            asyncio.run(scenario())
+
+    assert str(raised.value) == (
+        "Gemini returned an invalid calendar plan: "
+        "target_event_id is not a known calendar event"
+    )
+    assert "call_id=tg-update-semantic-gemini" in caplog.text
+    assert "provider=Gemini API" in caplog.text
+    assert "phase=semantic_validation" in caplog.text
+    assert "reason=target_event_id is not a known calendar event" in caplog.text
+    assert "output_bytes=" in caplog.text
+    assert "output_fingerprint=" in caplog.text
+    assert transcript_secret not in caplog.text
+    assert forged_event_id not in caplog.text
+    assert api_key not in caplog.text

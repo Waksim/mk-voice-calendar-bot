@@ -15,10 +15,12 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 from http import HTTPStatus
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -40,6 +42,7 @@ from .calendar import (
 )
 
 
+LOGGER = logging.getLogger("tg_voice_transcriber_bot.calendar_mcp")
 CALENDAR_MCP_TOOLS = (
     "create-event",
     "delete-event",
@@ -1239,6 +1242,21 @@ class GoogleCalendarMcpClient:
         return mcp_account, calendar_id
 
     async def _tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        safe_tool = name if name in CALENDAR_MCP_TOOLS else "unknown"
+        raw_account = arguments.get("account")
+        account = (
+            raw_account
+            if isinstance(raw_account, str) and _MCP_ACCOUNT_RE.fullmatch(raw_account)
+            else "none"
+        )
+        LOGGER.info(
+            "Calendar MCP tool started; tool=%s account=%s status=started "
+            "timeout=%ss",
+            safe_tool,
+            account,
+            self._timeout,
+        )
         try:
             result = await self._session.call_tool(
                 name,
@@ -1249,14 +1267,55 @@ class GoogleCalendarMcpClient:
             # Do not chain an MCP exception: provider errors may include event
             # text, account metadata, or credential-related diagnostics.
             if _is_connection_failure(exc):
+                LOGGER.error(
+                    "Calendar MCP tool finished; tool=%s account=%s "
+                    "status=connection_error elapsed=%.3fs error_type=%s",
+                    safe_tool,
+                    account,
+                    time.monotonic() - started,
+                    type(exc).__name__,
+                )
                 raise _connection_error() from None
+            LOGGER.warning(
+                "Calendar MCP tool finished; tool=%s account=%s "
+                "status=transport_error elapsed=%.3fs error_type=%s",
+                safe_tool,
+                account,
+                time.monotonic() - started,
+                type(exc).__name__,
+            )
             raise _ToolFailure from None
         if bool(_result_attribute(result, "isError", False)):
-            raise _classify_tool_error(name, arguments, result)
+            error = _classify_tool_error(name, arguments, result)
+            LOGGER.warning(
+                "Calendar MCP tool finished; tool=%s account=%s "
+                "status=tool_error elapsed=%.3fs error_type=%s",
+                safe_tool,
+                account,
+                time.monotonic() - started,
+                error.__name__,
+            )
+            raise error
         try:
-            return _parse_tool_payload(result)
+            payload = _parse_tool_payload(result)
         except _ResponseMismatch:
+            LOGGER.warning(
+                "Calendar MCP tool finished; tool=%s account=%s "
+                "status=invalid_response elapsed=%.3fs error_type=%s",
+                safe_tool,
+                account,
+                time.monotonic() - started,
+                _ResponseMismatch.__name__,
+            )
             raise _ToolFailure from None
+        LOGGER.info(
+            "Calendar MCP tool finished; tool=%s account=%s status=success "
+            "elapsed=%.3fs",
+            safe_tool,
+            account,
+            time.monotonic() - started,
+        )
+        return payload
 
     async def list_calendars(self, account: str) -> tuple[dict[str, Any], ...]:
         """List calendars for a configured logical account."""
@@ -1825,8 +1884,14 @@ async def open_calendar_mcp(
     Server stderr is intentionally discarded because upstream diagnostics may
     contain event or authentication context.  No OAuth flow is started here.
     """
+    started = time.monotonic()
+    LOGGER.info("Calendar MCP lifecycle; status=starting")
     path = Path(binary_path).expanduser().resolve()
     if not path.is_file() or not os.access(path, os.X_OK):
+        LOGGER.error(
+            "Calendar MCP lifecycle; status=binary_unavailable elapsed=%.3fs",
+            time.monotonic() - started,
+        )
         raise CalendarMcpError("Calendar MCP binary is unavailable")
     cwd = (
         Path(working_directory).expanduser().resolve()
@@ -1834,6 +1899,11 @@ async def open_calendar_mcp(
         else path.parent
     )
     if not cwd.is_dir():
+        LOGGER.error(
+            "Calendar MCP lifecycle; status=working_directory_unavailable "
+            "elapsed=%.3fs",
+            time.monotonic() - started,
+        )
         raise CalendarMcpError("Calendar MCP working directory is unavailable")
     child_env: dict[str, str] = {}
     for key, value in (env or {}).items():
@@ -1870,26 +1940,64 @@ async def open_calendar_mcp(
                     close_exc
                 )
             if connection_failed:
+                LOGGER.error(
+                    "Calendar MCP lifecycle; status=connection_error "
+                    "elapsed=%.3fs error_type=%s",
+                    time.monotonic() - started,
+                    type(exc).__name__,
+                )
                 raise _connection_error() from None
+            LOGGER.error(
+                "Calendar MCP lifecycle; status=startup_error elapsed=%.3fs "
+                "error_type=%s",
+                time.monotonic() - started,
+                type(exc).__name__,
+            )
             raise CalendarMcpError("Calendar MCP subprocess failed") from None
 
+        LOGGER.info(
+            "Calendar MCP lifecycle; status=ready elapsed=%.3fs",
+            time.monotonic() - started,
+        )
         try:
             yield client
         except BaseException:
             # Preserve exceptions from the caller's service body; they are not
             # Calendar MCP startup failures.  Teardown diagnostics stay muted.
+            close_started = time.monotonic()
             try:
                 await stack.aclose()
             except Exception:
                 pass
+            LOGGER.info(
+                "Calendar MCP lifecycle; status=closed elapsed=%.3fs",
+                time.monotonic() - close_started,
+            )
             raise
         else:
+            close_started = time.monotonic()
             try:
                 await stack.aclose()
             except Exception as exc:
                 if _is_connection_failure(exc):
+                    LOGGER.error(
+                        "Calendar MCP lifecycle; status=close_connection_error "
+                        "elapsed=%.3fs error_type=%s",
+                        time.monotonic() - close_started,
+                        type(exc).__name__,
+                    )
                     raise _connection_error() from None
+                LOGGER.error(
+                    "Calendar MCP lifecycle; status=close_error elapsed=%.3fs "
+                    "error_type=%s",
+                    time.monotonic() - close_started,
+                    type(exc).__name__,
+                )
                 raise CalendarMcpError("Calendar MCP subprocess failed") from None
+            LOGGER.info(
+                "Calendar MCP lifecycle; status=closed elapsed=%.3fs",
+                time.monotonic() - close_started,
+            )
 
 
 # A descriptive alias for callers that prefer the provider in the name.

@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import re
 import signal
 import tempfile
+import time
 from typing import Any, Awaitable, Callable, Protocol
 
 import httpx
@@ -25,6 +29,86 @@ from .intent import (
     validate_calendar_intent,
     validate_calendar_operation_plan,
 )
+
+
+LOGGER = logging.getLogger("tg_voice_transcriber_bot.planner")
+_DIAGNOSTIC_FINGERPRINT_KEY = os.urandom(32)
+_PLANNER_CALL_ID: ContextVar[str] = ContextVar(
+    "calendar_planner_call_id", default="unbound"
+)
+_SAFE_DIAGNOSTIC_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}")
+_SAFE_DIAGNOSTIC_LABEL_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9 ._:/+()&-]{0,199}"
+)
+
+
+def _diagnostic_fingerprint(value: str | bytes) -> tuple[int, str]:
+    """Return non-reversible, process-local diagnostics for provider output."""
+
+    payload = (
+        value.encode("utf-8", errors="replace")
+        if isinstance(value, str)
+        else value
+    )
+    digest = hashlib.blake2s(
+        payload,
+        key=_DIAGNOSTIC_FINGERPRINT_KEY,
+        digest_size=8,
+    ).hexdigest()
+    return len(payload), digest
+
+
+def _safe_diagnostic_token(value: Any) -> str:
+    if isinstance(value, str) and _SAFE_DIAGNOSTIC_TOKEN_RE.fullmatch(value):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return "none"
+
+
+def _safe_diagnostic_label(value: Any) -> str:
+    """Allow bounded provider display names without permitting log injection."""
+
+    if isinstance(value, str) and _SAFE_DIAGNOSTIC_LABEL_RE.fullmatch(value):
+        return value
+    return "none"
+
+
+def _log_structured_output_failure(
+    *,
+    provider: str,
+    model: str,
+    phase: str,
+    output: str | bytes,
+    reason: str,
+) -> None:
+    output_bytes, output_fingerprint = _diagnostic_fingerprint(output)
+    LOGGER.warning(
+        "AI planner structured output rejected; call_id=%s provider=%s "
+        "model=%s phase=%s reason=%s output_bytes=%d "
+        "output_fingerprint=%s",
+        _PLANNER_CALL_ID.get(),
+        provider,
+        model,
+        phase,
+        reason,
+        output_bytes,
+        output_fingerprint,
+    )
+
+
+@contextmanager
+def planner_diagnostic_context(call_id: str):
+    """Correlate every provider record belonging to one planner invocation."""
+
+    normalized = str(call_id).strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", normalized):
+        raise GeminiError("Calendar planner diagnostic call ID is invalid")
+    token = _PLANNER_CALL_ID.set(normalized)
+    try:
+        yield
+    finally:
+        _PLANNER_CALL_ID.reset(token)
 
 
 class GeminiError(RuntimeError):
@@ -139,9 +223,9 @@ class GeminiProviderChain:
         self.stages = tuple(stages)
         self.timeout_seconds = float(timeout_seconds)
         self._available = [True] * len(self.stages)
-        self._validation_errors: list[GeminiError | None] = [
-            None
-        ] * len(self.stages)
+        self._validation_errors: list[GeminiError | None] = [None] * len(
+            self.stages
+        )
 
     @property
     def primary_available(self) -> bool:
@@ -196,31 +280,102 @@ class GeminiProviderChain:
             ProviderCreditError,
             ProviderAuthenticationError,
             ProviderPermanentError,
-            GeminiRateLimitError,
         ):
             for error in errors:
                 if isinstance(error, error_type):
                     return error
         if len(errors) == 1:
             return errors[0]
-        return GeminiError(
-            "Calendar planner providers failed ("
-            + ", ".join(type(error).__name__ for error in errors)
-            + ")"
-        )
+        if all(isinstance(error, GeminiRateLimitError) for error in errors):
+            return errors[0]
+        # For mixed transient failures, the terminal provider is the most
+        # useful user-facing cause. Every earlier cause is retained in the
+        # per-stage diagnostic log instead of allowing one 429 to mask a later
+        # timeout or malformed response.
+        return errors[-1]
 
     async def _run_stage(
         self,
         stage: GeminiProviderStage,
         operation: Awaitable[Any],
+        *,
+        operation_name: str,
     ) -> Any:
+        started = time.monotonic()
+        call_id = _PLANNER_CALL_ID.get()
+        LOGGER.info(
+            "AI planner stage started; call_id=%s provider=%s operation=%s "
+            "timeout=%.3fs",
+            call_id,
+            stage.name,
+            operation_name,
+            stage.timeout_seconds,
+        )
+        rate_limit_token = _RATE_LIMIT_OBSERVED.set(False)
+        rate_limit_error_token = _RATE_LIMIT_ERROR_OBSERVED.set(None)
         try:
-            async with asyncio.timeout(stage.timeout_seconds):
-                return await operation
-        except TimeoutError:
-            raise self._timeout_error(stage) from None
+            try:
+                async with asyncio.timeout(stage.timeout_seconds):
+                    result = await operation
+            except TimeoutError:
+                error = self._timeout_error(stage)
+                LOGGER.warning(
+                    "AI planner stage timed out; call_id=%s provider=%s "
+                    "operation=%s elapsed=%.3fs error_type=%s error=%s",
+                    call_id,
+                    stage.name,
+                    operation_name,
+                    time.monotonic() - started,
+                    type(error).__name__,
+                    str(error),
+                )
+                raise error from None
+            except GeminiError as error:
+                LOGGER.warning(
+                    "AI planner stage failed; call_id=%s provider=%s "
+                    "operation=%s elapsed=%.3fs error_type=%s error=%s",
+                    call_id,
+                    stage.name,
+                    operation_name,
+                    time.monotonic() - started,
+                    type(error).__name__,
+                    str(error),
+                )
+                raise
+            result_action = (
+                result.get("action") if isinstance(result, Mapping) else None
+            )
+            operation_count = (
+                len(result.get("operations", ()))
+                if isinstance(result, Mapping)
+                and isinstance(result.get("operations"), Sequence)
+                and not isinstance(
+                    result.get("operations"), (str, bytes, bytearray)
+                )
+                else None
+            )
+            LOGGER.info(
+                "AI planner stage succeeded; call_id=%s provider=%s "
+                "operation=%s elapsed=%.3fs result_action=%s "
+                "operation_count=%s",
+                call_id,
+                stage.name,
+                operation_name,
+                time.monotonic() - started,
+                result_action or "none",
+                operation_count if operation_count is not None else "none",
+            )
+            return result
+        finally:
+            _RATE_LIMIT_ERROR_OBSERVED.reset(rate_limit_error_token)
+            _RATE_LIMIT_OBSERVED.reset(rate_limit_token)
 
-    async def _with_deadline(self, operation: Awaitable[Any]) -> Any:
+    async def _with_deadline(
+        self,
+        operation: Awaitable[Any],
+        *,
+        operation_name: str,
+    ) -> Any:
         rate_limit_token = _RATE_LIMIT_OBSERVED.set(False)
         rate_limit_error_token = _RATE_LIMIT_ERROR_OBSERVED.set(None)
         try:
@@ -230,14 +385,25 @@ class GeminiProviderChain:
             except TimeoutError:
                 rate_limit_error = _RATE_LIMIT_ERROR_OBSERVED.get()
                 if rate_limit_error is not None:
-                    raise rate_limit_error from None
-                if _RATE_LIMIT_OBSERVED.get():
-                    raise GeminiRateLimitError(
+                    error: GeminiError = rate_limit_error
+                elif _RATE_LIMIT_OBSERVED.get():
+                    error = GeminiRateLimitError(
                         "AI provider rate limit exceeded"
-                    ) from None
-                raise GeminiError(
-                    "Calendar planner provider chain timed out"
-                ) from None
+                    )
+                else:
+                    error = GeminiError(
+                        "Calendar planner provider chain timed out"
+                    )
+                LOGGER.warning(
+                    "AI planner chain deadline exhausted; call_id=%s "
+                    "operation=%s timeout=%.3fs error_type=%s error=%s",
+                    _PLANNER_CALL_ID.get(),
+                    operation_name,
+                    self.timeout_seconds,
+                    type(error).__name__,
+                    str(error),
+                )
+                raise error from None
         finally:
             _RATE_LIMIT_ERROR_OBSERVED.reset(rate_limit_error_token)
             _RATE_LIMIT_OBSERVED.reset(rate_limit_token)
@@ -245,6 +411,12 @@ class GeminiProviderChain:
     async def validate(self) -> None:
         errors: list[GeminiError] = []
         validated_provider = False
+        validation_started = time.monotonic()
+        LOGGER.info(
+            "AI planner chain validation started; call_id=%s providers=%s",
+            _PLANNER_CALL_ID.get(),
+            ",".join(stage.name for stage in self.stages),
+        )
         for index, stage in enumerate(self.stages):
             if not self._local_provider_available(stage.provider):
                 error = GeminiError(
@@ -253,9 +425,19 @@ class GeminiProviderChain:
                 self._available[index] = False
                 self._validation_errors[index] = error
                 errors.append(error)
+                LOGGER.warning(
+                    "AI planner stage skipped; call_id=%s provider=%s "
+                    "operation=validate reason=local_unavailable",
+                    _PLANNER_CALL_ID.get(),
+                    stage.name,
+                )
                 continue
             try:
-                await self._run_stage(stage, stage.provider.validate())
+                await self._run_stage(
+                    stage,
+                    stage.provider.validate(),
+                    operation_name="validate",
+                )
             except GeminiError as error:
                 # Authentication, credit, and explicit access rejections are
                 # stable for this process. A timeout, 429, transport error, or
@@ -271,21 +453,56 @@ class GeminiProviderChain:
                 self._validation_errors[index] = None
                 validated_provider = True
         if not validated_provider:
+            LOGGER.warning(
+                "AI planner chain validation failed; call_id=%s elapsed=%.3fs "
+                "available_providers=none error_types=%s",
+                _PLANNER_CALL_ID.get(),
+                time.monotonic() - validation_started,
+                ",".join(type(error).__name__ for error in errors),
+            )
             raise self._preferred_error(errors)
+        LOGGER.info(
+            "AI planner chain validation completed; call_id=%s elapsed=%.3fs "
+            "available_providers=%s",
+            _PLANNER_CALL_ID.get(),
+            time.monotonic() - validation_started,
+            ",".join(self.available_provider_names),
+        )
 
     async def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         errors: list[GeminiError] = []
+        chain_started = time.monotonic()
+        LOGGER.info(
+            "AI planner chain started; call_id=%s operation=%s providers=%s",
+            _PLANNER_CALL_ID.get(),
+            method,
+            ",".join(self.available_provider_names),
+        )
         for index, stage in enumerate(self.stages):
             if not self._available[index]:
                 validation_error = self._validation_errors[index]
                 if validation_error is not None:
                     errors.append(validation_error)
+                LOGGER.info(
+                    "AI planner stage skipped; call_id=%s provider=%s "
+                    "operation=%s reason=disabled_after_validation",
+                    _PLANNER_CALL_ID.get(),
+                    stage.name,
+                    method,
+                )
                 continue
             if not self._local_provider_available(stage.provider):
                 errors.append(
                     GeminiError(
                         f"Calendar planner provider is unavailable: {stage.name}"
                     )
+                )
+                LOGGER.warning(
+                    "AI planner stage skipped; call_id=%s provider=%s "
+                    "operation=%s reason=local_unavailable",
+                    _PLANNER_CALL_ID.get(),
+                    stage.name,
+                    method,
                 )
                 continue
             # A failed provider must not be able to mutate the authoritative
@@ -296,9 +513,33 @@ class GeminiProviderChain:
                 *stage_args, **stage_kwargs
             )
             try:
-                return await self._run_stage(stage, operation)
+                result = await self._run_stage(
+                    stage,
+                    operation,
+                    operation_name=method,
+                )
             except GeminiError as error:
                 errors.append(error)
+            else:
+                LOGGER.info(
+                    "AI planner chain succeeded; call_id=%s operation=%s "
+                    "selected_provider=%s elapsed=%.3fs prior_failures=%s",
+                    _PLANNER_CALL_ID.get(),
+                    method,
+                    stage.name,
+                    time.monotonic() - chain_started,
+                    ",".join(type(error).__name__ for error in errors) or "none",
+                )
+                return result
+        LOGGER.warning(
+            "AI planner chain exhausted; call_id=%s operation=%s providers=%s "
+            "elapsed=%.3fs error_types=%s",
+            _PLANNER_CALL_ID.get(),
+            method,
+            ",".join(stage.name for stage in self.stages),
+            time.monotonic() - chain_started,
+            ",".join(type(error).__name__ for error in errors),
+        )
         raise self._preferred_error(errors)
 
     async def extract_event(
@@ -314,7 +555,8 @@ class GeminiProviderChain:
                 transcript,
                 reference_time=reference_time,
                 account=account,
-            )
+            ),
+            operation_name="extract_event",
         )
 
     async def plan_calendar_actions(
@@ -336,7 +578,8 @@ class GeminiProviderChain:
                 application_state=application_state,
                 recent_conversation=recent_conversation,
                 history_steps=history_steps,
-            )
+            ),
+            operation_name="plan_calendar_actions",
         )
 
     async def aclose(self) -> None:
@@ -808,6 +1051,23 @@ class GeminiApi:
         *,
         payload: dict[str, Any] | None = None,
     ) -> httpx.Response:
+        try:
+            request_bytes = (
+                len(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                )
+                if payload is not None
+                else 0
+            )
+        except (TypeError, ValueError, UnicodeError):
+            raise GeminiApiError(
+                "Gemini API request is not serializable"
+            ) from None
         rate_limit_seen = [False]
         try:
             async with asyncio.timeout(self.timeout_seconds):
@@ -816,8 +1076,17 @@ class GeminiApi:
                     url,
                     payload=payload,
                     rate_limit_seen=rate_limit_seen,
+                    request_bytes=request_bytes,
                 )
         except TimeoutError:
+            LOGGER.warning(
+                "Gemini API deadline exhausted; call_id=%s model=%s "
+                "rate_limit_seen=%s timeout=%.3fs",
+                _PLANNER_CALL_ID.get(),
+                self.model,
+                rate_limit_seen[0],
+                self.timeout_seconds,
+            )
             if rate_limit_seen[0]:
                 raise GeminiRateLimitError(
                     "Gemini API rate limit exceeded"
@@ -831,12 +1100,15 @@ class GeminiApi:
         *,
         payload: dict[str, Any] | None = None,
         rate_limit_seen: list[bool] | None = None,
+        request_bytes: int = 0,
     ) -> httpx.Response:
         headers = {
             "x-goog-api-key": self._api_key,
             "content-type": "application/json",
         }
+        endpoint = "interactions" if url.endswith("/interactions") else "model"
         for attempt in range(self.max_retries + 1):
+            attempt_started = time.monotonic()
             try:
                 response = await self._client.request(
                     method,
@@ -844,21 +1116,69 @@ class GeminiApi:
                     headers=headers,
                     json=payload,
                 )
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as exc:
+                LOGGER.warning(
+                    "Gemini API HTTP attempt failed; call_id=%s model=%s "
+                    "endpoint=%s attempt=%d request_bytes=%d elapsed=%.3fs "
+                    "error_type=%s",
+                    _PLANNER_CALL_ID.get(),
+                    self.model,
+                    endpoint,
+                    attempt + 1,
+                    request_bytes,
+                    time.monotonic() - attempt_started,
+                    type(exc).__name__,
+                )
                 # A read timeout has consumed the request budget. Retrying it
                 # used to turn one 90-second wait into roughly 270 seconds.
                 # Immediate retryable HTTP responses may still retry below.
                 raise GeminiApiError("Gemini API request timed out") from None
             except httpx.HTTPError as exc:
+                retry_delay = (
+                    self._retry_delay(None, attempt)
+                    if attempt < self.max_retries
+                    else None
+                )
+                LOGGER.warning(
+                    "Gemini API HTTP attempt failed; call_id=%s model=%s "
+                    "endpoint=%s attempt=%d request_bytes=%d elapsed=%.3fs "
+                    "error_type=%s retry_delay=%s",
+                    _PLANNER_CALL_ID.get(),
+                    self.model,
+                    endpoint,
+                    attempt + 1,
+                    request_bytes,
+                    time.monotonic() - attempt_started,
+                    type(exc).__name__,
+                    f"{retry_delay:.3f}s" if retry_delay is not None else "none",
+                )
                 if attempt < self.max_retries:
-                    await self._sleep(self._retry_delay(None, attempt))
+                    await self._sleep(retry_delay or 0)
                     continue
                 # HTTPX exception strings may contain request details. Expose only
                 # the exception type, never the key, headers, prompt, or response.
                 raise GeminiApiError(
                     f"Gemini API transport error: {type(exc).__name__}"
                 ) from None
+            response_request_id = _safe_diagnostic_token(
+                response.headers.get("x-request-id")
+                or response.headers.get("x-guploader-uploadid")
+            )
             if 200 <= response.status_code < 300:
+                LOGGER.info(
+                    "Gemini API HTTP response; call_id=%s model=%s endpoint=%s "
+                    "attempt=%d status=%d request_bytes=%d elapsed=%.3fs "
+                    "response_bytes=%d request_id=%s",
+                    _PLANNER_CALL_ID.get(),
+                    self.model,
+                    endpoint,
+                    attempt + 1,
+                    response.status_code,
+                    request_bytes,
+                    time.monotonic() - attempt_started,
+                    len(response.content),
+                    response_request_id,
+                )
                 return response
             retryable = response.status_code in self._RETRYABLE_STATUS_CODES
             rate_limit_kind = self._rate_limit_kind(response)
@@ -870,14 +1190,40 @@ class GeminiApi:
                 # quota_exceeded lasts until the provider resets quota;
                 # retry short-window throttling only.
                 retryable = rate_limit_kind == "transient"
-            if retryable and attempt < self.max_retries:
-                await self._sleep(
-                    self._retry_delay(
-                        response,
-                        attempt,
-                        rate_limited=rate_limit_kind == "transient",
-                    )
+            retry_delay = (
+                self._retry_delay(
+                    response,
+                    attempt,
+                    rate_limited=rate_limit_kind == "transient",
                 )
+                if retryable and attempt < self.max_retries
+                else None
+            )
+            error_object = self._error_object(response)
+            error_status = _safe_diagnostic_token(
+                error_object.get("status") if error_object is not None else None
+            )
+            LOGGER.warning(
+                "Gemini API HTTP response; call_id=%s model=%s endpoint=%s "
+                "attempt=%d status=%d request_bytes=%d elapsed=%.3fs "
+                "response_bytes=%d request_id=%s error_status=%s "
+                "rate_limit_kind=%s retryable=%s retry_delay=%s",
+                _PLANNER_CALL_ID.get(),
+                self.model,
+                endpoint,
+                attempt + 1,
+                response.status_code,
+                request_bytes,
+                time.monotonic() - attempt_started,
+                len(response.content),
+                response_request_id,
+                error_status,
+                rate_limit_kind or "none",
+                retryable,
+                f"{retry_delay:.3f}s" if retry_delay is not None else "none",
+            )
+            if retryable and attempt < self.max_retries:
+                await self._sleep(retry_delay or 0)
                 continue
             if rate_limit_kind is not None:
                 raise GeminiRateLimitError(
@@ -907,6 +1253,25 @@ class GeminiApi:
         if not isinstance(body, dict):
             raise GeminiApiError("Gemini API returned an invalid envelope")
         return body
+
+    def _log_interaction_envelope(
+        self,
+        body: Mapping[str, Any],
+        *,
+        response_bytes: int,
+    ) -> None:
+        steps = body.get("steps")
+        step_count = len(steps) if isinstance(steps, list) else 0
+        LOGGER.info(
+            "Gemini interaction envelope; call_id=%s model=%s "
+            "interaction_id=%s status=%s step_count=%d response_bytes=%d",
+            _PLANNER_CALL_ID.get(),
+            self.model,
+            _safe_diagnostic_token(body.get("id")),
+            _safe_diagnostic_token(body.get("status")),
+            step_count,
+            response_bytes,
+        )
 
     async def validate(self) -> None:
         response = await self._request("GET", self._model_url)
@@ -954,6 +1319,7 @@ class GeminiApi:
             payload=payload,
         )
         body = self._response_json(response)
+        self._log_interaction_envelope(body, response_bytes=len(response.content))
         if body.get("status") != "completed":
             raise GeminiApiError("Gemini interaction did not complete")
         steps = body.get("steps")
@@ -983,17 +1349,34 @@ class GeminiApi:
         ]
         if not text_parts:
             raise GeminiApiError("Gemini API returned no structured output")
+        output_text = "".join(text_parts)
         try:
-            structured_output = json.loads("".join(text_parts))
-        except json.JSONDecodeError:
+            structured_output = json.loads(output_text)
+        except json.JSONDecodeError as exc:
+            _log_structured_output_failure(
+                provider="Gemini API",
+                model=self.model,
+                phase="json_decode",
+                output=output_text,
+                reason=f"line={exc.lineno} column={exc.colno} position={exc.pos}",
+            )
             raise GeminiApiError("Gemini API returned invalid structured JSON") from None
         try:
             return validate_calendar_intent(
                 structured_output,
                 expected_timezone=self.timezone,
             )
-        except ValueError:
-            raise GeminiApiError("Gemini returned an invalid calendar event") from None
+        except ValueError as exc:
+            _log_structured_output_failure(
+                provider="Gemini API",
+                model=self.model,
+                phase="semantic_validation",
+                output=output_text,
+                reason=str(exc),
+            )
+            raise GeminiApiError(
+                f"Gemini returned an invalid calendar event: {exc}"
+            ) from None
 
     async def plan_calendar_actions(
         self,
@@ -1050,6 +1433,7 @@ class GeminiApi:
             payload=payload,
         )
         body = self._response_json(response)
+        self._log_interaction_envelope(body, response_bytes=len(response.content))
         if body.get("status") != "completed":
             raise GeminiApiError("Gemini interaction did not complete")
         steps = body.get("steps")
@@ -1079,9 +1463,17 @@ class GeminiApi:
         ]
         if not text_parts:
             raise GeminiApiError("Gemini API returned no structured output")
+        output_text = "".join(text_parts)
         try:
-            structured_output = json.loads("".join(text_parts))
-        except json.JSONDecodeError:
+            structured_output = json.loads(output_text)
+        except json.JSONDecodeError as exc:
+            _log_structured_output_failure(
+                provider="Gemini API",
+                model=self.model,
+                phase="json_decode",
+                output=output_text,
+                reason=f"line={exc.lineno} column={exc.colno} position={exc.pos}",
+            )
             raise GeminiApiError("Gemini API returned invalid structured JSON") from None
         try:
             normalized = validate_calendar_operation_plan(
@@ -1089,8 +1481,17 @@ class GeminiApi:
                 _allowed_event_ids(application_state),
                 expected_timezone=self.timezone,
             )
-        except ValueError:
-            raise GeminiApiError("Gemini returned an invalid calendar plan") from None
+        except ValueError as exc:
+            _log_structured_output_failure(
+                provider="Gemini API",
+                model=self.model,
+                phase="semantic_validation",
+                output=output_text,
+                reason=str(exc),
+            )
+            raise GeminiApiError(
+                f"Gemini returned an invalid calendar plan: {exc}"
+            ) from None
         normalized["_interaction_input"] = deepcopy(current_input)
         normalized["_interaction_steps"] = deepcopy(steps)
         return normalized
@@ -1391,8 +1792,9 @@ class GeminiCli:
             )
         except OSError:
             raise GeminiCliError("Antigravity CLI could not be started") from None
+        started = time.monotonic()
         try:
-            stdout, _stderr = await asyncio.wait_for(
+            stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=self.timeout_seconds
             )
         except TimeoutError:
@@ -1400,7 +1802,21 @@ class GeminiCli:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            await process.communicate()
+            stdout, stderr = await process.communicate()
+            stdout_bytes, stdout_fingerprint = _diagnostic_fingerprint(stdout)
+            stderr_bytes, stderr_fingerprint = _diagnostic_fingerprint(stderr)
+            LOGGER.warning(
+                "Antigravity CLI timed out; call_id=%s model=%s elapsed=%.3fs "
+                "stdout_bytes=%d stdout_fingerprint=%s stderr_bytes=%d "
+                "stderr_fingerprint=%s",
+                _PLANNER_CALL_ID.get(),
+                self.model,
+                time.monotonic() - started,
+                stdout_bytes,
+                stdout_fingerprint,
+                stderr_bytes,
+                stderr_fingerprint,
+            )
             raise GeminiCliError("Antigravity CLI timed out") from None
         except asyncio.CancelledError:
             try:
@@ -1409,10 +1825,37 @@ class GeminiCli:
                 pass
             await process.communicate()
             raise
+        stdout_bytes, stdout_fingerprint = _diagnostic_fingerprint(stdout)
+        stderr_bytes, stderr_fingerprint = _diagnostic_fingerprint(stderr)
         if process.returncode != 0:
+            LOGGER.warning(
+                "Antigravity CLI failed; call_id=%s model=%s exit_code=%d "
+                "elapsed=%.3fs stdout_bytes=%d stdout_fingerprint=%s "
+                "stderr_bytes=%d stderr_fingerprint=%s",
+                _PLANNER_CALL_ID.get(),
+                self.model,
+                process.returncode,
+                time.monotonic() - started,
+                stdout_bytes,
+                stdout_fingerprint,
+                stderr_bytes,
+                stderr_fingerprint,
+            )
             raise GeminiCliError("Antigravity CLI request failed")
         if len(stdout) > 1_000_000:
             raise GeminiCliError("Antigravity CLI response was too large")
+        LOGGER.info(
+            "Antigravity CLI completed; call_id=%s model=%s elapsed=%.3fs "
+            "stdout_bytes=%d stdout_fingerprint=%s stderr_bytes=%d "
+            "stderr_fingerprint=%s",
+            _PLANNER_CALL_ID.get(),
+            self.model,
+            time.monotonic() - started,
+            stdout_bytes,
+            stdout_fingerprint,
+            stderr_bytes,
+            stderr_fingerprint,
+        )
         return stdout
 
     async def validate(self) -> None:
@@ -1478,7 +1921,19 @@ class GeminiCli:
                 )
         try:
             envelope = json.loads(stdout)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            reason = (
+                f"line={exc.lineno} column={exc.colno} position={exc.pos}"
+                if isinstance(exc, json.JSONDecodeError)
+                else "unicode_decode_error"
+            )
+            _log_structured_output_failure(
+                provider="Gemini CLI",
+                model=self.model,
+                phase="envelope_json_decode",
+                output=stdout,
+                reason=reason,
+            )
             raise GeminiCliError("Antigravity CLI returned invalid JSON") from None
         if not isinstance(envelope, dict):
             raise GeminiCliError("Antigravity CLI returned an invalid envelope")
@@ -1490,8 +1945,17 @@ class GeminiCli:
                 envelope.get("structured_output"),
                 expected_timezone=self.timezone,
             )
-        except ValueError:
-            raise GeminiCliError("Gemini returned an invalid calendar event") from None
+        except ValueError as exc:
+            _log_structured_output_failure(
+                provider="Gemini CLI",
+                model=self.model,
+                phase="semantic_validation",
+                output=stdout,
+                reason=str(exc),
+            )
+            raise GeminiCliError(
+                f"Gemini returned an invalid calendar event: {exc}"
+            ) from None
 
     async def plan_calendar_actions(
         self,
@@ -1576,7 +2040,19 @@ class GeminiCli:
                 )
         try:
             envelope = json.loads(stdout)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            reason = (
+                f"line={exc.lineno} column={exc.colno} position={exc.pos}"
+                if isinstance(exc, json.JSONDecodeError)
+                else "unicode_decode_error"
+            )
+            _log_structured_output_failure(
+                provider="Gemini CLI",
+                model=self.model,
+                phase="envelope_json_decode",
+                output=stdout,
+                reason=reason,
+            )
             raise GeminiCliError("Antigravity CLI returned invalid JSON") from None
         if not isinstance(envelope, dict):
             raise GeminiCliError("Antigravity CLI returned an invalid envelope")
@@ -1589,8 +2065,17 @@ class GeminiCli:
                 _allowed_event_ids(application_state),
                 expected_timezone=self.timezone,
             )
-        except ValueError:
-            raise GeminiCliError("Gemini returned an invalid calendar plan") from None
+        except ValueError as exc:
+            _log_structured_output_failure(
+                provider="Gemini CLI",
+                model=self.model,
+                phase="semantic_validation",
+                output=stdout,
+                reason=str(exc),
+            )
+            raise GeminiCliError(
+                f"Gemini returned an invalid calendar plan: {exc}"
+            ) from None
         normalized["_interaction_input"] = deepcopy(current_input)
         normalized["_interaction_steps"] = []
         return normalized
