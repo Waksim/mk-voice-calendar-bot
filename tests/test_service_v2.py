@@ -553,8 +553,8 @@ def test_text_enters_shared_calendar_pipeline_without_telegram_gateway(tmp_path)
     assert [call[0] for call in calendar.calls].count("create") == 1
     assert [transcript for transcript, _kwargs in gemini.calls] == [command]
     assert len(bot.sent_html) == 1
-    assert "Muse Spark 1.2 разбирает команду" in bot.sent_html[0]["html"]
-    assert "OpenRouter" in bot.sent_html[0]["html"]
+    assert "ИИ-планировщик разбирает команду" in bot.sent_html[0]["html"]
+    assert "OpenRouter" not in bot.sent_html[0]["html"]
     assert "Текстовая команда получена" in bot.sent_html[0]["html"]
     assert "Ищу сообщение в Telegram" not in bot.sent_html[0]["html"]
     assert bot.sent_html[0]["reply_to_message_id"] == 457
@@ -600,10 +600,10 @@ def test_nearest_hour_read_skips_gemini_even_when_provider_is_unavailable(tmp_pa
     bot, calendar, gemini, state, pipeline = asyncio.run(scenario())
 
     assert gemini.calls == []
-    assert "Gemini" not in bot.sent_html[0]["html"]
-    assert "Muse" not in bot.sent_html[0]["html"]
-    assert not any("Gemini" in edit["html"] for edit in bot.edited_html)
-    assert not any("Muse" in edit["html"] for edit in bot.edited_html)
+    assert "ИИ-планировщик" not in bot.sent_html[0]["html"]
+    assert not any(
+        "ИИ-планировщик" in edit["html"] for edit in bot.edited_html
+    )
     assert calendar.calls == [
         (
             "list",
@@ -817,7 +817,7 @@ def test_v2_sends_one_status_then_edits_each_phase_and_applies_create_immediatel
         for expected, edit in zip(
             (
                 "Получаю расшифровку от Telegram",
-                "Muse Spark 1.2 разбирает команду и контекст",
+                "ИИ-планировщик разбирает команду и контекст",
                 "Добавляю событие в Google Calendar",
                 "Добавлено в календарь",
             ),
@@ -1172,7 +1172,7 @@ def test_unknown_model_event_alias_is_rejected_before_calendar_access(tmp_path):
 def test_openrouter_timeout_has_specific_copy_and_safe_diagnostic_log(
     tmp_path, caplog
 ):
-    class TimedOutMuse(FakeGemini):
+    class TimedOutPlanner(FakeGemini):
         async def plan_calendar_actions(self, transcript, **kwargs):
             self.calls.append((transcript, kwargs))
             raise OpenRouterApiError("OpenRouter API transport error: ReadTimeout")
@@ -1184,7 +1184,7 @@ def test_openrouter_timeout_has_specific_copy_and_safe_diagnostic_log(
             tmp_path,
             bot=bot,
             gateway=FakeGateway(),
-            gemini=TimedOutMuse(),
+            gemini=TimedOutPlanner(),
             calendar=calendar,
         )
         await process_text(
@@ -1199,8 +1199,8 @@ def test_openrouter_timeout_has_specific_copy_and_safe_diagnostic_log(
         bot, calendar, state, pipeline = asyncio.run(scenario())
 
     final_html = bot.edited_html[-1]["html"]
-    assert "не успела обработать команду за отведённое время" in final_html
-    assert "не смогла надёжно разобрать" not in final_html
+    assert "не успел обработать команду за отведённое время" in final_html
+    assert "не смог надёжно разобрать" not in final_html
     assert calendar.calls == []
     assert pipeline.store.find_by_source("telegram-update:86") is None
     assert state.job(86)["status"] == "sent"
@@ -1212,7 +1212,7 @@ def test_openrouter_timeout_has_specific_copy_and_safe_diagnostic_log(
 def test_openrouter_rate_limit_has_honest_copy_and_does_not_mutate_calendar(
     tmp_path, caplog
 ):
-    class RateLimitedMuse(FakeGemini):
+    class RateLimitedPlanner(FakeGemini):
         async def plan_calendar_actions(self, transcript, **kwargs):
             self.calls.append((transcript, kwargs))
             raise OpenRouterRateLimitError("OpenRouter API rate limit exceeded")
@@ -1224,7 +1224,7 @@ def test_openrouter_rate_limit_has_honest_copy_and_does_not_mutate_calendar(
             tmp_path,
             bot=bot,
             gateway=FakeGateway(),
-            gemini=RateLimitedMuse(),
+            gemini=RateLimitedPlanner(),
             calendar=calendar,
         )
         await process_text(
@@ -1239,8 +1239,8 @@ def test_openrouter_rate_limit_has_honest_copy_and_does_not_mutate_calendar(
         bot, calendar, state, pipeline = asyncio.run(scenario())
 
     final_html = bot.edited_html[-1]["html"]
-    assert "OpenRouter временно ограничил запросы к Muse" in final_html
-    assert "не смогла надёжно разобрать" not in final_html
+    assert "Провайдеры ИИ-планировщика временно ограничили запросы" in final_html
+    assert "не смог надёжно разобрать" not in final_html
     assert calendar.calls == []
     assert pipeline.store.find_by_source("telegram-update:186") is None
     assert state.job(186)["status"] == "sent"
@@ -1251,7 +1251,7 @@ def test_openrouter_rate_limit_has_honest_copy_and_does_not_mutate_calendar(
 def test_openrouter_credit_error_requests_top_up_without_mutating_calendar(
     tmp_path, caplog
 ):
-    class OutOfCreditMuse(FakeGemini):
+    class OutOfCreditPlanner(FakeGemini):
         async def plan_calendar_actions(self, transcript, **kwargs):
             self.calls.append((transcript, kwargs))
             raise OpenRouterCreditError("OpenRouter credits exhausted")
@@ -1263,7 +1263,7 @@ def test_openrouter_credit_error_requests_top_up_without_mutating_calendar(
             tmp_path,
             bot=bot,
             gateway=FakeGateway(),
-            gemini=OutOfCreditMuse(),
+            gemini=OutOfCreditPlanner(),
             calendar=calendar,
         )
         await process_text(
@@ -1278,8 +1278,8 @@ def test_openrouter_credit_error_requests_top_up_without_mutating_calendar(
         bot, calendar, state, pipeline = asyncio.run(scenario())
 
     final_html = bot.edited_html[-1]["html"]
-    assert "На балансе OpenRouter недостаточно средств" in final_html
-    assert "Пополните баланс" in final_html
+    assert "OpenRouter отклонил запрос из-за лимита ключа или баланса" in final_html
+    assert "Проверьте аккаунт" in final_html
     assert calendar.calls == []
     assert pipeline.store.find_by_source("telegram-update:187") is None
     assert state.job(187)["status"] == "sent"
@@ -1290,7 +1290,7 @@ def test_openrouter_credit_error_requests_top_up_without_mutating_calendar(
 def test_openrouter_auth_error_requests_key_check_without_mutating_calendar(
     tmp_path, caplog
 ):
-    class RejectedMuse(FakeGemini):
+    class RejectedPlanner(FakeGemini):
         async def plan_calendar_actions(self, transcript, **kwargs):
             self.calls.append((transcript, kwargs))
             raise OpenRouterAuthenticationError("OpenRouter access rejected")
@@ -1302,7 +1302,7 @@ def test_openrouter_auth_error_requests_key_check_without_mutating_calendar(
             tmp_path,
             bot=bot,
             gateway=FakeGateway(),
-            gemini=RejectedMuse(),
+            gemini=RejectedPlanner(),
             calendar=calendar,
         )
         await process_text(
@@ -1317,7 +1317,8 @@ def test_openrouter_auth_error_requests_key_check_without_mutating_calendar(
         bot, calendar, state, pipeline = asyncio.run(scenario())
 
     final_html = bot.edited_html[-1]["html"]
-    assert "OpenRouter отклонил API-ключ или доступ к Muse" in final_html
+    assert "OpenRouter отклонил API-ключ" in final_html
+    assert "резервные модели тоже не ответили" in final_html
     assert "Проверьте ключ" in final_html
     assert calendar.calls == []
     assert pipeline.store.find_by_source("telegram-update:188") is None
@@ -1328,7 +1329,7 @@ def test_openrouter_auth_error_requests_key_check_without_mutating_calendar(
 def test_openrouter_request_rejection_is_not_misreported_as_bad_key(
     tmp_path, caplog
 ):
-    class RejectedRequestMuse(FakeGemini):
+    class RejectedRequestPlanner(FakeGemini):
         async def plan_calendar_actions(self, transcript, **kwargs):
             self.calls.append((transcript, kwargs))
             raise OpenRouterRequestRejectedError("OpenRouter request rejected")
@@ -1340,7 +1341,7 @@ def test_openrouter_request_rejection_is_not_misreported_as_bad_key(
             tmp_path,
             bot=bot,
             gateway=FakeGateway(),
-            gemini=RejectedRequestMuse(),
+            gemini=RejectedRequestPlanner(),
             calendar=calendar,
         )
         await process_text(
@@ -1355,7 +1356,8 @@ def test_openrouter_request_rejection_is_not_misreported_as_bad_key(
         bot, calendar, state, pipeline = asyncio.run(scenario())
 
     final_html = bot.edited_html[-1]["html"]
-    assert "OpenRouter отклонил этот запрос или доступ к Muse" in final_html
+    assert "OpenRouter отклонил запрос" in final_html
+    assert "резервные модели тоже не ответили" in final_html
     assert "API-ключ" not in final_html
     assert calendar.calls == []
     assert pipeline.store.find_by_source("telegram-update:189") is None
@@ -1626,7 +1628,7 @@ def test_lookup_then_second_gemini_updates_exact_external_event(tmp_path):
     assert calendar.events["external-update-event"].location == "переговорная А"
     progress = "\n".join(edit["html"] for edit in bot.edited_html)
     assert "Ищу события в Google Calendar" in progress
-    assert "Muse Spark 1.2 выбирает точную запись" in progress
+    assert "ИИ-планировщик выбирает точную запись" in progress
     assert "Обновляю событие" in progress
     assert "Событие обновлено" in bot.edited_html[-1]["html"]
     assert bot.edited_html[-1]["reply_markup"]["inline_keyboard"][0][0][

@@ -17,7 +17,7 @@ must use mode `0600`:
 
 - `telegram-bot-token`
 - `openrouter-api-key`
-- `gemini-api-key` (temporarily retained for rollback to the previous image)
+- `gemini-api-key`
 - `telegram-api-id`
 - `telegram-api-hash`
 - `telegram-session-work`
@@ -26,12 +26,11 @@ must use mode `0600`:
 - `telegram-work-user-id`
 - `telegram-webhook-secret`
 
-The bot reads the OpenRouter credential only through
-`OPENROUTER_API_KEY_FILE=/run/secrets/openrouter-api-key`; do not put the key in
-Compose, an image layer, or the release checkout.
-The legacy Gemini credential remains mounted but is ignored by the new image;
-it keeps a rollback to the previous release operational without changing the
-trusted Compose manifest during an incident.
+The bot reads provider credentials only through
+`OPENROUTER_API_KEY_FILE=/run/secrets/openrouter-api-key` and
+`GEMINI_API_KEY_FILE=/run/secrets/gemini-api-key`. Both secrets are required for
+the complete failover chain. Do not put either key in Compose, an image layer,
+or the release checkout.
 
 At least one of the two `telegram-session-*` files must contain a dedicated
 production `StringSession`; the other may be absent or empty while that account
@@ -39,18 +38,39 @@ is disabled. Never reuse a production value in a local Telegram MCP/Telethon
 process: Telegram treats one auth key used concurrently from different IPs as
 duplicated and permanently revokes that session.
 
-Calendar planning uses OpenRouter Chat Completions with
-`meta/muse-spark-1.2-contributor`. As of 2026-08-25, OpenRouter lists it at
-$0.10 per million input tokens and $0.20 per million output tokens. The
-Contributor price permits Meta to use prompts and completions to improve its
-products; do not enable a no-training/data-collection-denied routing policy for
-this model. The application retries transient throttling and provider failures
-with bounded backoff, while permanent credit/authentication failures fail
-immediately. Keep enough OpenRouter credit available and configure a per-key
-spending limit.
-Startup performs read-only checks of the API key, remaining key limit, account
-balance, model availability, structured-output support, and reasoning effort.
-The calendar bot exits before opening a healthy deployment if any check fails.
+Calendar planning uses a strict ordered provider chain:
+
+1. OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`, reasoning effort
+   `medium`, stage timeout 35 seconds;
+2. OpenRouter `z-ai/glm-5.2:free`, reasoning effort `high`, stage timeout 15
+   seconds;
+3. direct Gemini API `gemini-3.7-flash`, stage timeout 25 seconds.
+
+Each planner invocation also has an 80-second overall deadline. A later stage
+receives at most the time left under that deadline. The two free OpenRouter
+stages deliberately use no same-model retries: timeout, `408`, `429`, `5xx`, an
+unavailable route, or invalid structured output advances immediately to the
+next stage. This prevents a throttled free route from consuming the whole
+request budget before Gemini can run.
+
+Free OpenRouter routes provide no capacity or latency guarantee. They may have
+low rate limits, return `429`, lose an eligible upstream provider, or change
+availability. They do not require positive paid OpenRouter credit, but the API
+key must remain valid and its own optional usage limit must not be exhausted.
+Direct Gemini is therefore an operational fallback, not an unused rollback
+credential.
+
+Defaults can be overridden with `OPENROUTER_MODEL`,
+`OPENROUTER_REASONING_EFFORT`, `OPENROUTER_TIMEOUT_SECONDS`,
+`OPENROUTER_FALLBACK_MODEL`, `OPENROUTER_FALLBACK_REASONING_EFFORT`,
+`OPENROUTER_FALLBACK_TIMEOUT_SECONDS`, `OPENROUTER_MAX_TOKENS`, `GEMINI_MODEL`,
+`GEMINI_TIMEOUT_SECONDS`, and `CALENDAR_PLANNER_TIMEOUT_SECONDS`. Startup
+performs read-only capability checks for every configured stage. A permanently
+rejected earlier stage is disabled for that process; a stage that only timed
+out or hit a transient provider limit remains eligible and is retried first on
+the next command. Startup fails if no planner stage validates. Webhook mode also
+fails closed if the direct Gemini terminal stage fails credential/model checks;
+a transient Gemini validation failure remains eligible for the next request.
 
 The bot, outbound API proxy (the legacy `gemini-proxy` service name), and
 webhook controller share the WARP network namespace. They use

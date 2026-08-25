@@ -7,10 +7,20 @@ def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     config = Config()
 
     assert config.openrouter_api_key_environment == "OPENROUTER_API_KEY"
-    assert config.openrouter_model == "meta/muse-spark-1.2-contributor"
-    assert config.openrouter_timeout_seconds == 45
-    assert config.openrouter_reasoning_effort == "high"
+    assert config.openrouter_model == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert config.openrouter_timeout_seconds == 35
+    assert config.openrouter_reasoning_effort == "medium"
+    assert config.openrouter_fallback_model == "z-ai/glm-5.2:free"
+    assert config.openrouter_fallback_timeout_seconds == 15
+    assert config.openrouter_fallback_reasoning_effort == "high"
     assert config.openrouter_max_tokens == 8192
+    assert config.gemini_keychain_account == "codex.gemini.mk_voice_calendar_bot"
+    assert config.gemini_keychain_service == "mk_voice_calendar_bot"
+    assert config.gemini_api_key_environment == "GEMINI_API_KEY"
+    assert config.gemini_model == "gemini-3.7-flash"
+    assert config.gemini_timeout_seconds == 25
+    assert config.calendar_planner_timeout_seconds == 80
+    assert config.gemini_cli_model == "gemini-3.7-flash-high"
     assert config.calendar_mcp_package_version == "2.6.2"
     assert config.calendar_mcp_working_directory == PROJECT_ROOT / "calendar-mcp"
     assert config.calendar_mcp_binary_path == (
@@ -65,7 +75,14 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("OPENROUTER_MODEL", "meta/muse-spark-1.2")
     monkeypatch.setenv("OPENROUTER_TIMEOUT_SECONDS", "60")
     monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("OPENROUTER_FALLBACK_MODEL", "z-ai/glm-5.2:free")
+    monkeypatch.setenv("OPENROUTER_FALLBACK_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("OPENROUTER_FALLBACK_REASONING_EFFORT", "low")
     monkeypatch.setenv("OPENROUTER_MAX_TOKENS", "4096")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-test-model")
+    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("GEMINI_CLI_MODEL", "gemini-cli-test-model")
 
     config = Config()
 
@@ -79,7 +96,14 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.openrouter_model == "meta/muse-spark-1.2"
     assert config.openrouter_timeout_seconds == 60
     assert config.openrouter_reasoning_effort == "medium"
+    assert config.openrouter_fallback_model == "z-ai/glm-5.2:free"
+    assert config.openrouter_fallback_timeout_seconds == 20
+    assert config.openrouter_fallback_reasoning_effort == "low"
     assert config.openrouter_max_tokens == 4096
+    assert config.gemini_model == "gemini-test-model"
+    assert config.gemini_timeout_seconds == 30
+    assert config.calendar_planner_timeout_seconds == 120
+    assert config.gemini_cli_model == "gemini-cli-test-model"
 
 
 @pytest.mark.parametrize(
@@ -88,8 +112,19 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
         ("OPENROUTER_MODEL", "", "MODEL"),
         ("OPENROUTER_TIMEOUT_SECONDS", "0", "TIMEOUT"),
         ("OPENROUTER_REASONING_EFFORT", "maximum", "REASONING"),
+        ("OPENROUTER_FALLBACK_MODEL", "", "FALLBACK_MODEL"),
+        ("OPENROUTER_FALLBACK_TIMEOUT_SECONDS", "0", "FALLBACK_TIMEOUT"),
+        (
+            "OPENROUTER_FALLBACK_REASONING_EFFORT",
+            "maximum",
+            "FALLBACK_REASONING",
+        ),
         ("OPENROUTER_MAX_TOKENS", "0", "MAX_TOKENS"),
         ("OPENROUTER_MAX_TOKENS", "65537", "MAX_TOKENS"),
+        ("GEMINI_MODEL", "", "GEMINI_MODEL"),
+        ("GEMINI_TIMEOUT_SECONDS", "0", "GEMINI_TIMEOUT"),
+        ("CALENDAR_PLANNER_TIMEOUT_SECONDS", "0", "CALENDAR_PLANNER_TIMEOUT"),
+        ("GEMINI_CLI_MODEL", "", "GEMINI_CLI_MODEL"),
     ],
 )
 def test_invalid_openrouter_configuration_fails_closed(
@@ -98,6 +133,21 @@ def test_invalid_openrouter_configuration_fails_closed(
     monkeypatch.setenv(environment, value)
 
     with pytest.raises(ValueError, match=error):
+        Config()
+
+
+def test_primary_and_fallback_models_must_be_different(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_MODEL", "example/same:free")
+    monkeypatch.setenv("OPENROUTER_FALLBACK_MODEL", "example/same:free")
+
+    with pytest.raises(ValueError, match="must be different"):
+        Config()
+
+
+def test_planner_deadline_must_cover_every_provider_stage(monkeypatch):
+    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "74")
+
+    with pytest.raises(ValueError, match="must cover all provider stages"):
         Config()
 
 

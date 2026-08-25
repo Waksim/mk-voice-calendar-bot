@@ -3,7 +3,13 @@ import asyncio
 import pytest
 
 from tg_voice_transcriber_bot.config import Config
-from tg_voice_transcriber_bot.gemini import GeminiApiError, GeminiFallback
+from tg_voice_transcriber_bot.gemini import (
+    GeminiApiError,
+    GeminiAuthenticationError,
+    GeminiFallback,
+    GeminiProviderChain,
+    GeminiProviderStage,
+)
 from tg_voice_transcriber_bot.openrouter import OpenRouterCreditError
 from tg_voice_transcriber_bot.service import (
     VoiceBotService,
@@ -120,6 +126,64 @@ def test_calendar_bot_startup_fails_when_planner_validation_fails(tmp_path):
         asyncio.run(scenario())
 
 
+def test_webhook_startup_requires_usable_direct_gemini_terminal(tmp_path):
+    class FakeBot:
+        async def call(self, method):
+            assert method == "getMe"
+            return {"username": "mk_voice_text_bot"}
+
+        async def configure_profile(self):
+            return None
+
+    class FakeGateway:
+        async def validate_operations(self):
+            return frozenset({"personal"})
+
+        async def read(self, account, operation, arguments):
+            return {"id": 100000001}
+
+    class WorkingNemotron:
+        async def validate(self):
+            return None
+
+    terminal_error = GeminiAuthenticationError("Gemini credential rejected")
+
+    class RejectedGemini:
+        async def validate(self):
+            raise terminal_error
+
+    async def scenario():
+        planner = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super", WorkingNemotron(), 0.1
+                ),
+                GeminiProviderStage(
+                    "Gemini 3.7 Flash", RejectedGemini(), 0.1
+                ),
+            ],
+            timeout_seconds=0.5,
+        )
+        service = VoiceBotService(
+            Config(
+                    state_path=tmp_path / "state.json",
+                    bot_update_mode="webhook",
+                    webhook_register_with_telegram=False,
+                    webhook_path_override="/telegram/test/webhook",
+                ),
+            FakeBot(),
+            FakeGateway(),
+            StateStore(tmp_path / "state.json"),
+            planner,
+        )
+        service.calendar_operations = object()  # type: ignore[assignment]
+        await service.initialize()
+
+    with pytest.raises(GeminiAuthenticationError) as captured:
+        asyncio.run(scenario())
+    assert captured.value is terminal_error
+
+
 def test_calendar_bot_rejects_silent_cli_fallback_after_primary_outage(tmp_path):
     class FakeBot:
         async def call(self, method):
@@ -170,7 +234,7 @@ def test_calendar_bot_rejects_silent_cli_fallback_after_primary_outage(tmp_path)
     assert raised.value is primary_error
 
 
-def test_legacy_status_names_cli_fallback_instead_of_claiming_muse(tmp_path):
+def test_legacy_status_names_active_fallback_without_claiming_primary(tmp_path):
     class FakeBot:
         def __init__(self):
             self.messages = []
@@ -233,9 +297,9 @@ def test_legacy_status_names_cli_fallback_instead_of_claiming_muse(tmp_path):
         return bot
 
     bot = asyncio.run(scenario())
-    assert "Muse/OpenRouter недоступна" in bot.messages[-1]
-    assert "активен резервный Gemini CLI" in bot.messages[-1]
-    assert "Muse Spark 1.2 через OpenRouter доступна" not in bot.messages[-1]
+    assert "Основной ИИ-провайдер недоступен" in bot.messages[-1]
+    assert "активен резервный Gemini" in bot.messages[-1]
+    assert "ИИ-планировщик доступен" not in bot.messages[-1]
 
 
 def test_voice_from_temporarily_disabled_owner_does_not_call_gateway(tmp_path):
@@ -318,7 +382,7 @@ def test_status_does_not_invite_disabled_owner_to_send_voice(tmp_path):
     bot = asyncio.run(scenario())
 
     assert "временно не подключена" in bot.messages[0][1]
-    assert "Muse Spark 1.2 через OpenRouter доступна" in bot.messages[0][1]
+    assert "ИИ-планировщик доступен" in bot.messages[0][1]
     assert "Пришлите голосовое" not in bot.messages[0][1]
 
 

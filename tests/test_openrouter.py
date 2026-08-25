@@ -112,7 +112,7 @@ def api(client, **changes):
     return OpenRouterApi("openrouter-unit-test-secret", **arguments)
 
 
-def test_extract_uses_contributor_model_strict_schema_and_required_provider_flags():
+def test_extract_uses_nemotron_free_strict_schema_and_required_provider_flags():
     observed = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -141,8 +141,8 @@ def test_extract_uses_contributor_model_strict_schema_and_required_provider_flag
         "Bearer openrouter-unit-test-secret"
     )
     assert "openrouter-unit-test-secret" not in str(request.url)
-    assert payload["model"] == "meta/muse-spark-1.2-contributor"
-    assert payload["reasoning"] == {"effort": "high"}
+    assert payload["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert payload["reasoning"] == {"effort": "medium"}
     assert payload["max_tokens"] == 8192
     assert payload["provider"] == {
         "require_parameters": True,
@@ -190,6 +190,23 @@ def test_reasoning_effort_and_max_tokens_are_configurable():
     asyncio.run(scenario())
     assert observed["reasoning"] == {"effort": "medium"}
     assert observed["max_tokens"] == 4096
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "z-ai/glm-5.2:free",
+        "meta/muse-spark-1.2-contributor",
+    ],
+)
+def test_model_ids_accept_one_optional_safe_variant(model):
+    async def scenario():
+        async with httpx.AsyncClient() as http_client:
+            provider = api(http_client, model=model)
+            assert provider.model == model
+
+    asyncio.run(scenario())
 
 
 def test_planner_converts_safe_history_and_never_sends_or_returns_thoughts():
@@ -386,19 +403,21 @@ def test_validate_checks_authenticated_key_then_public_model_metadata():
                 200,
                 json={"data": {"total_credits": 5, "total_usage": 0}},
             )
-        if request.url.path == "/api/v1/model/meta/muse-spark-1.2-contributor":
+        if request.url.path == (
+            "/api/v1/model/nvidia/nemotron-3-super-120b-a12b:free"
+        ):
             return httpx.Response(
                 200,
                 json={
                     "data": {
-                        "id": "meta/muse-spark-1.2-contributor",
+                        "id": "nvidia/nemotron-3-super-120b-a12b:free",
                         "supported_parameters": [
                             "max_tokens",
                             "reasoning",
                             "response_format",
                             "structured_outputs",
                         ],
-                        "reasoning": {"supported_efforts": ["high"]},
+                        "reasoning": {"supported_efforts": ["medium"]},
                     }
                 },
             )
@@ -423,24 +442,32 @@ def test_validate_checks_authenticated_key_then_public_model_metadata():
         "Bearer openrouter-unit-test-secret"
     )
     assert all("openrouter-unit-test-secret" not in str(item.url) for item in requests)
+    assert requests[2].url.raw_path.endswith(b"%3Afree")
 
 
 @pytest.mark.parametrize(
-    ("key_data", "credit_data"),
+    ("key_data", "credit_data", "changes"),
     [
-        ({"limit_remaining": 0}, None),
+        ({"limit_remaining": 0}, None, {}),
         (
             {"limit_remaining": 1},
             {"total_credits": 0, "total_usage": 0},
+            {"model": "paid/model"},
         ),
         (
             {"limit_remaining": 1},
             {"total_credits": 5, "total_usage": 5},
+            {"model": "paid/model"},
+        ),
+        (
+            {"limit_remaining": 1},
+            {"total_credits": 0, "total_usage": 1},
+            {},
         ),
     ],
 )
 def test_validate_rejects_exhausted_key_limit_or_account_balance(
-    key_data, credit_data
+    key_data, credit_data, changes
 ):
     requests = []
 
@@ -456,11 +483,60 @@ def test_validate_rejects_exhausted_key_limit_or_account_balance(
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler)
         ) as http_client:
-            await api(http_client).validate()
+            await api(http_client, **changes).validate()
 
     with pytest.raises(OpenRouterCreditError):
         asyncio.run(scenario())
-    assert all(request.url.path != "/api/v1/model/meta/muse-spark-1.2-contributor" for request in requests)
+    assert all("/api/v1/model/" not in request.url.path for request in requests)
+
+
+def test_validate_allows_zero_account_balance_for_free_model():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/v1/key":
+            return httpx.Response(
+                200,
+                json={"data": {"label": "owner", "limit_remaining": None}},
+            )
+        if request.url.path == "/api/v1/credits":
+            return httpx.Response(
+                200,
+                json={"data": {"total_credits": 5, "total_usage": 5}},
+            )
+        if request.url.path == (
+            "/api/v1/model/nvidia/nemotron-3-super-120b-a12b:free"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "nvidia/nemotron-3-super-120b-a12b:free",
+                        "supported_parameters": [
+                            "max_tokens",
+                            "reasoning",
+                            "response_format",
+                            "structured_outputs",
+                        ],
+                        "reasoning": {"supported_efforts": ["medium"]},
+                    }
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url.path}")
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            await api(http_client).validate()
+
+    asyncio.run(scenario())
+    assert [request.url.path for request in requests] == [
+        "/api/v1/key",
+        "/api/v1/credits",
+        "/api/v1/model/nvidia/nemotron-3-super-120b-a12b:free",
+    ]
 
 
 @pytest.mark.parametrize("status", [408, 429, 500, 503, 524, 529])
@@ -988,6 +1064,13 @@ def test_transport_errors_are_retried_and_do_not_expose_request_details():
         {"max_tokens": 0},
         {"max_retries": -1},
         {"model": "https://attacker.invalid/model"},
+        {"model": "vendor/model:free:extra"},
+        {"model": "vendor/model:"},
+        {"model": "vendor//model"},
+        {"model": "vendor/model/extra"},
+        {"model": "/model"},
+        {"model": "vendor/"},
+        {"model": "vendor/model?query=private"},
         {"timeout_seconds": 0},
         {"timeout_seconds": float("nan")},
     ],
@@ -1044,7 +1127,7 @@ def test_model_validation_requires_structured_output_and_reasoning_support():
             200,
             json={
                 "data": {
-                    "id": "meta/muse-spark-1.2-contributor",
+                    "id": "nvidia/nemotron-3-super-120b-a12b:free",
                     "supported_parameters": ["max_tokens"],
                     "reasoning": {"supported_efforts": ["medium"]},
                 }

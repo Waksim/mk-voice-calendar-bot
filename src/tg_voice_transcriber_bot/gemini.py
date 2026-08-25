@@ -6,8 +6,10 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -49,6 +51,14 @@ class ProviderAuthenticationError(ProviderPermanentError):
     """Marker for a rejected provider credential or access policy."""
 
 
+class GeminiAuthenticationError(GeminiApiError, ProviderAuthenticationError):
+    """Gemini rejected the configured API credential or its access policy."""
+
+
+class GeminiConfigurationError(GeminiApiError, ProviderPermanentError):
+    """Gemini rejected the configured model or endpoint permanently."""
+
+
 class GeminiCliError(GeminiError):
     """Google Antigravity CLI request or response failure."""
 
@@ -82,6 +92,265 @@ class GeminiProvider(Protocol):
         recent_conversation: Sequence[Mapping[str, Any]],
         history_steps: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True)
+class GeminiProviderStage:
+    """One named provider and its share of the planner deadline."""
+
+    name: str
+    provider: GeminiProvider
+    timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.name, str)
+            or not self.name.strip()
+            or len(self.name) > 100
+            or isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or self.timeout_seconds <= 0
+            or not math.isfinite(float(self.timeout_seconds))
+        ):
+            raise GeminiError("Calendar planner stage configuration is invalid")
+
+
+class GeminiProviderChain:
+    """Try structured-output providers in order under one bounded deadline."""
+
+    def __init__(
+        self,
+        stages: Sequence[GeminiProviderStage],
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        if (
+            isinstance(stages, (str, bytes, bytearray))
+            or not isinstance(stages, Sequence)
+            or not stages
+            or any(not isinstance(stage, GeminiProviderStage) for stage in stages)
+            or len({stage.name for stage in stages}) != len(stages)
+            or isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+            or not math.isfinite(float(timeout_seconds))
+        ):
+            raise GeminiError("Calendar planner chain configuration is invalid")
+        self.stages = tuple(stages)
+        self.timeout_seconds = float(timeout_seconds)
+        self._available = [True] * len(self.stages)
+        self._validation_errors: list[GeminiError | None] = [
+            None
+        ] * len(self.stages)
+
+    @property
+    def primary_available(self) -> bool:
+        return self._available[0]
+
+    @property
+    def primary_validation_error(self) -> GeminiError | None:
+        return self._validation_errors[0]
+
+    @property
+    def terminal_available(self) -> bool:
+        return self._available[-1]
+
+    @property
+    def terminal_validation_error(self) -> GeminiError | None:
+        return self._validation_errors[-1]
+
+    @property
+    def available_provider_names(self) -> tuple[str, ...]:
+        return tuple(
+            stage.name
+            for stage, available in zip(
+                self.stages, self._available, strict=True
+            )
+            if available
+        )
+
+    @staticmethod
+    def _local_provider_available(provider: GeminiProvider) -> bool:
+        check = getattr(provider, "is_available", None)
+        if check is None:
+            return True
+        try:
+            return bool(check())
+        except OSError:
+            return False
+
+    @staticmethod
+    def _timeout_error(stage: GeminiProviderStage) -> GeminiError:
+        rate_limit_error = _RATE_LIMIT_ERROR_OBSERVED.get()
+        if rate_limit_error is not None:
+            return rate_limit_error
+        if _RATE_LIMIT_OBSERVED.get():
+            return GeminiRateLimitError("AI provider rate limit exceeded")
+        return GeminiError(f"Calendar planner stage timed out: {stage.name}")
+
+    @staticmethod
+    def _preferred_error(errors: Sequence[GeminiError]) -> GeminiError:
+        if not errors:
+            return GeminiError("Calendar planner providers are unavailable")
+        for error_type in (
+            ProviderCreditError,
+            ProviderAuthenticationError,
+            ProviderPermanentError,
+            GeminiRateLimitError,
+        ):
+            for error in errors:
+                if isinstance(error, error_type):
+                    return error
+        if len(errors) == 1:
+            return errors[0]
+        return GeminiError(
+            "Calendar planner providers failed ("
+            + ", ".join(type(error).__name__ for error in errors)
+            + ")"
+        )
+
+    async def _run_stage(
+        self,
+        stage: GeminiProviderStage,
+        operation: Awaitable[Any],
+    ) -> Any:
+        try:
+            async with asyncio.timeout(stage.timeout_seconds):
+                return await operation
+        except TimeoutError:
+            raise self._timeout_error(stage) from None
+
+    async def _with_deadline(self, operation: Awaitable[Any]) -> Any:
+        rate_limit_token = _RATE_LIMIT_OBSERVED.set(False)
+        rate_limit_error_token = _RATE_LIMIT_ERROR_OBSERVED.set(None)
+        try:
+            try:
+                async with asyncio.timeout(self.timeout_seconds):
+                    return await operation
+            except TimeoutError:
+                rate_limit_error = _RATE_LIMIT_ERROR_OBSERVED.get()
+                if rate_limit_error is not None:
+                    raise rate_limit_error from None
+                if _RATE_LIMIT_OBSERVED.get():
+                    raise GeminiRateLimitError(
+                        "AI provider rate limit exceeded"
+                    ) from None
+                raise GeminiError(
+                    "Calendar planner provider chain timed out"
+                ) from None
+        finally:
+            _RATE_LIMIT_ERROR_OBSERVED.reset(rate_limit_error_token)
+            _RATE_LIMIT_OBSERVED.reset(rate_limit_token)
+
+    async def validate(self) -> None:
+        errors: list[GeminiError] = []
+        validated_provider = False
+        for index, stage in enumerate(self.stages):
+            if not self._local_provider_available(stage.provider):
+                error = GeminiError(
+                    f"Calendar planner provider is unavailable: {stage.name}"
+                )
+                self._available[index] = False
+                self._validation_errors[index] = error
+                errors.append(error)
+                continue
+            try:
+                await self._run_stage(stage, stage.provider.validate())
+            except GeminiError as error:
+                # Authentication, credit, and explicit access rejections are
+                # stable for this process. A timeout, 429, transport error, or
+                # 5xx is transient: keep the stage eligible so the next user
+                # command still starts from the configured highest priority.
+                self._available[index] = not isinstance(
+                    error, ProviderPermanentError
+                )
+                self._validation_errors[index] = error
+                errors.append(error)
+            else:
+                self._available[index] = True
+                self._validation_errors[index] = None
+                validated_provider = True
+        if not validated_provider:
+            raise self._preferred_error(errors)
+
+    async def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        errors: list[GeminiError] = []
+        for index, stage in enumerate(self.stages):
+            if not self._available[index]:
+                validation_error = self._validation_errors[index]
+                if validation_error is not None:
+                    errors.append(validation_error)
+                continue
+            if not self._local_provider_available(stage.provider):
+                errors.append(
+                    GeminiError(
+                        f"Calendar planner provider is unavailable: {stage.name}"
+                    )
+                )
+                continue
+            # A failed provider must not be able to mutate the authoritative
+            # application state or history seen by the next provider.
+            stage_args = deepcopy(args)
+            stage_kwargs = deepcopy(kwargs)
+            operation = getattr(stage.provider, method)(
+                *stage_args, **stage_kwargs
+            )
+            try:
+                return await self._run_stage(stage, operation)
+            except GeminiError as error:
+                errors.append(error)
+        raise self._preferred_error(errors)
+
+    async def extract_event(
+        self,
+        transcript: str,
+        *,
+        reference_time: datetime,
+        account: str,
+    ) -> dict[str, Any]:
+        return await self._with_deadline(
+            self._call(
+                "extract_event",
+                transcript,
+                reference_time=reference_time,
+                account=account,
+            )
+        )
+
+    async def plan_calendar_actions(
+        self,
+        transcript: str,
+        *,
+        reference_time: datetime,
+        account: str,
+        application_state: Mapping[str, Any],
+        recent_conversation: Sequence[Mapping[str, Any]],
+        history_steps: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        return await self._with_deadline(
+            self._call(
+                "plan_calendar_actions",
+                transcript,
+                reference_time=reference_time,
+                account=account,
+                application_state=application_state,
+                recent_conversation=recent_conversation,
+                history_steps=history_steps,
+            )
+        )
+
+    async def aclose(self) -> None:
+        first_error: Exception | None = None
+        for stage in self.stages:
+            close = getattr(stage.provider, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise GeminiError("Calendar planner provider cleanup failed") from None
 
 
 CALENDAR_PLANNER_SYSTEM_INSTRUCTION = """# Роль
@@ -302,6 +571,18 @@ class GeminiApi:
     _TRANSIENT_RATE_LIMIT_CODES = frozenset(
         {"rate_limit_exceeded", "too_many_requests"}
     )
+    _AUTHENTICATION_ERROR_REASONS = frozenset(
+        {
+            "api_key_expired",
+            "api_key_http_referrer_blocked",
+            "api_key_invalid",
+            "api_key_ip_address_blocked",
+            "api_key_not_found",
+            "api_key_service_blocked",
+            "consumer_invalid",
+            "credentials_missing",
+        }
+    )
     _QUOTA_EXHAUSTED_CODES = frozenset({"quota_exceeded"})
     _PERSISTENT_QUOTA_MARKERS = (
         "perday",
@@ -450,6 +731,26 @@ class GeminiApi:
             return "transient"
         return None
 
+    @classmethod
+    def _authentication_rejected(cls, response: httpx.Response) -> bool:
+        if response.status_code in {401, 403}:
+            return True
+        error = cls._error_object(response)
+        if error is None:
+            return False
+        status = str(error.get("status", "")).strip().casefold()
+        if status in {"permission_denied", "unauthenticated"}:
+            return True
+        details = error.get("details")
+        if not isinstance(details, list):
+            return False
+        return any(
+            isinstance(detail, Mapping)
+            and str(detail.get("reason", "")).strip().casefold()
+            in cls._AUTHENTICATION_ERROR_REASONS
+            for detail in details
+        )
+
     @staticmethod
     def _retry_delay_from_response(response: httpx.Response) -> float | None:
         header = response.headers.get("retry-after")
@@ -582,6 +883,14 @@ class GeminiApi:
                 raise GeminiRateLimitError(
                     "Gemini API rate limit exceeded"
                 ) from None
+            if self._authentication_rejected(response):
+                raise GeminiAuthenticationError(
+                    "Gemini API credential or access was rejected"
+                ) from None
+            if response.status_code == 404:
+                raise GeminiConfigurationError(
+                    "Configured Gemini model or endpoint is unavailable"
+                ) from None
             raise GeminiApiError(
                 f"Gemini API HTTP status {response.status_code}"
             ) from None
@@ -603,8 +912,12 @@ class GeminiApi:
         response = await self._request("GET", self._model_url)
         body = self._response_json(response)
         name = body.get("name")
+        if not isinstance(name, str):
+            raise GeminiApiError("Gemini model validation failed")
         if name not in {self.model, f"models/{self.model}"}:
-            raise GeminiApiError("Configured Gemini model is unavailable")
+            raise GeminiConfigurationError(
+                "Configured Gemini model is unavailable"
+            )
 
     async def extract_event(
         self,

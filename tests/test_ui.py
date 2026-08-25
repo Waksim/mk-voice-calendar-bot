@@ -49,14 +49,14 @@ def test_progress_cards_are_single_safe_html_messages():
 
     assert "Ищу сообщение в Telegram" in matching
     assert "Получаю расшифровку" in transcribing
-    assert "Muse Spark 1.2 разбирает" in gemini
-    assert "OpenRouter" in gemini
+    assert "ИИ-планировщик разбирает" in gemini
+    assert "OpenRouter" not in gemini
     assert "Расшифровка Telegram получена" in gemini
     assert "Текстовая команда получена" in text_gemini
     assert "Обрабатываю текстовую команду" in text_gemini
     assert "Ищу события в Google Calendar" in lookup
-    assert "Muse Spark 1.2 выбирает точную запись" in matching_candidates
-    assert "Muse Spark 1.2: изменить событие" in calendar
+    assert "ИИ-планировщик выбирает точную запись" in matching_candidates
+    assert "ИИ-планировщик: изменить событие" in calendar
     assert "Обновляю событие" in calendar
     assert "Читаю события" in reading
     assert all(utf16_units(ui._visible_text(card)) <= 4096 for card in (
@@ -193,10 +193,12 @@ def test_update_delete_clarify_error_and_undo_cards_have_distinct_outcomes():
     assert "&lt;важно&gt;" in undone
 
 
-def test_ignore_card_names_current_model():
+def test_ignore_card_uses_provider_neutral_copy():
     card = format_ignore_card(transcript="Привет", elapsed_seconds=1)
 
-    assert "Muse Spark 1.2 не нашла" in card
+    assert "ИИ-планировщик не нашёл" in card
+    assert "Muse" not in card
+    assert "OpenRouter" not in card
     assert "Gemini" not in card
 
 

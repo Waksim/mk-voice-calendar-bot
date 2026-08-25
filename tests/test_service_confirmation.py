@@ -116,6 +116,12 @@ class FakeGateway:
 
 
 class FakeGemini:
+    available_provider_names = (
+        "Nemotron 3 Super",
+        "GLM 5.2 Free",
+        "Gemini 3.7 Flash",
+    )
+
     def __init__(self, intent):
         self.intent = intent
         self.calls = 0
@@ -158,8 +164,9 @@ def callback_update(update_id, data, *, user_id=OWNER_ID, callback_id="cb-1"):
 
 def test_start_copy_requires_confirmation_before_google_calendar_write():
     assert "основной Google Calendar" in START_TEXT
-    assert "Muse Spark 1.2" in START_TEXT
-    assert "OpenRouter" in START_TEXT
+    assert "ИИ-планировщик" in START_TEXT
+    assert "Muse" not in START_TEXT
+    assert "OpenRouter" not in START_TEXT
     assert "нажмите «Добавить»" in START_TEXT
     assert "Без этого подтверждения календарь не изменяется" in START_TEXT
 
@@ -191,7 +198,10 @@ def test_status_reports_connected_calendar_confirmation_pipeline(tmp_path):
 
     messages = asyncio.run(scenario())
     assert len(messages) == 1
-    assert "Muse Spark 1.2 через OpenRouter доступна" in messages[0][1]
+    assert (
+        "ИИ-планировщик доступен: Nemotron 3 Super → GLM 5.2 Free → "
+        "Gemini 3.7 Flash"
+    ) in messages[0][1]
     assert "Google Calendar подключён" in messages[0][1]
     assert "только после подтверждения" in messages[0][1]
 

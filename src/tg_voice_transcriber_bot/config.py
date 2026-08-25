@@ -128,27 +128,61 @@ class Config:
     openrouter_api_key_environment: str = "OPENROUTER_API_KEY"
     openrouter_model: str = field(
         default_factory=lambda: os.environ.get(
-            "OPENROUTER_MODEL", "meta/muse-spark-1.2-contributor"
+            "OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"
         ).strip()
     )
     openrouter_timeout_seconds: int = field(
-        default_factory=lambda: _environment_int("OPENROUTER_TIMEOUT_SECONDS", 45)
+        default_factory=lambda: _environment_int("OPENROUTER_TIMEOUT_SECONDS", 35)
     )
     openrouter_reasoning_effort: str = field(
         default_factory=lambda: os.environ.get(
-            "OPENROUTER_REASONING_EFFORT", "high"
+            "OPENROUTER_REASONING_EFFORT", "medium"
+        ).strip().lower()
+    )
+    openrouter_fallback_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "OPENROUTER_FALLBACK_MODEL", "z-ai/glm-5.2:free"
+        ).strip()
+    )
+    openrouter_fallback_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int(
+            "OPENROUTER_FALLBACK_TIMEOUT_SECONDS", 15
+        )
+    )
+    openrouter_fallback_reasoning_effort: str = field(
+        default_factory=lambda: os.environ.get(
+            "OPENROUTER_FALLBACK_REASONING_EFFORT", "high"
         ).strip().lower()
     )
     openrouter_max_tokens: int = field(
         default_factory=lambda: _environment_int("OPENROUTER_MAX_TOKENS", 8192)
     )
-    gemini_timeout_seconds: int = 45
+    gemini_keychain_account: str = "codex.gemini.mk_voice_calendar_bot"
+    gemini_keychain_service: str = "mk_voice_calendar_bot"
+    gemini_api_key_environment: str = "GEMINI_API_KEY"
+    gemini_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "GEMINI_MODEL", "gemini-3.7-flash"
+        ).strip()
+    )
+    gemini_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int("GEMINI_TIMEOUT_SECONDS", 25)
+    )
+    calendar_planner_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int(
+            "CALENDAR_PLANNER_TIMEOUT_SECONDS", 80
+        )
+    )
     gemini_cli_path: Path = field(
         default_factory=lambda: _environment_path(
             "GEMINI_CLI_PATH", Path.home() / ".local" / "bin" / "agy"
         )
     )
-    gemini_cli_model: str = "gemini-3.7-flash-high"
+    gemini_cli_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "GEMINI_CLI_MODEL", "gemini-3.7-flash-high"
+        ).strip()
+    )
     calendar_timezone: str = "Europe/Moscow"
     calendar_mcp_package_version: str = "2.6.2"
     calendar_mcp_working_directory: Path = field(
@@ -241,10 +275,43 @@ class Config:
             raise ValueError(
                 "OPENROUTER_REASONING_EFFORT must be low, medium, or high"
             )
+        if not self.openrouter_fallback_model:
+            raise ValueError("OPENROUTER_FALLBACK_MODEL must not be empty")
+        if self.openrouter_fallback_model == self.openrouter_model:
+            raise ValueError("OpenRouter primary and fallback models must be different")
+        if self.openrouter_fallback_timeout_seconds <= 0:
+            raise ValueError(
+                "OPENROUTER_FALLBACK_TIMEOUT_SECONDS must be positive"
+            )
+        if self.openrouter_fallback_reasoning_effort not in {
+            "low",
+            "medium",
+            "high",
+        }:
+            raise ValueError(
+                "OPENROUTER_FALLBACK_REASONING_EFFORT must be low, medium, or high"
+            )
         if not 1 <= self.openrouter_max_tokens <= 65_536:
             raise ValueError(
                 "OPENROUTER_MAX_TOKENS must be between 1 and 65536"
             )
+        if not self.gemini_model:
+            raise ValueError("GEMINI_MODEL must not be empty")
+        if self.gemini_timeout_seconds <= 0:
+            raise ValueError("GEMINI_TIMEOUT_SECONDS must be positive")
+        if self.calendar_planner_timeout_seconds <= 0:
+            raise ValueError("CALENDAR_PLANNER_TIMEOUT_SECONDS must be positive")
+        minimum_chain_timeout = (
+            self.openrouter_timeout_seconds
+            + self.openrouter_fallback_timeout_seconds
+            + self.gemini_timeout_seconds
+        )
+        if self.calendar_planner_timeout_seconds < minimum_chain_timeout:
+            raise ValueError(
+                "CALENDAR_PLANNER_TIMEOUT_SECONDS must cover all provider stages"
+            )
+        if not self.gemini_cli_model:
+            raise ValueError("GEMINI_CLI_MODEL must not be empty")
         if self.bot_update_mode not in {"polling", "webhook"}:
             raise ValueError("TELEGRAM_BOT_UPDATE_MODE must be polling or webhook")
         if not self.webhook_listen_host:
