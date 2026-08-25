@@ -15,7 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 TUNNEL_HOST_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com$"
@@ -44,10 +44,58 @@ READY_FILE = Path(os.environ.get("READY_FILE", "/tmp/webhook-tunnel.ready"))
 METRICS_BASE_URL = os.environ.get(
     "CLOUDFLARED_METRICS_URL", "http://127.0.0.1:20241"
 ).rstrip("/")
+READINESS_HEARTBEAT_SECONDS = 300
 
 
 class ControllerError(RuntimeError):
     """A recoverable tunnel-controller failure safe to report without secrets."""
+
+
+class ReadinessReporter:
+    """Emit state transitions immediately and deduplicated periodic heartbeats."""
+
+    def __init__(
+        self,
+        *,
+        heartbeat_seconds: int = READINESS_HEARTBEAT_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if heartbeat_seconds <= 0:
+            raise ValueError("readiness heartbeat interval must be positive")
+        self._heartbeat_seconds = heartbeat_seconds
+        self._clock = clock
+        self._state: str | None = None
+        self._reason: str | None = None
+        self._last_reported_at: float | None = None
+
+    def update(self, state: str, *, reason: str | None = None) -> None:
+        if state not in {"ready", "unready"}:
+            raise ValueError("invalid readiness state")
+        if state == "ready":
+            reason = None
+        elif not reason:
+            raise ValueError("unready state requires a reason")
+
+        now = self._clock()
+        transitioned = state != self._state or reason != self._reason
+        heartbeat_due = (
+            self._last_reported_at is None
+            or now - self._last_reported_at >= self._heartbeat_seconds
+        )
+        self._state = state
+        self._reason = reason
+        if not transitioned and not heartbeat_due:
+            return
+
+        report_kind = "transition" if transitioned else "heartbeat"
+        suffix = f" reason={reason}" if reason is not None else ""
+        destination = sys.stderr if state == "unready" else sys.stdout
+        print(
+            f"Webhook tunnel readiness {report_kind}: state={state}{suffix}",
+            file=destination,
+            flush=True,
+        )
+        self._last_reported_at = now
 
 
 def _read_secret(path: Path, *, pattern: re.Pattern[str], label: str) -> str:
@@ -187,6 +235,7 @@ def _validate_configuration() -> tuple[str, str]:
 def run() -> int:
     token, secret = _validate_configuration()
     telegram = TelegramWebhook(token, secret)
+    readiness = ReadinessReporter()
     _mark_unready()
 
     process = subprocess.Popen(
@@ -246,14 +295,19 @@ def run() -> int:
             if telegram.current_url() != desired_url:
                 raise ControllerError("Telegram webhook verification failed")
             _mark_ready(desired_url)
+            readiness.update("ready")
             next_check = time.monotonic() + CHECK_INTERVAL_SECONDS
         except ControllerError as exc:
             _mark_unready()
-            print(f"Webhook readiness check failed: {exc}", file=sys.stderr, flush=True)
+            readiness.update("unready", reason=str(exc))
             next_check = time.monotonic() + RETRY_INTERVAL_SECONDS
         stopping.wait(1)
 
     _mark_unready()
+    readiness.update(
+        "unready",
+        reason=("controller_stopping" if stopping.is_set() else "cloudflared_exited"),
+    )
     if process.poll() is None:
         process.terminate()
     try:

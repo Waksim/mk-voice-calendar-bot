@@ -10,9 +10,11 @@ from datetime import date, datetime, timedelta, timezone
 import base64
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
+import time
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
@@ -41,6 +43,82 @@ _NON_MATERIAL_SNAPSHOT_FIELDS = {
     "html_link",
     "provider_updated_at",
 }
+_LOGGED_OPERATION_TYPES = frozenset({"read", "create", "update", "delete", "undo"})
+_SAFE_LOG_VALUE_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+LOGGER = logging.getLogger("tg_voice_transcriber_bot.calendar_operations")
+
+
+def _safe_log_value(value: Any, *, fallback: str = "none") -> str:
+    """Return one bounded token suitable for a key=value production log."""
+
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return fallback
+    if any(character not in _SAFE_LOG_VALUE_CHARACTERS for character in value):
+        return fallback
+    return value
+
+
+def _safe_source_update_id(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return "none"
+    return str(value)
+
+
+def _operation_types(values: Any) -> tuple[str, ...]:
+    """Extract only allowlisted operation names without touching payload data."""
+
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray)
+    ):
+        return ()
+    result: list[str] = []
+    for value in values:
+        operation_type = (
+            value.get("type") if isinstance(value, Mapping) else None
+        )
+        if operation_type in _LOGGED_OPERATION_TYPES and operation_type not in result:
+            result.append(str(operation_type))
+    return tuple(result)
+
+
+def _log_operation_lifecycle(
+    *,
+    status: Literal["started", "success", "rollback", "conflict", "error"],
+    operation_types: Sequence[str],
+    operation_count: int,
+    account: Any,
+    source_update_id: Any,
+    started: float,
+    phase: str,
+    target_operation_types: Sequence[str] = (),
+    error_type: str | None = None,
+) -> None:
+    """Emit bounded lifecycle metadata and never serialize operation content."""
+
+    safe_operation_types = tuple(
+        value for value in operation_types if value in _LOGGED_OPERATION_TYPES
+    )
+    safe_target_types = tuple(
+        value for value in target_operation_types if value in _LOGGED_OPERATION_TYPES
+    )
+    safe_error_type = _safe_log_value(error_type) if error_type else "none"
+    log_method = LOGGER.warning if status in {"conflict", "error"} else LOGGER.info
+    log_method(
+        "Calendar operation lifecycle; phase=%s status=%s operation_type=%s "
+        "target_operation_type=%s operation_count=%d account=%s "
+        "source_update_id=%s elapsed=%.3fs error_type=%s",
+        _safe_log_value(phase, fallback="unknown"),
+        status,
+        ",".join(safe_operation_types) or "none",
+        ",".join(safe_target_types) or "none",
+        max(0, int(operation_count)),
+        _safe_log_value(account, fallback="unknown"),
+        _safe_source_update_id(source_update_id),
+        max(0.0, time.monotonic() - started),
+        safe_error_type,
+    )
 
 
 class OperationStateError(RuntimeError):
@@ -1334,6 +1412,47 @@ class CalendarOperationPipeline:
         time_min: str,
         time_max: str,
         limit: int = 20,
+        source_update_id: int | None = None,
+    ) -> CalendarEventQueryResult:
+        started = time.monotonic()
+        lifecycle = {
+            "operation_types": ("read",),
+            "operation_count": 1,
+            "account": account,
+            "source_update_id": source_update_id,
+            "started": started,
+            "phase": "provider_read",
+        }
+        _log_operation_lifecycle(status="started", **lifecycle)
+        try:
+            result = await self._query_events(
+                account=account,
+                query=query,
+                time_min=time_min,
+                time_max=time_max,
+                limit=limit,
+            )
+        except CalendarStateConflictError as exc:
+            _log_operation_lifecycle(
+                status="conflict", error_type=type(exc).__name__, **lifecycle
+            )
+            raise
+        except Exception as exc:
+            _log_operation_lifecycle(
+                status="error", error_type=type(exc).__name__, **lifecycle
+            )
+            raise
+        _log_operation_lifecycle(status="success", **lifecycle)
+        return result
+
+    async def _query_events(
+        self,
+        *,
+        account: str,
+        query: str | None,
+        time_min: str,
+        time_max: str,
+        limit: int,
     ) -> CalendarEventQueryResult:
         """Run a bounded provider read and hide provider diagnostics from callers."""
 
@@ -1405,6 +1524,73 @@ class CalendarOperationPipeline:
         return snapshot
 
     async def apply_plan(
+        self,
+        *,
+        source_update_id: int,
+        account: str,
+        owner_user_id: int,
+        chat_id: int,
+        transcript: str,
+        reference_time: datetime,
+        plan: Mapping[str, Any],
+        interaction_input: Mapping[str, Any] | None = None,
+        interaction_steps: Sequence[Mapping[str, Any]] | None = None,
+        assistant_text: str | None = None,
+        allowed_event_ids: Sequence[str] | None = None,
+        displayed_candidates: Sequence[Any] | None = None,
+    ) -> ActionExecutionResult:
+        raw_operations = plan.get("operations") if isinstance(plan, Mapping) else None
+        operation_types = _operation_types(raw_operations)
+        should_log = bool(operation_types) and plan.get("action") == "execute"
+        operation_count = (
+            len(raw_operations)
+            if isinstance(raw_operations, Sequence)
+            and not isinstance(raw_operations, (str, bytes, bytearray))
+            else 0
+        )
+        started = time.monotonic()
+        lifecycle = {
+            "operation_types": operation_types,
+            "operation_count": operation_count,
+            "account": account,
+            "source_update_id": source_update_id,
+            "started": started,
+            "phase": "apply",
+        }
+        if should_log:
+            _log_operation_lifecycle(status="started", **lifecycle)
+        try:
+            result = await self._apply_plan(
+                source_update_id=source_update_id,
+                account=account,
+                owner_user_id=owner_user_id,
+                chat_id=chat_id,
+                transcript=transcript,
+                reference_time=reference_time,
+                plan=plan,
+                interaction_input=interaction_input,
+                interaction_steps=interaction_steps,
+                assistant_text=assistant_text,
+                allowed_event_ids=allowed_event_ids,
+                displayed_candidates=displayed_candidates,
+            )
+        except (CalendarStateConflictError, OperationStateError) as exc:
+            if should_log:
+                _log_operation_lifecycle(
+                    status="conflict", error_type=type(exc).__name__, **lifecycle
+                )
+            raise
+        except Exception as exc:
+            if should_log:
+                _log_operation_lifecycle(
+                    status="error", error_type=type(exc).__name__, **lifecycle
+                )
+            raise
+        if should_log:
+            _log_operation_lifecycle(status="success", **lifecycle)
+        return result
+
+    async def _apply_plan(
         self,
         *,
         source_update_id: int,
@@ -1655,6 +1841,64 @@ class CalendarOperationPipeline:
         return candidates
 
     async def record_read(
+        self,
+        *,
+        source_update_id: int,
+        account: str,
+        owner_user_id: int,
+        chat_id: int,
+        transcript: str,
+        reference_time: datetime,
+        lookup: Mapping[str, Any],
+        events: Sequence[Any],
+        total_count: int,
+        may_be_incomplete: bool,
+        interaction_input: Mapping[str, Any] | None = None,
+        interaction_steps: Sequence[Mapping[str, Any]] | None = None,
+        assistant_text: str | None = None,
+        displayed_candidates: Sequence[Any] | None = None,
+    ) -> ActionExecutionResult:
+        started = time.monotonic()
+        lifecycle = {
+            "operation_types": ("read",),
+            "operation_count": 1,
+            "account": account,
+            "source_update_id": source_update_id,
+            "started": started,
+            "phase": "record_read",
+        }
+        _log_operation_lifecycle(status="started", **lifecycle)
+        try:
+            result = await self._record_read(
+                source_update_id=source_update_id,
+                account=account,
+                owner_user_id=owner_user_id,
+                chat_id=chat_id,
+                transcript=transcript,
+                reference_time=reference_time,
+                lookup=lookup,
+                events=events,
+                total_count=total_count,
+                may_be_incomplete=may_be_incomplete,
+                interaction_input=interaction_input,
+                interaction_steps=interaction_steps,
+                assistant_text=assistant_text,
+                displayed_candidates=displayed_candidates,
+            )
+        except OperationStateError as exc:
+            _log_operation_lifecycle(
+                status="conflict", error_type=type(exc).__name__, **lifecycle
+            )
+            raise
+        except Exception as exc:
+            _log_operation_lifecycle(
+                status="error", error_type=type(exc).__name__, **lifecycle
+            )
+            raise
+        _log_operation_lifecycle(status="success", **lifecycle)
+        return result
+
+    async def _record_read(
         self,
         *,
         source_update_id: int,
@@ -2213,6 +2457,90 @@ class CalendarOperationPipeline:
         return "Google Calendar обновлён: " + ", ".join(actions)
 
     async def undo(
+        self,
+        *,
+        operation_id: str,
+        owner_user_id: int,
+        chat_id: int,
+        source_update_id: int | None = None,
+        assistant_text: str | None = None,
+    ) -> UndoResult:
+        candidate = self.store.get(operation_id)
+        owned_candidate = (
+            candidate
+            if candidate is not None
+            and candidate.get("owner_user_id") == owner_user_id
+            and candidate.get("chat_id") == chat_id
+            else None
+        )
+        target_operation_types = _operation_types(
+            owned_candidate.get("items") if owned_candidate is not None else ()
+        )
+        operation_count = (
+            len(owned_candidate.get("items", ()))
+            if owned_candidate is not None
+            and isinstance(owned_candidate.get("items"), Sequence)
+            and not isinstance(
+                owned_candidate.get("items"), (str, bytes, bytearray)
+            )
+            else 0
+        )
+        started = time.monotonic()
+        lifecycle = {
+            "operation_types": ("undo",),
+            "target_operation_types": target_operation_types,
+            "operation_count": operation_count,
+            "account": (
+                owned_candidate.get("account")
+                if owned_candidate is not None
+                else "unknown"
+            ),
+            "source_update_id": source_update_id,
+            "started": started,
+            "phase": "undo",
+        }
+        _log_operation_lifecycle(status="started", **lifecycle)
+        try:
+            result = await self._undo(
+                operation_id=operation_id,
+                owner_user_id=owner_user_id,
+                chat_id=chat_id,
+                source_update_id=source_update_id,
+                assistant_text=assistant_text,
+            )
+        except CalendarStateConflictError as exc:
+            _log_operation_lifecycle(
+                status="conflict", error_type=type(exc).__name__, **lifecycle
+            )
+            raise
+        except Exception as exc:
+            _log_operation_lifecycle(
+                status="error", error_type=type(exc).__name__, **lifecycle
+            )
+            raise
+
+        if result.outcome == "undone":
+            _log_operation_lifecycle(status="rollback", **lifecycle)
+            _log_operation_lifecycle(status="success", **lifecycle)
+        elif result.outcome == "already_undone":
+            _log_operation_lifecycle(status="success", **lifecycle)
+        elif result.outcome in {"blocked", "rejected"} or not result.handled:
+            _log_operation_lifecycle(
+                status="conflict",
+                error_type=(
+                    "UndoRejected"
+                    if result.outcome == "rejected" or not result.handled
+                    else "UndoBlocked"
+                ),
+                **lifecycle,
+            )
+        else:
+            _log_operation_lifecycle(
+                status="error", error_type="UndoRetryableError", **lifecycle
+            )
+        return result
+
+    async def _undo(
         self,
         *,
         operation_id: str,

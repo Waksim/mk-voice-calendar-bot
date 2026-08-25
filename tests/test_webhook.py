@@ -205,6 +205,70 @@ def test_serial_worker_retries_in_order_without_using_polling_offset(tmp_path):
     assert state.offset == 10_000
 
 
+def test_webhook_lifecycle_logs_update_status_without_private_body(
+    tmp_path, caplog
+):
+    class SecretRetryHandler:
+        def __init__(self):
+            self.calls = 0
+
+        async def handle_update(self, _update):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("PRIVATE_WEBHOOK_HANDLER_DIAGNOSTIC")
+
+    async def scenario():
+        state = StateStore(tmp_path / "state.json")
+        handler = SecretRetryHandler()
+        runtime = WebhookRuntime(
+            handler,
+            state,
+            secret_token="valid_secret-123",
+            path="/hook",
+            host="127.0.0.1",
+            port=0,
+            retry_seconds=0.01,
+        )
+        await runtime.start()
+        try:
+            async with ClientSession() as client:
+                response = await client.post(
+                    f"http://127.0.0.1:{runtime.bound_port}/hook",
+                    json={
+                        "update_id": 81,
+                        "message": {"text": "PRIVATE_WEBHOOK_USER_TEXT"},
+                    },
+                    headers=SECRET_HEADER,
+                )
+                assert response.status == 200
+                await response.read()
+            await wait_until(lambda: state.pending_update_count == 0)
+            assert handler.calls == 2
+        finally:
+            await runtime.close()
+
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.webhook"):
+        asyncio.run(scenario())
+
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "tg_voice_transcriber_bot.webhook"
+    )
+    assert "Telegram webhook receive" in messages
+    assert "Telegram webhook update" in messages
+    assert "update_id=81" in messages
+    assert "status=enqueued" in messages
+    assert "status=started" in messages
+    assert "status=retry" in messages
+    assert "status=completed" in messages
+    assert "error_type=RuntimeError" in messages
+    assert "elapsed=" in messages
+    assert "PRIVATE_WEBHOOK_USER_TEXT" not in messages
+    assert "PRIVATE_WEBHOOK_HANDLER_DIAGNOSTIC" not in messages
+    assert "valid_secret-123" not in messages
+
+
 def test_pending_update_is_drained_after_process_restart(tmp_path):
     class RecordingHandler:
         def __init__(self):

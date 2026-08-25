@@ -8,8 +8,10 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
+import logging
 import math
 import re
+import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
@@ -23,12 +25,17 @@ from .gemini import (
     ProviderAuthenticationError,
     ProviderCreditError,
     ProviderPermanentError,
+    _PLANNER_CALL_ID,
     _RATE_LIMIT_ERROR_OBSERVED,
     _RATE_LIMIT_OBSERVED,
     _allowed_event_ids,
     _calendar_operation_input,
     _calendar_prompt,
     _copy_history_steps,
+    _diagnostic_fingerprint,
+    _log_structured_output_failure,
+    _safe_diagnostic_label,
+    _safe_diagnostic_token,
     _validate_input,
 )
 from .intent import (
@@ -37,6 +44,9 @@ from .intent import (
     validate_calendar_intent,
     validate_calendar_operation_plan,
 )
+
+
+LOGGER = logging.getLogger("tg_voice_transcriber_bot.planner.openrouter")
 
 
 class OpenRouterApiError(GeminiApiError):
@@ -222,12 +232,86 @@ class OpenRouterApi:
     def _is_free_model(self) -> bool:
         return self.model.endswith(":free")
 
+    @staticmethod
+    def _selected_provider(router_mapping: Mapping[str, Any]) -> Any:
+        endpoints = router_mapping.get("endpoints")
+        endpoints_mapping = endpoints if isinstance(endpoints, Mapping) else {}
+        available = endpoints_mapping.get("available")
+        if not isinstance(available, list):
+            return None
+        for endpoint in available[:100]:
+            if isinstance(endpoint, Mapping) and endpoint.get("selected") is True:
+                return endpoint.get("provider")
+        return None
+
+    @staticmethod
+    def _response_diagnostics(response: httpx.Response) -> dict[str, str]:
+        diagnostics = {
+            "generation_id": _safe_diagnostic_token(
+                response.headers.get("x-generation-id")
+            ),
+            "provider": "none",
+            "router_strategy": "none",
+            "router_region": "none",
+            "router_attempt": "none",
+            "error_code": "none",
+        }
+        # Metadata is diagnostic only. Do not parse an unexpectedly large
+        # provider body before the normal bounded response validator runs.
+        if len(response.content) > OpenRouterApi._MAX_RESPONSE_BYTES:
+            return diagnostics
+        try:
+            body = response.json()
+        except (ValueError, RecursionError):
+            return diagnostics
+        body_mapping = body if isinstance(body, Mapping) else {}
+        error = body_mapping.get("error")
+        error_mapping = error if isinstance(error, Mapping) else {}
+        error_metadata = error_mapping.get("metadata")
+        metadata_mapping = (
+            error_metadata if isinstance(error_metadata, Mapping) else {}
+        )
+        router_metadata = body_mapping.get("openrouter_metadata")
+        router_mapping = (
+            router_metadata if isinstance(router_metadata, Mapping) else {}
+        )
+        attempts = router_mapping.get("attempts")
+        last_attempt = (
+            attempts[-1]
+            if isinstance(attempts, list)
+            and attempts
+            and isinstance(attempts[-1], Mapping)
+            else {}
+        )
+        generation_id = (
+            response.headers.get("x-generation-id")
+            or body_mapping.get("id")
+        )
+        provider = (
+            OpenRouterApi._selected_provider(router_mapping)
+            or last_attempt.get("provider")
+            or metadata_mapping.get("provider_name")
+            or body_mapping.get("provider")
+        )
+        return {
+            "generation_id": _safe_diagnostic_token(generation_id),
+            "provider": _safe_diagnostic_label(provider),
+            "router_strategy": _safe_diagnostic_token(
+                router_mapping.get("strategy")
+            ),
+            "router_region": _safe_diagnostic_token(router_mapping.get("region")),
+            "router_attempt": _safe_diagnostic_token(
+                router_mapping.get("attempt")
+            ),
+            "error_code": _safe_diagnostic_token(error_mapping.get("code")),
+        }
+
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
 
     @classmethod
-    def _ensure_request_size(cls, payload: Mapping[str, Any]) -> None:
+    def _ensure_request_size(cls, payload: Mapping[str, Any]) -> int:
         try:
             serialized = json.dumps(
                 payload,
@@ -241,6 +325,7 @@ class OpenRouterApi:
             ) from None
         if len(serialized) > cls._MAX_REQUEST_BYTES:
             raise OpenRouterApiError("OpenRouter API request is too large")
+        return len(serialized)
 
     @staticmethod
     def _retry_after(response: httpx.Response) -> float | None:
@@ -291,8 +376,9 @@ class OpenRouterApi:
         payload: Mapping[str, Any] | None = None,
         authenticated: bool = True,
     ) -> httpx.Response:
-        if payload is not None:
-            self._ensure_request_size(payload)
+        request_bytes = (
+            self._ensure_request_size(payload) if payload is not None else 0
+        )
         rate_limited = [False]
         try:
             async with asyncio.timeout(self.timeout_seconds):
@@ -302,8 +388,17 @@ class OpenRouterApi:
                     payload=payload,
                     authenticated=authenticated,
                     rate_limited=rate_limited,
+                    request_bytes=request_bytes,
                 )
         except TimeoutError:
+            LOGGER.warning(
+                "OpenRouter API deadline exhausted; call_id=%s model=%s "
+                "rate_limit_seen=%s timeout=%.3fs",
+                _PLANNER_CALL_ID.get(),
+                self.model,
+                rate_limited[0],
+                self.timeout_seconds,
+            )
             if rate_limited[0]:
                 raise OpenRouterRateLimitError(
                     "OpenRouter API rate limit exceeded"
@@ -318,14 +413,27 @@ class OpenRouterApi:
         payload: Mapping[str, Any] | None,
         authenticated: bool,
         rate_limited: list[bool],
+        request_bytes: int,
     ) -> httpx.Response:
         headers = {"accept": "application/json"}
         if authenticated:
             headers["authorization"] = f"Bearer {self._api_key}"
         if payload is not None:
             headers["content-type"] = "application/json"
+        endpoint = (
+            "chat_completions"
+            if url == self._chat_url
+            else "key"
+            if url == self._key_url
+            else "credits"
+            if url == self._credits_url
+            else "model"
+        )
+        if endpoint == "chat_completions":
+            headers["x-openrouter-metadata"] = "enabled"
 
         for attempt in range(self.max_retries + 1):
+            attempt_started = time.monotonic()
             try:
                 response = await self._client.request(
                     method,
@@ -333,21 +441,85 @@ class OpenRouterApi:
                     headers=headers,
                     json=dict(payload) if payload is not None else None,
                 )
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as exc:
+                LOGGER.warning(
+                    "OpenRouter HTTP attempt failed; call_id=%s model=%s "
+                    "endpoint=%s attempt=%d request_bytes=%d elapsed=%.3fs "
+                    "error_type=%s",
+                    _PLANNER_CALL_ID.get(),
+                    self.model,
+                    endpoint,
+                    attempt + 1,
+                    request_bytes,
+                    time.monotonic() - attempt_started,
+                    type(exc).__name__,
+                )
                 # The provider may have completed and billed a timed-out
                 # generation. Do not start an indistinguishable second one.
                 raise OpenRouterApiError(
                     "OpenRouter API request timed out"
                 ) from None
             except httpx.HTTPError as exc:
+                retry_delay = (
+                    self._retry_delay(None, attempt)
+                    if attempt < self.max_retries
+                    else None
+                )
+                LOGGER.warning(
+                    "OpenRouter HTTP attempt failed; call_id=%s model=%s "
+                    "endpoint=%s attempt=%d request_bytes=%d elapsed=%.3fs "
+                    "error_type=%s retry_delay=%s",
+                    _PLANNER_CALL_ID.get(),
+                    self.model,
+                    endpoint,
+                    attempt + 1,
+                    request_bytes,
+                    time.monotonic() - attempt_started,
+                    type(exc).__name__,
+                    f"{retry_delay:.3f}s" if retry_delay is not None else "none",
+                )
                 if attempt < self.max_retries:
-                    await self._sleep(self._retry_delay(None, attempt))
+                    await self._sleep(retry_delay or 0)
                     continue
                 raise OpenRouterApiError(
                     f"OpenRouter API transport error: {type(exc).__name__}"
                 ) from None
 
             status = response.status_code
+            diagnostics = self._response_diagnostics(response)
+            retry_delay = (
+                self._retry_delay(
+                    response,
+                    attempt,
+                    rate_limited=status == 429,
+                )
+                if self._retryable_status(status) and attempt < self.max_retries
+                else None
+            )
+            log_method = LOGGER.info if 200 <= status < 300 else LOGGER.warning
+            log_method(
+                "OpenRouter HTTP response; call_id=%s model=%s endpoint=%s "
+                "attempt=%d status=%d request_bytes=%d elapsed=%.3fs "
+                "response_bytes=%d "
+                "generation_id=%s provider=%s router_strategy=%s "
+                "router_region=%s router_attempt=%s error_code=%s "
+                "retry_delay=%s",
+                _PLANNER_CALL_ID.get(),
+                self.model,
+                endpoint,
+                attempt + 1,
+                status,
+                request_bytes,
+                time.monotonic() - attempt_started,
+                len(response.content),
+                diagnostics["generation_id"],
+                diagnostics["provider"],
+                diagnostics["router_strategy"],
+                diagnostics["router_region"],
+                diagnostics["router_attempt"],
+                diagnostics["error_code"],
+                f"{retry_delay:.3f}s" if retry_delay is not None else "none",
+            )
             if 200 <= status < 300:
                 return response
             if status == 402:
@@ -372,13 +544,7 @@ class OpenRouterApi:
                     )
                     _RATE_LIMIT_OBSERVED.set(True)
             if self._retryable_status(status) and attempt < self.max_retries:
-                await self._sleep(
-                    self._retry_delay(
-                        response,
-                        attempt,
-                        rate_limited=status == 429,
-                    )
-                )
+                await self._sleep(retry_delay or 0)
                 continue
             if status == 429:
                 raise OpenRouterRateLimitError(
@@ -618,6 +784,119 @@ class OpenRouterApi:
             )
         return text
 
+    @staticmethod
+    def _completion_diagnostics(body: Mapping[str, Any]) -> dict[str, Any]:
+        choices = body.get("choices")
+        choice = (
+            choices[0]
+            if isinstance(choices, list)
+            and choices
+            and isinstance(choices[0], Mapping)
+            else {}
+        )
+        usage = body.get("usage")
+        usage_mapping = usage if isinstance(usage, Mapping) else {}
+        completion_details = usage_mapping.get("completion_tokens_details")
+        completion_details_mapping = (
+            completion_details if isinstance(completion_details, Mapping) else {}
+        )
+        prompt_details = usage_mapping.get("prompt_tokens_details")
+        prompt_details_mapping = (
+            prompt_details if isinstance(prompt_details, Mapping) else {}
+        )
+        router_metadata = body.get("openrouter_metadata")
+        router_mapping = (
+            router_metadata if isinstance(router_metadata, Mapping) else {}
+        )
+        attempts = router_mapping.get("attempts")
+        safe_attempts = []
+        if isinstance(attempts, list):
+            for attempt in attempts[:10]:
+                if isinstance(attempt, Mapping):
+                    safe_attempts.append(
+                        {
+                            "provider": _safe_diagnostic_label(
+                                attempt.get("provider")
+                            ),
+                            "model": _safe_diagnostic_token(attempt.get("model")),
+                            "status": _safe_diagnostic_token(
+                                attempt.get("status")
+                            ),
+                        }
+                    )
+        pipeline = router_mapping.get("pipeline")
+        safe_pipeline = []
+        if isinstance(pipeline, list):
+            for stage in pipeline[:10]:
+                if isinstance(stage, Mapping):
+                    safe_pipeline.append(
+                        {
+                            "type": _safe_diagnostic_token(stage.get("type")),
+                            "name": _safe_diagnostic_label(stage.get("name")),
+                        }
+                    )
+        safe_usage: dict[str, int | float] = {
+            key: value
+            for key in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            )
+            if isinstance((value := usage_mapping.get(key)), int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
+        nested_token_fields = {
+            "reasoning_tokens": completion_details_mapping.get(
+                "reasoning_tokens",
+                usage_mapping.get("reasoning_tokens"),
+            ),
+            "cached_tokens": prompt_details_mapping.get(
+                "cached_tokens",
+                usage_mapping.get("cached_tokens"),
+            ),
+        }
+        safe_usage.update(
+            {
+                key: value
+                for key, value in nested_token_fields.items()
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+            }
+        )
+        cost = usage_mapping.get("cost")
+        if (
+            isinstance(cost, int)
+            and not isinstance(cost, bool)
+            and cost >= 0
+        ) or (isinstance(cost, float) and math.isfinite(cost) and cost >= 0):
+            safe_usage["cost"] = cost
+        return {
+            "generation_id": _safe_diagnostic_token(body.get("id")),
+            "returned_model": _safe_diagnostic_token(body.get("model")),
+            "provider": _safe_diagnostic_label(
+                OpenRouterApi._selected_provider(router_mapping)
+                or body.get("provider")
+            ),
+            "finish_reason": _safe_diagnostic_token(choice.get("finish_reason")),
+            "usage": safe_usage,
+            "router_strategy": _safe_diagnostic_token(
+                router_mapping.get("strategy")
+            ),
+            "router_region": _safe_diagnostic_token(router_mapping.get("region")),
+            "router_attempt": _safe_diagnostic_token(
+                router_mapping.get("attempt")
+            ),
+            "router_is_byok": (
+                router_mapping.get("is_byok")
+                if isinstance(router_mapping.get("is_byok"), bool)
+                else None
+            ),
+            "attempts": safe_attempts,
+            "pipeline": safe_pipeline,
+        }
+
     async def _complete_structured(
         self,
         *,
@@ -631,10 +910,60 @@ class OpenRouterApi:
             schema_name=schema_name,
         )
         response = await self._request("POST", self._chat_url, payload=payload)
-        text = self._completion_text(self._response_json(response))
+        try:
+            body = self._response_json(response)
+        except OpenRouterApiError as exc:
+            LOGGER.warning(
+                "OpenRouter completion envelope rejected; call_id=%s "
+                "model=%s response_bytes=%d error=%s",
+                _PLANNER_CALL_ID.get(),
+                self.model,
+                len(response.content),
+                str(exc),
+            )
+            raise
+        completion_diagnostics = self._completion_diagnostics(body)
+        metadata_json = json.dumps(
+            completion_diagnostics,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        try:
+            text = self._completion_text(body)
+        except OpenRouterApiError as exc:
+            LOGGER.warning(
+                "OpenRouter completion envelope rejected; call_id=%s "
+                "model=%s response_bytes=%d metadata=%s error=%s",
+                _PLANNER_CALL_ID.get(),
+                self.model,
+                len(response.content),
+                metadata_json,
+                str(exc),
+            )
+            raise
+        output_bytes, output_fingerprint = _diagnostic_fingerprint(text)
+        LOGGER.info(
+            "OpenRouter completion envelope; call_id=%s model=%s "
+            "response_bytes=%d output_bytes=%d output_fingerprint=%s "
+            "metadata=%s",
+            _PLANNER_CALL_ID.get(),
+            self.model,
+            len(response.content),
+            output_bytes,
+            output_fingerprint,
+            metadata_json,
+        )
         try:
             return json.loads(text), text
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            _log_structured_output_failure(
+                provider="OpenRouter",
+                model=self.model,
+                phase="json_decode",
+                output=text,
+                reason=f"line={exc.lineno} column={exc.colno} position={exc.pos}",
+            )
             raise OpenRouterApiError(
                 "OpenRouter API returned invalid structured JSON"
             ) from None
@@ -657,7 +986,7 @@ class OpenRouterApi:
         except GeminiError as exc:
             raise OpenRouterApiError(str(exc)) from None
 
-        structured, _text = await self._complete_structured(
+        structured, output_text = await self._complete_structured(
             messages=[{"role": "user", "content": prompt}],
             schema=_OPENROUTER_CALENDAR_INTENT_SCHEMA,
             schema_name="calendar_intent",
@@ -667,9 +996,16 @@ class OpenRouterApi:
                 structured,
                 expected_timezone=self.timezone,
             )
-        except ValueError:
+        except ValueError as exc:
+            _log_structured_output_failure(
+                provider="OpenRouter",
+                model=self.model,
+                phase="semantic_validation",
+                output=output_text,
+                reason=str(exc),
+            )
             raise OpenRouterApiError(
-                "OpenRouter returned an invalid calendar event"
+                f"OpenRouter returned an invalid calendar event: {exc}"
             ) from None
 
     async def plan_calendar_actions(
@@ -728,9 +1064,16 @@ class OpenRouterApi:
                 _allowed_event_ids(application_state),
                 expected_timezone=self.timezone,
             )
-        except ValueError:
+        except ValueError as exc:
+            _log_structured_output_failure(
+                provider="OpenRouter",
+                model=self.model,
+                phase="semantic_validation",
+                output=output_text,
+                reason=str(exc),
+            )
             raise OpenRouterApiError(
-                "OpenRouter returned an invalid calendar plan"
+                f"OpenRouter returned an invalid calendar plan: {exc}"
             ) from None
 
         normalized["_interaction_input"] = deepcopy(current_input)

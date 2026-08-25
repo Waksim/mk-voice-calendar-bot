@@ -1142,3 +1142,312 @@ def test_model_validation_requires_structured_output_and_reasoning_support():
 
     with pytest.raises(OpenRouterApiError, match="lacks required parameters"):
         asyncio.run(scenario())
+
+
+def test_openrouter_metadata_header_is_sent_only_for_completions():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/v1/key":
+            return httpx.Response(
+                200,
+                json={"data": {"label": "owner", "limit_remaining": 1}},
+            )
+        if request.url.path == "/api/v1/credits":
+            return httpx.Response(
+                200,
+                json={"data": {"total_credits": 5, "total_usage": 0}},
+            )
+        if request.url.path == (
+            "/api/v1/model/nvidia/nemotron-3-super-120b-a12b:free"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "nvidia/nemotron-3-super-120b-a12b:free",
+                        "supported_parameters": [
+                            "max_tokens",
+                            "reasoning",
+                            "response_format",
+                            "structured_outputs",
+                        ],
+                        "reasoning": {"supported_efforts": ["medium"]},
+                    }
+                },
+            )
+        if request.url.path == "/api/v1/chat/completions":
+            return httpx.Response(200, json=completion(CALENDAR_RESULT))
+        raise AssertionError(f"unexpected request: {request.url.path}")
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = api(http_client)
+            await client.validate()
+            await client.extract_event(
+                "Завтра в десять позвонить врачу",
+                reference_time=NOW,
+                account="personal",
+            )
+
+    asyncio.run(scenario())
+
+    assert [request.url.path for request in requests] == [
+        "/api/v1/key",
+        "/api/v1/credits",
+        "/api/v1/model/nvidia/nemotron-3-super-120b-a12b:free",
+        "/api/v1/chat/completions",
+    ]
+    assert all(
+        "x-openrouter-metadata" not in request.headers
+        for request in requests[:-1]
+    )
+    assert requests[-1].headers["x-openrouter-metadata"] == "enabled"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"not-json",
+        b"x" * (OpenRouterApi._MAX_RESPONSE_BYTES + 1),
+    ],
+)
+def test_response_diagnostics_preserve_generation_header_without_safe_json(
+    content,
+):
+    response = httpx.Response(
+        502,
+        headers={"X-Generation-Id": "gen-debug-123"},
+        content=content,
+    )
+
+    diagnostics = OpenRouterApi._response_diagnostics(response)
+
+    assert diagnostics == {
+        "generation_id": "gen-debug-123",
+        "provider": "none",
+        "router_strategy": "none",
+        "router_region": "none",
+        "router_attempt": "none",
+        "error_code": "none",
+    }
+
+
+def test_deep_error_json_cannot_bypass_typed_http_error_or_generation_log(
+    caplog,
+):
+    deeply_nested_json = ("[" * 10_000 + "0" + "]" * 10_000).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            502,
+            headers={"X-Generation-Id": "gen-deep-502"},
+            content=deeply_nested_json,
+        )
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            await api(http_client, max_retries=0).extract_event(
+                "Завтра встреча",
+                reference_time=NOW,
+                account="personal",
+            )
+
+    with caplog.at_level(
+        "INFO", logger="tg_voice_transcriber_bot.planner.openrouter"
+    ):
+        with pytest.raises(OpenRouterApiError, match="HTTP status 502"):
+            asyncio.run(scenario())
+
+    assert "generation_id=gen-deep-502" in caplog.text
+
+
+def test_diagnostics_use_selected_endpoint_without_optional_attempts():
+    body = {
+        "openrouter_metadata": {
+            "endpoints": {
+                "available": [
+                    {
+                        "provider": "Rejected Provider",
+                        "selected": False,
+                    },
+                    {
+                        "provider": "Google AI Studio",
+                        "selected": True,
+                    },
+                ]
+            }
+        }
+    }
+
+    completion_diagnostics = OpenRouterApi._completion_diagnostics(body)
+    response_diagnostics = OpenRouterApi._response_diagnostics(
+        httpx.Response(200, json=body)
+    )
+
+    assert completion_diagnostics["provider"] == "Google AI Studio"
+    assert completion_diagnostics["attempts"] == []
+    assert response_diagnostics["provider"] == "Google AI Studio"
+
+
+def test_completion_logs_safe_metadata_and_usage_without_private_content(
+    caplog,
+):
+    prompt_secret = "prompt-secret-DO-NOT-LOG"
+    output_secret = "output-secret-DO-NOT-LOG"
+    metadata_secret = "metadata-secret-DO-NOT-LOG"
+    reasoning_secret = "reasoning-secret-DO-NOT-LOG"
+    api_key = "openrouter-unit-test-secret"
+    result = deepcopy(CALENDAR_RESULT)
+    result["events"][0]["description"] = output_secret
+    response_body = completion(result, reasoning=reasoning_secret)
+    response_body.update(
+        {
+            "id": "gen-safe-123",
+            "model": "nvidia/nemotron-3-super-120b-a12b:free",
+            "usage": {
+                "prompt_tokens": 321,
+                "completion_tokens": 123,
+                "total_tokens": 444,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 75,
+                    "private_reasoning_detail": reasoning_secret,
+                },
+                "prompt_tokens_details": {
+                    "cached_tokens": 8,
+                    "cache_write_tokens": 4,
+                    "private_cache_detail": metadata_secret,
+                },
+                "cost": 0.00042,
+                "private_usage_detail": metadata_secret,
+            },
+            "openrouter_metadata": {
+                "strategy": "fallback",
+                "region": "us-east",
+                "attempt": 2,
+                "is_byok": False,
+                "private_prompt": prompt_secret,
+                "private_output": output_secret,
+                "endpoints": {
+                    "total": 1,
+                    "available": [
+                        {
+                            "provider": "Google AI Studio",
+                            "model": "nvidia/nemotron-3-super-120b-a12b:free",
+                            "selected": True,
+                            "private": metadata_secret,
+                        }
+                    ],
+                },
+                "attempts": [
+                    {
+                        "provider": "Google AI Studio",
+                        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+                        "status": "success",
+                        "private": metadata_secret,
+                    }
+                ],
+                "pipeline": [
+                    {
+                        "type": "provider",
+                        "name": "NVIDIA",
+                        "private": metadata_secret,
+                    }
+                ],
+            },
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response_body)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            return await api(http_client).extract_event(
+                prompt_secret,
+                reference_time=NOW,
+                account="personal",
+            )
+
+    with caplog.at_level(
+        "INFO", logger="tg_voice_transcriber_bot.planner.openrouter"
+    ):
+        parsed = asyncio.run(scenario())
+
+    assert parsed["events"][0]["description"] == output_secret
+    assert "generation_id=gen-safe-123" in caplog.text
+    assert "provider=Google AI Studio" in caplog.text
+    assert '"finish_reason":"stop"' in caplog.text
+    assert '"provider":"Google AI Studio"' in caplog.text
+    assert '"prompt_tokens":321' in caplog.text
+    assert '"completion_tokens":123' in caplog.text
+    assert '"total_tokens":444' in caplog.text
+    assert '"reasoning_tokens":75' in caplog.text
+    assert '"cached_tokens":8' in caplog.text
+    assert '"cost":0.00042' in caplog.text
+    assert '"router_strategy":"fallback"' in caplog.text
+    assert '"router_region":"us-east"' in caplog.text
+    assert '"router_attempt":"2"' in caplog.text
+    assert '"router_is_byok":false' in caplog.text
+    assert '"attempts":[{"model":"nvidia/nemotron-3-super-120b-a12b:free"' in caplog.text
+    assert '"provider":"Google AI Studio"' in caplog.text
+    assert '"pipeline":[{"name":"NVIDIA","type":"provider"}]' in caplog.text
+    assert "response_bytes=" in caplog.text
+    assert "output_bytes=" in caplog.text
+    assert "output_fingerprint=" in caplog.text
+    assert prompt_secret not in caplog.text
+    assert output_secret not in caplog.text
+    assert metadata_secret not in caplog.text
+    assert reasoning_secret not in caplog.text
+    assert api_key not in caplog.text
+
+
+def test_openrouter_logs_static_semantic_rejection_without_model_output(
+    caplog,
+):
+    forged_event_id = "provider-event-id-secret-DO-NOT-LOG"
+    prompt_secret = "planner-command-secret-DO-NOT-LOG"
+    api_key = "openrouter-unit-test-secret"
+    forged = deepcopy(CALENDAR_PLAN)
+    forged["operations"][0]["target_event_id"] = forged_event_id
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=completion(forged))
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            await api(http_client).plan_calendar_actions(
+                prompt_secret,
+                reference_time=NOW,
+                account="personal",
+                application_state={"allowed_event_ids": ["e1"]},
+                recent_conversation=[],
+            )
+
+    with caplog.at_level(
+        "INFO", logger="tg_voice_transcriber_bot.planner.openrouter"
+    ):
+        with pytest.raises(OpenRouterApiError) as raised:
+            asyncio.run(scenario())
+
+    assert str(raised.value) == (
+        "OpenRouter returned an invalid calendar plan: "
+        "target_event_id is not a known calendar event"
+    )
+    assert "provider=OpenRouter" in caplog.text
+    assert "phase=semantic_validation" in caplog.text
+    assert "reason=target_event_id is not a known calendar event" in caplog.text
+    assert "output_bytes=" in caplog.text
+    assert "output_fingerprint=" in caplog.text
+    assert prompt_secret not in caplog.text
+    assert forged_event_id not in caplog.text
+    assert api_key not in caplog.text

@@ -39,6 +39,7 @@ from .gemini import (
     GeminiProviderChain,
     GeminiProviderStage,
     GeminiRateLimitError,
+    planner_diagnostic_context,
 )
 from .intent import format_calendar_preview
 from .operations import (
@@ -764,7 +765,8 @@ class VoiceBotService:
         else:
             await self.bot.configure()
         try:
-            await self.gemini.validate()
+            with planner_diagnostic_context("startup-validation"):
+                await self.gemini.validate()
             if (
                 self.config.bot_update_mode == "webhook"
                 and isinstance(self.gemini, GeminiProviderChain)
@@ -781,15 +783,21 @@ class VoiceBotService:
                 raise self.gemini.primary_validation_error or GeminiError(
                     "Primary calendar planner is unavailable"
                 )
-        except GeminiError:
+        except GeminiError as exc:
             self.gemini_available = False
             if self.calendar_operations is not None:
                 LOGGER.error(
-                    "AI planner validation failed; calendar bot startup aborted"
+                    "AI planner validation failed; error_type=%s error=%s; "
+                    "calendar bot startup aborted",
+                    type(exc).__name__,
+                    str(exc),
                 )
                 raise
             LOGGER.warning(
-                "AI planner validation failed; transcript fallback enabled"
+                "AI planner validation failed; error_type=%s error=%s; "
+                "transcript fallback enabled",
+                type(exc).__name__,
+                str(exc),
             )
         LOGGER.info(
             "Bot, %d user session(s), and local integrations validated",
@@ -1438,14 +1446,17 @@ class VoiceBotService:
                 )
                 planning_started = time.monotonic()
                 try:
-                    plan = await self.gemini.plan_calendar_actions(
-                        transcript,
-                        reference_time=sent_time,
-                        account=account,
-                        application_state=context.application_state,
-                        recent_conversation=context.recent_conversation,
-                        history_steps=context.history_steps,
-                    )
+                    with planner_diagnostic_context(
+                        f"telegram-update-{update_id}:initial"
+                    ):
+                        plan = await self.gemini.plan_calendar_actions(
+                            transcript,
+                            reference_time=sent_time,
+                            account=account,
+                            application_state=context.application_state,
+                            recent_conversation=context.recent_conversation,
+                            history_steps=context.history_steps,
+                        )
                     plan = _resolve_plan_event_references(
                         plan,
                         context.event_id_by_ref,
@@ -1527,6 +1538,7 @@ class VoiceBotService:
                         time_min=str(lookup["time_min"]),
                         time_max=str(lookup["time_max"]),
                         limit=20,
+                        source_update_id=update_id,
                     )
                     durable_result = _calendar_query_payload(query_result)
                     if plan.get("action") == "lookup":
@@ -1710,14 +1722,17 @@ class VoiceBotService:
             native_history.extend(first_steps)
             planning_started = time.monotonic()
             try:
-                resolved_plan = await self.gemini.plan_calendar_actions(
-                    transcript,
-                    reference_time=sent_time,
-                    account=account,
-                    application_state=application_state,
-                    recent_conversation=context.recent_conversation,
-                    history_steps=native_history,
-                )
+                with planner_diagnostic_context(
+                    f"telegram-update-{update_id}:matching"
+                ):
+                    resolved_plan = await self.gemini.plan_calendar_actions(
+                        transcript,
+                        reference_time=sent_time,
+                        account=account,
+                        application_state=application_state,
+                        recent_conversation=context.recent_conversation,
+                        history_steps=native_history,
+                    )
                 resolved_plan = _resolve_plan_event_references(
                     resolved_plan,
                     lookup_event_id_by_ref,
@@ -2092,15 +2107,21 @@ class VoiceBotService:
                     int(job["sent_at"]), tz=timezone.utc
                 ).astimezone(ZoneInfo(self.config.calendar_timezone))
                 try:
-                    intent = await self.gemini.extract_event(
-                        transcript,
-                        reference_time=sent_time,
-                        account=account,
-                    )
-                except GeminiError:
+                    with planner_diagnostic_context(
+                        f"telegram-update-{update_id}:extract"
+                    ):
+                        intent = await self.gemini.extract_event(
+                            transcript,
+                            reference_time=sent_time,
+                            account=account,
+                        )
+                except GeminiError as exc:
                     LOGGER.warning(
-                        "AI planner extraction failed for update %s; transcript fallback used",
+                        "AI planner extraction failed for update %s; "
+                        "error_type=%s error=%s; transcript fallback used",
                         update_id,
+                        type(exc).__name__,
+                        str(exc),
                     )
                     job["reply"] = (
                         f"Расшифровка:\n{transcript}\n\n"
