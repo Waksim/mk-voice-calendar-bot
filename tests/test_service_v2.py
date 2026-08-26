@@ -739,9 +739,10 @@ def test_recurring_scope_controls_series_delete_and_ordinary_update():
     assert update_occurrence["operations"][0]["target_event_id"] == (
         "provider-instance-secret"
     )
-    assert ambiguous["action"] == "clarify"
-    assert ambiguous["operations"] == []
-    assert "всю серию" in ambiguous["clarification_question"]
+    assert ambiguous["action"] == "execute"
+    assert ambiguous["operations"][0]["target_event_id"] == (
+        "provider-instance-secret"
+    )
 
     master_occurrence = _resolve_plan_event_references(
         update_plan("e1", recurrence_scope="occurrence"),
@@ -749,10 +750,10 @@ def test_recurring_scope_controls_series_delete_and_ordinary_update():
         {"e1": "provider-master-secret"},
         ("e1",),
     )
-    assert master_occurrence["action"] == "clarify"
-    assert "дату конкретного повторения" in master_occurrence[
-        "clarification_question"
-    ]
+    assert master_occurrence["action"] == "execute"
+    assert master_occurrence["operations"][0]["target_event_id"] == (
+        "provider-master-secret"
+    )
 
 
 def test_unauthorized_text_is_silently_ignored(tmp_path):

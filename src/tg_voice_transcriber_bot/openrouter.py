@@ -41,8 +41,8 @@ from .gemini import (
 from .intent import (
     CALENDAR_INTENT_SCHEMA,
     CALENDAR_OPERATION_SCHEMA,
-    validate_calendar_intent,
-    validate_calendar_operation_plan,
+    normalize_calendar_intent,
+    normalize_calendar_operation_plan,
 )
 
 
@@ -992,7 +992,7 @@ class OpenRouterApi:
             schema_name="calendar_intent",
         )
         try:
-            return validate_calendar_intent(
+            return normalize_calendar_intent(
                 structured,
                 expected_timezone=self.timezone,
             )
@@ -1059,7 +1059,7 @@ class OpenRouterApi:
         )
         structured = self._decode_operation_wire_payload(structured)
         try:
-            normalized = validate_calendar_operation_plan(
+            normalized = normalize_calendar_operation_plan(
                 structured,
                 _allowed_event_ids(application_state),
                 expected_timezone=self.timezone,

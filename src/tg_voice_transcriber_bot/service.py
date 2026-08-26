@@ -494,10 +494,10 @@ async def _hydrate_lookup_series_candidates(
                 and not isinstance(rules, (str, bytes, bytearray))
                 and rules
             ):
-                raise CalendarOperationError(
-                    "Google Calendar не вернул правило повторения серии. "
-                    "Уточните изменение новым сообщением."
-                )
+                # Missing recurrence metadata is provider state, not a reason
+                # for the bot to veto the model's next operation.  The exact
+                # visible occurrence remains available as a mutation target.
+                continue
             master_contexts[master_id] = {
                 "start_at": master.get("start_at"),
                 "end_at": master.get("end_at"),
@@ -521,46 +521,10 @@ def _resolve_plan_event_references(
     operations = resolved.get("operations")
     if not isinstance(operations, list):
         return resolved
-    recurring_refs = (
-        frozenset(recurring_event_refs)
-        if recurring_event_refs is not None
-        else frozenset(
-            event_ref
-            for event_ref, event_id in event_id_by_ref.items()
-            if series_event_id_by_ref is not None
-            and series_event_id_by_ref.get(event_ref) != event_id
-        )
-    )
-
-    def clarify_scope() -> dict[str, Any]:
-        clarification = {
-            "action": "clarify",
-            "operations": [],
-            "lookup": None,
-            "clarification_question": (
-                "Изменить только выбранное повторение или всю серию событий?"
-            ),
-            "confidence": float(resolved.get("confidence", 0)),
-        }
-        for key in ("_interaction_input", "_interaction_steps"):
-            if key in resolved:
-                clarification[key] = deepcopy(resolved[key])
-        return clarification
-
-    def clarify_occurrence_date() -> dict[str, Any]:
-        clarification = {
-            "action": "clarify",
-            "operations": [],
-            "lookup": None,
-            "clarification_question": (
-                "Укажите дату конкретного повторения, которое нужно изменить."
-            ),
-            "confidence": float(resolved.get("confidence", 0)),
-        }
-        for key in ("_interaction_input", "_interaction_steps"):
-            if key in resolved:
-                clarification[key] = deepcopy(resolved[key])
-        return clarification
+    # Kept for API compatibility with callers that already computed this
+    # metadata.  Scope is now trusted as model output instead of being turned
+    # into a bot-authored clarification guard.
+    _ = recurring_event_refs
 
     for operation in operations:
         if not isinstance(operation, dict):
@@ -571,36 +535,9 @@ def _resolve_plan_event_references(
         event_ref = operation.get("target_event_id")
         if not isinstance(event_ref, str) or event_ref not in event_id_by_ref:
             raise _UnknownEventReference("unknown model event reference")
-        patch = operation.get("patch")
-        clear_fields = operation.get("clear_fields")
-        recurrence_mutation = (
-            isinstance(patch, Mapping) and "recurrence_rrule" in patch
-        ) or (
-            isinstance(clear_fields, Sequence)
-            and not isinstance(clear_fields, (str, bytes, bytearray))
-            and "recurrence_rrule" in clear_fields
-        )
         recurrence_scope = operation.get("recurrence_scope")
-        recurring = event_ref in recurring_refs
-        if recurrence_mutation and recurrence_scope != "series":
-            return clarify_scope()
-        if recurring and recurrence_scope not in {"series", "occurrence"}:
-            return clarify_scope()
-        if (
-            recurring
-            and recurrence_scope == "occurrence"
-            and series_event_id_by_ref is not None
-            and series_event_id_by_ref.get(event_ref)
-            == event_id_by_ref.get(event_ref)
-        ):
-            # A master ID cannot safely stand in for one concrete occurrence.
-            return clarify_occurrence_date()
-        if not recurring and not recurrence_mutation and recurrence_scope is not None:
-            return clarify_scope()
         target_map = event_id_by_ref
-        if recurrence_scope == "series":
-            if series_event_id_by_ref is None:
-                return clarify_scope()
+        if recurrence_scope == "series" and series_event_id_by_ref is not None:
             target_map = series_event_id_by_ref
         if event_ref not in target_map:
             raise _UnknownEventReference("unknown model event reference")

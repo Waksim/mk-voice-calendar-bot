@@ -1535,6 +1535,63 @@ def test_non_temporal_update_preserves_offset_only_event_without_timezone_write(
     )
 
 
+def test_text_only_batch_update_accepts_provider_offset_timezone_mismatch(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        first = provider_event(
+            "daily-first",
+            title="Дейлик 1",
+            start_at="2026-08-24T09:50:00+02:00",
+            end_at="2026-08-24T10:30:00+02:00",
+            timezone="Europe/Moscow",
+            recurrence_rrules=("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",),
+        )
+        second = provider_event(
+            "daily-second",
+            title="Дейлик 2",
+            start_at="2026-08-24T10:30:00+02:00",
+            end_at="2026-08-24T11:00:00+02:00",
+            timezone="Europe/Moscow",
+            recurrence_rrules=("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",),
+        )
+        for snapshot in (first, second):
+            calendar.events[snapshot.event_id] = snapshot
+        pipeline.observe_lookup_events("personal", [first, second])
+        first_update = update_op(first.event_id, {"location": "call one"})
+        second_update = update_op(second.event_id, {"location": "call two"})
+        first_update["recurrence_scope"] = "series"
+        second_update["recurrence_scope"] = "series"
+        result = await apply(
+            pipeline,
+            231,
+            plan(first_update, second_update),
+            allowed_event_ids=(first.event_id, second.event_id),
+        )
+        return calendar, result, first, second
+
+    calendar, result, first, second = asyncio.run(scenario())
+
+    assert result.stage == "applied"
+    update_calls = [call for call in calendar.calls if call[0] == "update"]
+    assert [call[2] for call in update_calls] == [
+        {"location": "call one"},
+        {"location": "call two"},
+    ]
+    assert (
+        calendar.events[first.event_id].start_at,
+        calendar.events[first.event_id].end_at,
+        calendar.events[first.event_id].timezone,
+    ) == (first.start_at, first.end_at, first.timezone)
+    assert (
+        calendar.events[second.event_id].start_at,
+        calendar.events[second.event_id].end_at,
+        calendar.events[second.event_id].timezone,
+    ) == (second.start_at, second.end_at, second.timezone)
+
+
 def test_timed_delete_without_named_timezone_is_not_policy_blocked(tmp_path):
     async def scenario():
         calendar = FakeCalendar()

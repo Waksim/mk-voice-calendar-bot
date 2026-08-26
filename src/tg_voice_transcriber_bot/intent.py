@@ -740,6 +740,225 @@ def validate_calendar_operation_plan(
     }
 
 
+def normalize_calendar_intent(
+    payload: Any, *, expected_timezone: str = "Europe/Moscow"
+) -> dict[str, Any]:
+    """Normalize model output without applying Calendar semantics locally.
+
+    The structured-output schema already defines the wire shape.  This helper
+    deliberately does not reinterpret dates, compare offsets with IANA zones,
+    validate RRULE grammar, or impose cross-field policy.  Those semantics
+    belong to the Calendar adapter and Google Calendar.
+    """
+
+    if not isinstance(payload, dict):
+        raise ValueError("calendar intent must be an object")
+    action = payload.get("action")
+    if action not in {"create", "clarify", "ignore"}:
+        raise ValueError("calendar intent action is not routable")
+    raw_events = payload.get("events")
+    if not isinstance(raw_events, list):
+        raise ValueError("calendar intent events must be an array")
+
+    events: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            raise ValueError("calendar event must be an object")
+        # Ignore model-added metadata, but preserve every Calendar field
+        # verbatim.  Missing/invalid provider values are delegated to the
+        # Calendar boundary instead of being rejected by the bot planner.
+        event = {
+            key: raw_event.get(key)
+            for key in _EVENT_KEYS
+        }
+        if event.get("timezone") is None:
+            event["timezone"] = expected_timezone
+        events.append(event)
+
+    confidence = payload.get("confidence")
+    normalized_confidence = (
+        float(confidence)
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+        else 0.0
+    )
+    return {
+        "action": action,
+        "events": events,
+        "clarification_question": (
+            payload.get("clarification_question")
+            if isinstance(payload.get("clarification_question"), str)
+            else None
+        ),
+        "confidence": max(0.0, min(1.0, normalized_confidence)),
+    }
+
+
+def normalize_calendar_operation_plan(
+    payload: Any,
+    allowed_event_ids: Collection[str],
+    expected_timezone: str = "Europe/Moscow",
+) -> dict[str, Any]:
+    """Normalize a CRUD plan while retaining only routing and ownership checks.
+
+    This is the runtime boundary for model-authored plans.  It intentionally
+    does not validate Calendar semantics: temporal consistency, timezone
+    offsets, recurrence grammar and irrelevant per-operation fields are not
+    reasons to reject a model response.  Unsupported fields are ignored and
+    fields named in ``clear_fields`` win over a simultaneous patch.
+
+    Exact mutation targets remain allowlisted because that is account/owner
+    authorization, not model policy.
+    """
+
+    if not isinstance(payload, dict):
+        raise ValueError("calendar operation plan must be an object")
+    action = payload.get("action")
+    if action not in {"execute", "read", "lookup", "clarify", "ignore"}:
+        raise ValueError("calendar operation action is not routable")
+    raw_operations = payload.get("operations")
+    if not isinstance(raw_operations, list):
+        raise ValueError("calendar operations must be an array")
+    # Keep the bounded batch as a resource limit; do not turn arbitrary model
+    # output into an unbounded series of provider mutations.
+    if len(raw_operations) > 5:
+        raise ValueError("calendar operation batch is too large")
+
+    allowed_ids = _allowed_id_set(allowed_event_ids)
+    operations: list[dict[str, Any]] = []
+    operations_to_normalize = raw_operations if action == "execute" else []
+    for raw_operation in operations_to_normalize:
+        if not isinstance(raw_operation, dict):
+            raise ValueError("calendar operation must be an object")
+        operation_type = raw_operation.get("type")
+        if operation_type not in {"create", "update", "delete"}:
+            raise ValueError("calendar operation type is not routable")
+
+        recurrence_scope = raw_operation.get("recurrence_scope")
+        if recurrence_scope not in {"series", "occurrence"}:
+            recurrence_scope = None
+
+        if operation_type == "create":
+            raw_event = raw_operation.get("event")
+            if not isinstance(raw_event, dict):
+                raise ValueError("calendar create operation has no event object")
+            event = {
+                key: raw_event.get(key)
+                for key in _EVENT_KEYS
+            }
+            if event.get("timezone") is None:
+                event["timezone"] = expected_timezone
+            operations.append(
+                {
+                    "type": "create",
+                    "target_event_id": None,
+                    "recurrence_scope": None,
+                    "event": event,
+                    "patch": None,
+                    "clear_fields": [],
+                }
+            )
+            continue
+
+        target_event_id = raw_operation.get("target_event_id")
+        if not isinstance(target_event_id, str) or target_event_id not in allowed_ids:
+            raise ValueError("target_event_id is not a known calendar event")
+
+        if operation_type == "delete":
+            operations.append(
+                {
+                    "type": "delete",
+                    "target_event_id": target_event_id,
+                    "recurrence_scope": recurrence_scope,
+                    "event": None,
+                    "patch": None,
+                    "clear_fields": [],
+                }
+            )
+            continue
+
+        raw_patch = raw_operation.get("patch")
+        patch = (
+            {
+                key: value
+                for key, value in raw_patch.items()
+                if key in _PATCH_KEYS
+            }
+            if isinstance(raw_patch, dict)
+            else {}
+        )
+        raw_clear_fields = raw_operation.get("clear_fields")
+        clear_fields = list(
+            dict.fromkeys(
+                field
+                for field in (
+                    raw_clear_fields
+                    if isinstance(raw_clear_fields, list)
+                    else []
+                )
+                if isinstance(field, str) and field in _CLEARABLE_EVENT_FIELDS
+            )
+        )
+        for field in clear_fields:
+            patch.pop(field, None)
+        operations.append(
+            {
+                "type": "update",
+                "target_event_id": target_event_id,
+                "recurrence_scope": recurrence_scope,
+                # A model may redundantly populate the full event branch for
+                # an update.  It is irrelevant and must not poison a valid
+                # patch, as happened with Nemotron in production.
+                "event": None,
+                "patch": patch or None,
+                "clear_fields": clear_fields,
+            }
+        )
+
+    raw_lookup = payload.get("lookup")
+    lookup = None
+    if isinstance(raw_lookup, dict):
+        lookup = {
+            key: raw_lookup.get(key)
+            for key in _LOOKUP_KEYS
+        }
+
+    confidence = payload.get("confidence")
+    normalized_confidence = (
+        float(confidence)
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+        else 0.0
+    )
+    question = (
+        payload.get("clarification_question")
+        if isinstance(payload.get("clarification_question"), str)
+        else None
+    )
+
+    # Route by the model's action and discard irrelevant union branches rather
+    # than rejecting the whole response for having populated them.
+    if action == "execute":
+        lookup = None
+        question = None
+    elif action in {"read", "lookup"}:
+        operations = []
+        question = None
+    elif action == "clarify":
+        operations = []
+        lookup = None
+    else:
+        operations = []
+        lookup = None
+        question = None
+
+    return {
+        "action": action,
+        "operations": operations,
+        "lookup": lookup,
+        "clarification_question": question,
+        "confidence": max(0.0, min(1.0, normalized_confidence)),
+    }
+
+
 def _format_when(event: dict[str, Any]) -> str:
     if event["all_day"]:
         return f'{event["start_at"]} (весь день; конец {event["end_at"]})'

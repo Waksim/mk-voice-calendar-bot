@@ -27,7 +27,7 @@ from .calendar import (
     CalendarWriteRejectedError,
     UpdatedCalendarEvent,
 )
-from .intent import validate_calendar_intent, validate_calendar_operation_plan
+from .intent import normalize_calendar_operation_plan
 
 
 _MAX_TURNS = 2
@@ -1652,7 +1652,7 @@ class CalendarOperationPipeline:
                 trusted_event_ids = tuple(
                     dict.fromkeys((*trusted_event_ids, *journal_target_ids))
                 )
-            normalized = validate_calendar_operation_plan(
+            normalized = normalize_calendar_operation_plan(
                 {
                     key: deepcopy(value)
                     for key, value in plan.items()
@@ -2381,38 +2381,11 @@ class CalendarOperationPipeline:
                     )
                     assert isinstance(parsed, datetime)
                     desired[field] = parsed.astimezone(configured_zone).isoformat()
-        complete = _event_payload(desired)
-        validation_timezone = (
-            self.timezone_name
-            if temporal_patch
-            else desired.get("timezone")
-        )
-        if validation_timezone is None:
-            # Google can return a valid offset-aware timed event without an
-            # IANA timezone.  A title/location-only patch must not relabel or
-            # rewrite its temporal fields merely to satisfy model-side schema.
-            start_value = _parse_temporal(
-                str(complete["start_at"]), all_day=bool(complete["all_day"])
-            )
-            end_value = _parse_temporal(
-                str(complete["end_at"]), all_day=bool(complete["all_day"])
-            )
-            if end_value <= start_value or end_value - start_value > timedelta(
-                days=366
-            ):
-                raise OperationStateError("Provider event has invalid temporal bounds")
-            validated = complete
-        else:
-            validated = validate_calendar_intent(
-                {
-                    "action": "create",
-                    "events": [complete],
-                    "clarification_question": None,
-                    "confidence": 1,
-                },
-                expected_timezone=str(validation_timezone),
-            )["events"][0]
-        desired.update(validated)
+        # The model patch was already decoded from structured output, and the
+        # Calendar adapter is the authority for provider semantics.  Do not
+        # revalidate the untouched provider snapshot here: Google/MCP may
+        # encode one instant with an offset different from the attached IANA
+        # zone, which must not block a description/location-only update.
         provider_patch: dict[str, Any] = {}
         explicit_fields = set(patch) | set(clear_fields)
         for field in ("title", "description", "location", "timezone"):

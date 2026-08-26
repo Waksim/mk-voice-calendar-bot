@@ -13,7 +13,7 @@ import unicodedata
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .intent import validate_calendar_operation_plan
+from .intent import normalize_calendar_operation_plan
 
 
 _MAX_INPUT_LENGTH = 1_000
@@ -174,7 +174,7 @@ def plan_fast_calendar_read(
         return None
     time_min, time_max = window
 
-    return validate_calendar_operation_plan(
+    return normalize_calendar_operation_plan(
         {
             "action": "read",
             "operations": [],

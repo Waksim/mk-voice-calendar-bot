@@ -794,7 +794,7 @@ def test_direct_api_does_not_retry_daily_quota_or_expose_secret():
     assert api_key not in str(raised.value)
 
 
-def test_direct_api_rejects_semantically_invalid_structured_output():
+def test_direct_api_delegates_semantically_invalid_structured_output():
     invalid = {
         "action": "create",
         "events": [],
@@ -816,7 +816,7 @@ def test_direct_api_rejects_semantically_invalid_structured_output():
                 timezone="Europe/Moscow",
                 client=http_client,
             )
-            await client.extract_event(
+            return await client.extract_event(
                 "Завтра встреча",
                 reference_time=datetime(
                     2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
@@ -824,8 +824,9 @@ def test_direct_api_rejects_semantically_invalid_structured_output():
                 account="personal",
             )
 
-    with pytest.raises(GeminiApiError):
-        asyncio.run(scenario())
+    result = asyncio.run(scenario())
+    assert result["action"] == "create"
+    assert result["events"] == []
 
 
 def test_cli_is_used_when_direct_api_validation_fails():

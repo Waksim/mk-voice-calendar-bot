@@ -26,8 +26,8 @@ import httpx
 from .intent import (
     CALENDAR_INTENT_SCHEMA,
     CALENDAR_OPERATION_SCHEMA,
-    validate_calendar_intent,
-    validate_calendar_operation_plan,
+    normalize_calendar_intent,
+    normalize_calendar_operation_plan,
 )
 
 
@@ -1362,7 +1362,7 @@ class GeminiApi:
             )
             raise GeminiApiError("Gemini API returned invalid structured JSON") from None
         try:
-            return validate_calendar_intent(
+            return normalize_calendar_intent(
                 structured_output,
                 expected_timezone=self.timezone,
             )
@@ -1476,7 +1476,7 @@ class GeminiApi:
             )
             raise GeminiApiError("Gemini API returned invalid structured JSON") from None
         try:
-            normalized = validate_calendar_operation_plan(
+            normalized = normalize_calendar_operation_plan(
                 structured_output,
                 _allowed_event_ids(application_state),
                 expected_timezone=self.timezone,
@@ -1941,7 +1941,7 @@ class GeminiCli:
         if status not in {"SUCCESS", "OK"}:
             raise GeminiCliError("Antigravity CLI did not complete successfully")
         try:
-            return validate_calendar_intent(
+            return normalize_calendar_intent(
                 envelope.get("structured_output"),
                 expected_timezone=self.timezone,
             )
@@ -2060,7 +2060,7 @@ class GeminiCli:
         if status not in {"SUCCESS", "OK"}:
             raise GeminiCliError("Antigravity CLI did not complete successfully")
         try:
-            normalized = validate_calendar_operation_plan(
+            normalized = normalize_calendar_operation_plan(
                 envelope.get("structured_output"),
                 _allowed_event_ids(application_state),
                 expected_timezone=self.timezone,

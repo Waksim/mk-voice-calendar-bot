@@ -3,6 +3,7 @@ import pytest
 from tg_voice_transcriber_bot.intent import (
     CALENDAR_OPERATION_SCHEMA,
     format_calendar_preview,
+    normalize_calendar_operation_plan,
     validate_calendar_intent,
     validate_calendar_operation_plan,
 )
@@ -157,6 +158,58 @@ def operation_plan(*operations):
         "clarification_question": None,
         "confidence": 0.94,
     }
+
+
+def test_runtime_normalizer_ignores_irrelevant_crud_fields_and_semantics():
+    update = update_operation(
+        patch={
+            "location": "https://meet.example/daily",
+            "start_at": "2026-08-24T17:00:00+02:00",
+            "end_at": "2026-08-24T16:00:00+02:00",
+            "recurrence_rrule": "provider decides whether this is valid",
+        },
+        clear_fields=["location"],
+    )
+    update["event"] = valid_event()["events"][0]
+    update["recurrence_scope"] = "model-specific-value"
+    deletion = delete_operation("second")
+    deletion["event"] = valid_event()["events"][0]
+    deletion["patch"] = {"title": "ignored"}
+    deletion["clear_fields"] = ["description"]
+    creation = create_operation()
+    creation["target_event_id"] = "ignored"
+    creation["patch"] = {"title": "ignored"}
+
+    normalized = normalize_calendar_operation_plan(
+        operation_plan(update, deletion, creation),
+        {"known-event", "second"},
+    )
+
+    normalized_update, normalized_delete, normalized_create = normalized[
+        "operations"
+    ]
+    assert normalized_update["event"] is None
+    assert normalized_update["recurrence_scope"] is None
+    assert normalized_update["patch"] == {
+        "start_at": "2026-08-24T17:00:00+02:00",
+        "end_at": "2026-08-24T16:00:00+02:00",
+        "recurrence_rrule": "provider decides whether this is valid",
+    }
+    assert normalized_update["clear_fields"] == ["location"]
+    assert normalized_delete["event"] is None
+    assert normalized_delete["patch"] is None
+    assert normalized_delete["clear_fields"] == []
+    assert normalized_create["target_event_id"] is None
+    assert normalized_create["patch"] is None
+
+
+def test_runtime_normalizer_keeps_mutation_target_authorization():
+    payload = operation_plan(
+        update_operation("not-visible", patch={"title": "Новое"})
+    )
+
+    with pytest.raises(ValueError, match="known calendar event"):
+        normalize_calendar_operation_plan(payload, {"visible"})
 
 
 def test_operation_schema_exposes_all_mutation_types_and_five_item_limit():

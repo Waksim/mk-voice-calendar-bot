@@ -359,7 +359,7 @@ def test_all_null_wire_patch_preserves_fields_while_clear_fields_stays_explicit(
     assert result["operations"][0]["clear_fields"] == ["description"]
 
 
-def test_all_null_wire_patch_without_clear_is_rejected_as_noop():
+def test_all_null_wire_patch_without_clear_is_accepted_as_noop():
     plan = deepcopy(CALENDAR_PLAN)
     plan["operations"][0]["patch"] = {
         key: None for key in plan["operations"][0]["patch"]
@@ -372,7 +372,7 @@ def test_all_null_wire_patch_without_clear_is_rejected_as_noop():
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler)
         ) as http_client:
-            await api(http_client).plan_calendar_actions(
+            return await api(http_client).plan_calendar_actions(
                 "Измени это событие",
                 reference_time=NOW,
                 account="personal",
@@ -384,8 +384,9 @@ def test_all_null_wire_patch_without_clear_is_rejected_as_noop():
                 recent_conversation=[],
             )
 
-    with pytest.raises(OpenRouterApiError, match="invalid calendar plan"):
-        asyncio.run(scenario())
+    result = asyncio.run(scenario())
+    assert result["operations"][0]["patch"] is None
+    assert result["operations"][0]["clear_fields"] == []
 
 
 def test_validate_checks_authenticated_key_then_public_model_metadata():

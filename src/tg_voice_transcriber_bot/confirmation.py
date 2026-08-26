@@ -14,7 +14,7 @@ import secrets
 from typing import Any, Callable, Literal, Mapping
 
 from .calendar import CalendarClient, CalendarConnectionError, CreatedCalendarEvent
-from .intent import validate_calendar_intent
+from .intent import normalize_calendar_intent
 
 
 CONFIDENCE_THRESHOLD = 0.85
@@ -234,7 +234,7 @@ class CalendarConfirmationPipeline:
         intent: Mapping[str, Any],
     ) -> PreparedConfirmation | None:
         """Persist one pending confirmation if confidence passes the hard gate."""
-        normalized = validate_calendar_intent(
+        normalized = normalize_calendar_intent(
             dict(intent), expected_timezone=self.timezone_name
         )
         if (
