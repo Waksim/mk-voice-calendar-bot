@@ -32,6 +32,7 @@ from .intent import (
 
 
 LOGGER = logging.getLogger("tg_voice_transcriber_bot.planner")
+PLANNER_MODEL_FIELD = "_planner_model"
 _DIAGNOSTIC_FINGERPRINT_KEY = os.urandom(32)
 _PLANNER_CALL_ID: ContextVar[str] = ContextVar(
     "calendar_planner_call_id", default="unbound"
@@ -262,6 +263,13 @@ class GeminiProviderChain:
             return bool(check())
         except OSError:
             return False
+
+    @staticmethod
+    def _selected_model_label(stage: GeminiProviderStage) -> str:
+        configured_model = getattr(stage.provider, "model", None)
+        if isinstance(configured_model, str) and configured_model.strip():
+            return f"{stage.name} ({configured_model.strip()})"
+        return stage.name
 
     @staticmethod
     def _timeout_error(stage: GeminiProviderStage) -> GeminiError:
@@ -530,6 +538,14 @@ class GeminiProviderChain:
                     time.monotonic() - chain_started,
                     ",".join(type(error).__name__ for error in errors) or "none",
                 )
+                if method == "plan_calendar_actions" and isinstance(
+                    result, Mapping
+                ):
+                    labeled_result = deepcopy(dict(result))
+                    labeled_result[PLANNER_MODEL_FIELD] = (
+                        self._selected_model_label(stage)
+                    )
+                    return labeled_result
                 return result
         LOGGER.warning(
             "AI planner chain exhausted; call_id=%s operation=%s providers=%s "

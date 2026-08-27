@@ -21,6 +21,7 @@ from tg_voice_transcriber_bot.gemini import (
     GeminiProviderChain,
     GeminiProviderStage,
     GeminiRateLimitError,
+    PLANNER_MODEL_FIELD,
     ProviderPermanentError,
     planner_diagnostic_context,
 )
@@ -1792,7 +1793,12 @@ def test_provider_chain_isolates_full_planner_context_between_stages():
             history_steps=history_steps,
         )
 
-    assert asyncio.run(scenario()) == CALENDAR_OPERATION_RESULT
+    result = asyncio.run(scenario())
+
+    assert result == {
+        **CALENDAR_OPERATION_RESULT,
+        PLANNER_MODEL_FIELD: "GLM 5.2 Free",
+    }
     assert observed == {
         "transcript": "Добавь место",
         "kwargs": {
@@ -1806,6 +1812,65 @@ def test_provider_chain_isolates_full_planner_context_between_stages():
     assert application_state == expected_application_state
     assert recent_conversation == expected_recent_conversation
     assert history_steps == expected_history_steps
+
+
+def test_provider_chain_labels_calendar_plan_with_actual_fallback_model():
+    calls = []
+
+    class FailedPrimary:
+        model = "nvidia/nemotron-3-super-120b-a12b:free"
+
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append(self.model)
+            raise GeminiError("primary failed")
+
+    class WorkingFallback:
+        model = "z-ai/glm-5.2:free"
+
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append(self.model)
+            return CALENDAR_OPERATION_RESULT
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage(
+                    "Nemotron 3 Super", FailedPrimary(), 0.1
+                ),
+                GeminiProviderStage(
+                    "GLM 5.2 Free", WorkingFallback(), 0.1
+                ),
+            ],
+            timeout_seconds=0.5,
+        )
+        return await chain.plan_calendar_actions(
+            "Добавь место",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+            application_state={
+                "allowed_event_ids": ["event-planning"],
+                "candidate_events": [],
+            },
+            recent_conversation=[],
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result[PLANNER_MODEL_FIELD] == (
+        "GLM 5.2 Free (z-ai/glm-5.2:free)"
+    )
+    assert {
+        key: value
+        for key, value in result.items()
+        if key != PLANNER_MODEL_FIELD
+    } == CALENDAR_OPERATION_RESULT
+    assert PLANNER_MODEL_FIELD not in CALENDAR_OPERATION_RESULT
+    assert calls == [
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "z-ai/glm-5.2:free",
+    ]
 
 
 def test_provider_chain_validation_succeeds_when_any_provider_is_available():

@@ -432,6 +432,13 @@ def _transcript_block(transcript: object, *, limit: int) -> str | None:
     )
 
 
+def _model_block(model_name: object | None) -> str | None:
+    cleaned = _clean_text(model_name) if model_name is not None else ""
+    if not cleaned:
+        return None
+    return f"🤖 Модель: <b>{_dynamic(cleaned, limit=100)}</b>"
+
+
 def format_operation_card(
     action: CalendarAction,
     events: Sequence[Mapping[str, Any]],
@@ -441,6 +448,7 @@ def format_operation_card(
     changes: Sequence[FieldChange | Mapping[str, Any]] = (),
     html_links: Sequence[str | None] | None = None,
     best_effort_undo: bool = False,
+    model_name: str | None = None,
 ) -> str:
     """Render a successful create, update, or delete operation."""
     if action not in _OPERATION_HEADERS:
@@ -486,6 +494,9 @@ def format_operation_card(
     )
     if transcript_block:
         parts.append(transcript_block)
+    model_block = _model_block(model_name)
+    if model_block:
+        parts.append(model_block)
     parts.append(f"⏱ Готово за <b>{format_duration(elapsed_seconds)}</b>")
     return _bounded("\n\n".join(parts))
 
@@ -496,6 +507,7 @@ def format_create_card(
     transcript: str,
     elapsed_seconds: float,
     html_links: Sequence[str | None] | None = None,
+    model_name: str | None = None,
 ) -> str:
     return format_operation_card(
         "create",
@@ -503,6 +515,7 @@ def format_create_card(
         transcript=transcript,
         elapsed_seconds=elapsed_seconds,
         html_links=html_links,
+        model_name=model_name,
     )
 
 
@@ -513,6 +526,7 @@ def format_update_card(
     elapsed_seconds: float,
     changes: Sequence[FieldChange | Mapping[str, Any]] = (),
     html_links: Sequence[str | None] | None = None,
+    model_name: str | None = None,
 ) -> str:
     return format_operation_card(
         "update",
@@ -521,6 +535,7 @@ def format_update_card(
         elapsed_seconds=elapsed_seconds,
         changes=changes,
         html_links=html_links,
+        model_name=model_name,
     )
 
 
@@ -530,6 +545,7 @@ def format_delete_card(
     transcript: str,
     elapsed_seconds: float,
     best_effort_undo: bool = False,
+    model_name: str | None = None,
 ) -> str:
     return format_operation_card(
         "delete",
@@ -537,6 +553,7 @@ def format_delete_card(
         transcript=transcript,
         elapsed_seconds=elapsed_seconds,
         best_effort_undo=best_effort_undo,
+        model_name=model_name,
     )
 
 
@@ -564,6 +581,7 @@ def format_read_card(
     elapsed_seconds: float,
     total_count: int | None = None,
     may_be_incomplete: bool = False,
+    model_name: str | None = None,
 ) -> str:
     """Render a bounded read-only Calendar result without an undo control."""
 
@@ -600,6 +618,9 @@ def format_read_card(
     transcript_block = _transcript_block(transcript, limit=450)
     if transcript_block:
         parts.append(transcript_block)
+    model_block = _model_block(model_name)
+    if model_block:
+        parts.append(model_block)
     parts.append(f"⏱ Готово за <b>{format_duration(elapsed_seconds)}</b>")
     return _bounded("\n\n".join(parts))
 
@@ -610,6 +631,7 @@ def format_lookup_clarify_card(
     *,
     transcript: str,
     elapsed_seconds: float,
+    model_name: str | None = None,
 ) -> str:
     """Show safe candidate summaries when a mutation target is ambiguous."""
 
@@ -637,6 +659,9 @@ def format_lookup_clarify_card(
     transcript_block = _transcript_block(transcript, limit=400)
     if transcript_block:
         parts.append(transcript_block)
+    model_block = _model_block(model_name)
+    if model_block:
+        parts.append(model_block)
     parts.append(f"⏱ Ответ за <b>{format_duration(elapsed_seconds)}</b>")
     return _bounded("\n\n".join(parts))
 
@@ -647,6 +672,7 @@ def format_mixed_operation_card(
     transcript: str,
     elapsed_seconds: float,
     best_effort_undo: bool = False,
+    model_name: str | None = None,
 ) -> str:
     """Render a bounded result for a batch containing different action types."""
     if isinstance(items, (str, bytes)) or not 1 <= len(items) <= MAX_EVENTS_PER_CARD:
@@ -686,6 +712,9 @@ def format_mixed_operation_card(
     transcript_block = _transcript_block(transcript, limit=300)
     if transcript_block:
         parts.append(transcript_block)
+    model_block = _model_block(model_name)
+    if model_block:
+        parts.append(model_block)
     parts.append(f"⏱ Готово за <b>{format_duration(elapsed_seconds)}</b>")
     return _bounded("\n\n".join(parts))
 
@@ -695,6 +724,7 @@ def format_clarify_card(
     *,
     transcript: str,
     elapsed_seconds: float,
+    model_name: str | None = None,
 ) -> str:
     cleaned_question = _clean_text(question, multiline=True)
     if not cleaned_question:
@@ -707,6 +737,9 @@ def format_clarify_card(
     transcript_block = _transcript_block(transcript, limit=650)
     if transcript_block:
         parts.append(transcript_block)
+    model_block = _model_block(model_name)
+    if model_block:
+        parts.append(model_block)
     parts.append(f"⏱ Ответ за <b>{format_duration(elapsed_seconds)}</b>")
     return _bounded("\n\n".join(parts))
 
@@ -715,6 +748,7 @@ def format_ignore_card(
     *,
     transcript: str,
     elapsed_seconds: float,
+    model_name: str | None = None,
 ) -> str:
     """Render a non-error response when no calendar command was present."""
     parts = [
@@ -724,6 +758,9 @@ def format_ignore_card(
     transcript_block = _transcript_block(transcript, limit=650)
     if transcript_block:
         parts.append(transcript_block)
+    model_block = _model_block(model_name)
+    if model_block:
+        parts.append(model_block)
     parts.append(f"⏱ Готово за <b>{format_duration(elapsed_seconds)}</b>")
     return _bounded("\n\n".join(parts))
 
@@ -734,6 +771,7 @@ def format_error_card(
     transcript: str | None = None,
     elapsed_seconds: float | None = None,
     calendar_unchanged: bool = True,
+    model_name: str | None = None,
 ) -> str:
     cleaned_message = _clean_text(message, multiline=True)
     if not cleaned_message:
@@ -750,6 +788,9 @@ def format_error_card(
         transcript_block = _transcript_block(transcript, limit=650)
         if transcript_block:
             parts.append(transcript_block)
+    model_block = _model_block(model_name)
+    if model_block:
+        parts.append(model_block)
     if elapsed_seconds is not None:
         parts.append(f"⏱ Остановлено через <b>{format_duration(elapsed_seconds)}</b>")
     return _bounded("\n\n".join(parts))

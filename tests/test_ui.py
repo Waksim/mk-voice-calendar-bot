@@ -202,6 +202,88 @@ def test_ignore_card_uses_provider_neutral_copy():
     assert "Gemini" not in card
 
 
+def test_model_badge_is_escaped_and_precedes_timing_in_every_result_card():
+    model_name = 'Gemini </b><script>alert("x")</script> & Co'
+    escaped_badge = (
+        "🤖 Модель: <b>Gemini &lt;/b&gt;&lt;script&gt;alert(&quot;x&quot;)"
+        "&lt;/script&gt; &amp; Co</b>"
+    )
+    cards = [
+        format_create_card(
+            [event()],
+            transcript="Создай встречу",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+        format_update_card(
+            [event()],
+            transcript="Измени встречу",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+        format_delete_card(
+            [event()],
+            transcript="Удали встречу",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+        format_mixed_operation_card(
+            [{"type": "create", "event": event()}],
+            transcript="Обнови календарь",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+        format_read_card(
+            [event()],
+            transcript="Что в календаре?",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+        format_lookup_clarify_card(
+            "Какое событие?",
+            [event()],
+            transcript="Перенеси встречу",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+        format_clarify_card(
+            "Во сколько?",
+            transcript="Создай встречу",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+        format_ignore_card(
+            transcript="Привет",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+        format_error_card(
+            "Google Calendar отклонил операцию",
+            transcript="Создай встречу",
+            elapsed_seconds=1,
+            model_name=model_name,
+        ),
+    ]
+
+    for card in cards:
+        assert escaped_badge in card
+        assert model_name not in card
+        assert card.index("💬 Команда") < card.index(escaped_badge)
+        assert card.index(escaped_badge) < card.index("⏱")
+        assert utf16_units(ui._visible_text(card)) <= 4096
+
+
+def test_empty_model_name_does_not_render_a_model_badge():
+    card = format_create_card(
+        [event()],
+        transcript="Создай встречу",
+        elapsed_seconds=1,
+        model_name="   ",
+    )
+
+    assert "🤖 Модель:" not in card
+
+
 def test_mixed_batch_has_one_bounded_card_and_generic_undo():
     card = format_mixed_operation_card(
         [

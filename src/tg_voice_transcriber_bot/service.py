@@ -39,6 +39,7 @@ from .gemini import (
     GeminiProviderChain,
     GeminiProviderStage,
     GeminiRateLimitError,
+    PLANNER_MODEL_FIELD,
     planner_diagnostic_context,
 )
 from .intent import format_calendar_preview
@@ -107,10 +108,33 @@ _MODEL_TITLE_LIMIT = 300
 _MODEL_LOCATION_LIMIT = 300
 _MODEL_DESCRIPTION_LIMIT = 500
 _MODEL_RECURRENCE_LIMIT = 500
+_FAST_READ_MODEL_LABEL = "Без LLM · быстрый разбор"
 
 
 class _UnknownEventReference(ValueError):
     """The model selected an event reference outside the server allowlist."""
+
+
+def _planner_model_name(value: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    model_name = value.get(PLANNER_MODEL_FIELD)
+    if not isinstance(model_name, str) or not model_name.strip():
+        return None
+    return model_name.strip()
+
+
+def _job_planner_model(job: Mapping[str, Any]) -> str | None:
+    model_name = job.get("planner_model")
+    if isinstance(model_name, str) and model_name.strip():
+        return model_name.strip()
+    for key in ("resolved_plan", "plan"):
+        candidate = job.get(key)
+        if isinstance(candidate, Mapping):
+            model_name = _planner_model_name(candidate)
+            if model_name is not None:
+                return model_name
+    return None
 
 
 def message_command(text: str) -> str:
@@ -232,7 +256,11 @@ def _record_undo_is_best_effort(record: Mapping[str, Any]) -> bool:
 
 
 def _success_card(
-    record: dict[str, Any], *, transcript: str, elapsed_seconds: float
+    record: dict[str, Any],
+    *,
+    transcript: str,
+    elapsed_seconds: float,
+    model_name: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     action = _record_action(record)
     events = _record_events(record)
@@ -240,7 +268,10 @@ def _success_card(
     best_effort_undo = _record_undo_is_best_effort(record)
     if action == "create":
         html = format_create_card(
-            events, transcript=transcript, elapsed_seconds=elapsed_seconds
+            events,
+            transcript=transcript,
+            elapsed_seconds=elapsed_seconds,
+            model_name=model_name,
         )
     elif action == "update":
         html = format_update_card(
@@ -248,6 +279,7 @@ def _success_card(
             transcript=transcript,
             elapsed_seconds=elapsed_seconds,
             changes=_record_changes(record),
+            model_name=model_name,
         )
     elif action == "delete":
         html = format_delete_card(
@@ -255,6 +287,7 @@ def _success_card(
             transcript=transcript,
             elapsed_seconds=elapsed_seconds,
             best_effort_undo=best_effort_undo,
+            model_name=model_name,
         )
     else:
         mixed_items = [
@@ -274,6 +307,7 @@ def _success_card(
             transcript=transcript,
             elapsed_seconds=elapsed_seconds,
             best_effort_undo=best_effort_undo,
+            model_name=model_name,
         )
     return html, undo_reply_markup(  # type: ignore[arg-type]
         operation_id,
@@ -1356,7 +1390,9 @@ class VoiceBotService:
             )
             if fast_plan is not None:
                 # Exact, bounded read phrases do not need an LLM round trip.
+                fast_plan[PLANNER_MODEL_FIELD] = _FAST_READ_MODEL_LABEL
                 job["plan"] = fast_plan
+                job["planner_model"] = _FAST_READ_MODEL_LABEL
                 job["fast_read"] = True
                 job["status"] = "planned"
                 self.state.save_job(update_id, job)
@@ -1394,6 +1430,9 @@ class VoiceBotService:
                             recent_conversation=context.recent_conversation,
                             history_steps=context.history_steps,
                         )
+                    selected_model = _planner_model_name(plan)
+                    if selected_model is not None:
+                        job["planner_model"] = selected_model
                     plan = _resolve_plan_event_references(
                         plan,
                         context.event_id_by_ref,
@@ -1419,6 +1458,7 @@ class VoiceBotService:
                         "Уточните его название или время новым сообщением.",
                         transcript=transcript,
                         elapsed_seconds=self._elapsed(job),
+                        model_name=_job_planner_model(job),
                     )
                     job["final_reply_markup"] = None
                     job["status"] = "final_ready"
@@ -1496,6 +1536,7 @@ class VoiceBotService:
                         str(exc),
                         transcript=str(job["transcript"]),
                         elapsed_seconds=self._elapsed(job),
+                        model_name=_job_planner_model(job),
                     )
                     job["final_reply_markup"] = None
                     job["status"] = "final_ready"
@@ -1547,6 +1588,7 @@ class VoiceBotService:
                 elapsed_seconds=self._elapsed(job),
                 total_count=int(result.get("total_count", len(events))),
                 may_be_incomplete=bool(result.get("may_be_incomplete")),
+                model_name=_job_planner_model(job),
             )
             job["final_reply_markup"] = None
             job["status"] = "final_ready"
@@ -1670,6 +1712,9 @@ class VoiceBotService:
                         recent_conversation=context.recent_conversation,
                         history_steps=native_history,
                     )
+                selected_model = _planner_model_name(resolved_plan)
+                if selected_model is not None:
+                    job["planner_model"] = selected_model
                 resolved_plan = _resolve_plan_event_references(
                     resolved_plan,
                     lookup_event_id_by_ref,
@@ -1691,6 +1736,7 @@ class VoiceBotService:
                     "его название или время новым сообщением.",
                     transcript=transcript,
                     elapsed_seconds=self._elapsed(job),
+                    model_name=_job_planner_model(job),
                 )
                 job["final_reply_markup"] = None
                 job["status"] = "final_ready"
@@ -1713,6 +1759,7 @@ class VoiceBotService:
                 job["status"] = "final_ready"
             else:
                 if resolved_plan.get("action") in {"read", "lookup"}:
+                    selected_model = _planner_model_name(resolved_plan)
                     resolved_plan = {
                         "action": "clarify",
                         "operations": [],
@@ -1728,6 +1775,7 @@ class VoiceBotService:
                         "_interaction_steps": resolved_plan.get(
                             "_interaction_steps"
                         ),
+                        PLANNER_MODEL_FIELD: selected_model,
                     }
                 job["resolved_plan"] = resolved_plan
                 job["status"] = "calendar_lookup_planned"
@@ -1847,6 +1895,7 @@ class VoiceBotService:
                         transcript=transcript,
                         elapsed_seconds=self._elapsed(job),
                         calendar_unchanged=False,
+                        model_name=_job_planner_model(job),
                     )
                     job["final_reply_markup"] = None
                 else:
@@ -1862,6 +1911,7 @@ class VoiceBotService:
                         calendar_unchanged=not (
                             exc.partially_applied or exc.outcome_uncertain
                         ),
+                        model_name=_job_planner_model(job),
                     )
                     job["final_reply_markup"] = None
             else:
@@ -1872,6 +1922,7 @@ class VoiceBotService:
                         execution.record,
                         transcript=transcript,
                         elapsed_seconds=self._elapsed(job),
+                        model_name=_job_planner_model(job),
                     )
                     job["final_html"] = html_text
                     job["final_reply_markup"] = reply_markup
@@ -1887,12 +1938,14 @@ class VoiceBotService:
                             candidates,
                             transcript=transcript,
                             elapsed_seconds=self._elapsed(job),
+                            model_name=_job_planner_model(job),
                         )
                         if candidates
                         else format_clarify_card(
                             question,
                             transcript=transcript,
                             elapsed_seconds=self._elapsed(job),
+                            model_name=_job_planner_model(job),
                         )
                     )
                     job["final_reply_markup"] = None
@@ -1900,6 +1953,7 @@ class VoiceBotService:
                     job["final_html"] = format_ignore_card(
                         transcript=transcript,
                         elapsed_seconds=self._elapsed(job),
+                        model_name=_job_planner_model(job),
                     )
                     job["final_reply_markup"] = None
             job["status"] = "final_ready"
