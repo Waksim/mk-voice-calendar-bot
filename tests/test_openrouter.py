@@ -328,6 +328,125 @@ def test_planner_converts_safe_history_and_never_sends_or_returns_thoughts():
     ]
 
 
+def test_planner_sends_same_separate_image_observation_envelope():
+    observed = {}
+    observation = {
+        "description": "Скриншот приложения с подтверждением брони",
+        "visible_text": "Сб 29 августа | 8:00–10:00\nLunda Padel",
+        "source": "telegram_document",
+        "mode": "vision_description_and_ocr",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed["payload"] = json.loads(request.content)
+        return httpx.Response(200, json=completion(CALENDAR_PLAN))
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            return await api(http_client).plan_calendar_actions(
+                "Добавь это в календарь",
+                reference_time=NOW,
+                account="personal",
+                application_state={
+                    "allowed_event_ids": ["e1"],
+                    "candidate_events": [{"event_id": "e1"}],
+                    "lookup_permitted": False,
+                },
+                recent_conversation=[],
+                input_kind="text_and_image",
+                image_observations=[observation],
+            )
+
+    asyncio.run(scenario())
+    current_text = observed["payload"]["messages"][-1]["content"]
+    latest_json = current_text.partition(
+        '<latest_user_message format="application/json" trust="untrusted">\n'
+    )[2].partition("\n</latest_user_message>")[0]
+    observations_json = current_text.partition(
+        '<image_observations format="application/json" trust="untrusted" role="evidence_only">\n'
+    )[2].partition("\n</image_observations>")[0]
+
+    assert json.loads(latest_json) == {
+        "input_kind": "text_and_image",
+        "transcript": "Добавь это в календарь",
+    }
+    assert json.loads(observations_json) == [observation]
+    assert "<image_observations>" in observed["payload"]["messages"][0]["content"]
+
+
+def test_planner_reuses_image_evidence_from_exact_lookup_history():
+    payloads = []
+    observation = {
+        "description": "Скриншот подтверждения брони",
+        "visible_text": "Сб 29 августа | 8:00–10:00\nLunda Padel",
+        "source": "telegram_photo",
+        "mode": "vision_description_and_ocr",
+    }
+    lookup_plan = {
+        "action": "lookup",
+        "operations": [],
+        "lookup": {
+            "query": "Lunda Padel",
+            "time_min": "2026-08-25T00:00:00+03:00",
+            "time_max": "2026-09-01T00:00:00+03:00",
+        },
+        "clarification_question": None,
+        "confidence": 0.9,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        result = lookup_plan if len(payloads) == 1 else CALENDAR_PLAN
+        return httpx.Response(200, json=completion(result))
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            client = api(http_client)
+            first = await client.plan_calendar_actions(
+                "",
+                reference_time=NOW,
+                account="personal",
+                application_state={"allowed_event_ids": []},
+                recent_conversation=[],
+                input_kind="image",
+                image_observations=[observation],
+            )
+            history = [first["_interaction_input"], *first["_interaction_steps"]]
+            await client.plan_calendar_actions(
+                "",
+                reference_time=NOW,
+                account="personal",
+                application_state={
+                    "allowed_event_ids": ["e1"],
+                    "lookup_permitted": False,
+                },
+                recent_conversation=[],
+                history_steps=history,
+                input_kind="image",
+                image_observations=[observation],
+            )
+
+    asyncio.run(scenario())
+    first_text = payloads[1]["messages"][1]["content"]
+    current_text = payloads[1]["messages"][-1]["content"]
+    first_observations = first_text.partition(
+        '<image_observations format="application/json" trust="untrusted" '
+        'role="evidence_only">\n'
+    )[2].partition("\n</image_observations>")[0]
+    current_observations = current_text.partition(
+        '<image_observations format="application/json" trust="untrusted" '
+        'role="evidence_only">\n'
+    )[2].partition("\n</image_observations>")[0]
+
+    assert json.loads(first_observations) == [observation]
+    assert json.loads(current_observations) == []
+    assert '"image_evidence_in_history":true' in current_text
+
+
 def test_all_null_wire_patch_preserves_fields_while_clear_fields_stays_explicit():
     plan = deepcopy(CALENDAR_PLAN)
     plan["operations"][0]["patch"] = {

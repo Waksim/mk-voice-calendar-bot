@@ -1,7 +1,8 @@
-# Telegram Voice/Text → Google Calendar
+# Telegram Voice/Text/Image → Google Calendar
 
 Бот `@mk_voice_text_bot` только для владельца и двух его аккаунтов. Он принимает
-обычную текстовую календарную команду либо голосовое через Bot API. Голосовое
+обычную текстовую календарную команду, голосовое либо скриншот/изображение через
+Bot API. Голосовое
 сопоставляется с исходящим сообщением в выбранной пользовательской сессии и
 расшифровывается вызовом Telegram MTProto `messages.transcribeAudio`; файл не
 скачивается, распознавание выполняется на серверах Telegram. Текст сразу
@@ -102,6 +103,40 @@ OpenRouter для `:free`-моделей не требуется, однако A
 `OPENROUTER_MAX_TOKENS` (по умолчанию 8192). Stage timeout ограничивает один
 сетевой вызов, а общий planner timeout — всю последовательность fallback.
 
+## Скриншоты и изображения
+
+Изображение проходит отдельный observation-only конвейер. Vision-модели не
+выделяют `start`, `end`, адрес или готовую календарную операцию: они возвращают
+только нейтральное описание и максимально буквальную расшифровку видимого
+текста. Эти два поля передаются в уже существующий planner как недоверенное
+содержимое изображения вместе с подписью пользователя, если она есть. Решение о
+CRUD, датах, времени и намерении пользователя по-прежнему принимает цепочка
+Nemotron → GLM → Gemini.
+
+Vision-провайдеры вызываются по одному, без общего дедлайна между ступенями:
+
+1. OpenRouter `google/gemma-4-31b-it:free`, timeout 15 секунд;
+2. OpenRouter `google/gemma-4-26b-a4b-it:free`, timeout 12 секунд;
+3. direct Gemini API `gemini-3.7-flash`, timeout 20 секунд;
+4. обязательный локальный RapidOCR 3 / ONNX Runtime с PP-OCRv5 Cyrillic и
+   резервным ESLAV, timeout 15 секунд.
+
+Локальная ступень является терминальным OCR-fallback: она восстанавливает
+видимый текст, но не придумывает семантическое описание. Production-образ заранее
+загружает обе кириллические модели в `/opt/rapidocr-models` и делает каталог
+read-only, поэтому контейнеру не нужен доступ к сети или writable `$HOME` для
+первого OCR-вызова.
+
+По умолчанию принимается не более 8 MiB encoded image и 20 миллионов пикселей.
+Описание ограничено 4000 символами, видимый текст — 12000 символами. Пределы и
+timeouts настраиваются через `OPENROUTER_VISION_MODEL`,
+`OPENROUTER_VISION_TIMEOUT_SECONDS`, `OPENROUTER_VISION_FALLBACK_MODEL`,
+`OPENROUTER_VISION_FALLBACK_TIMEOUT_SECONDS`, `GEMINI_VISION_MODEL`,
+`GEMINI_VISION_TIMEOUT_SECONDS`, `VISION_LOCAL_OCR_TIMEOUT_SECONDS`,
+`VISION_MAX_IMAGE_BYTES`, `VISION_MAX_IMAGE_PIXELS`,
+`VISION_MAX_DESCRIPTION_CHARS`, `VISION_MAX_VISIBLE_TEXT_CHARS` и
+`VISION_OCR_MODEL_DIR`.
+
 ## Безопасность
 
 - Production-секреты не хранятся в GitHub. Они монтируются read-only из
@@ -124,6 +159,9 @@ OpenRouter для `:free`-моделей не требуется, однако A
 - Тексты расшифровок не пишутся в service logs. Две последние пары хранятся в
   journal с правами `0600`; модель получает только их компактное
   структурированное представление и короткие ссылки на события.
+- Байты изображений, их description и OCR-текст не пишутся в service logs.
+  Логи Vision содержат только имя провайдера/модели, размеры, длительность и
+  тип безопасной ошибки.
 
 ## Разработка и деплой
 

@@ -31,6 +31,18 @@ services:
       OPENROUTER_API_KEY_FILE: /run/secrets/openrouter-api-key
       # Direct Gemini Developer API is the final planner fallback.
       GEMINI_API_KEY_FILE: /run/secrets/gemini-api-key
+      OPENROUTER_VISION_MODEL: google/gemma-4-31b-it:free
+      OPENROUTER_VISION_TIMEOUT_SECONDS: "15"
+      OPENROUTER_VISION_FALLBACK_MODEL: google/gemma-4-26b-a4b-it:free
+      OPENROUTER_VISION_FALLBACK_TIMEOUT_SECONDS: "12"
+      GEMINI_VISION_MODEL: gemini-3.7-flash
+      GEMINI_VISION_TIMEOUT_SECONDS: "20"
+      VISION_LOCAL_OCR_TIMEOUT_SECONDS: "15"
+      VISION_MAX_IMAGE_BYTES: "8388608"
+      VISION_MAX_IMAGE_PIXELS: "20000000"
+      VISION_MAX_DESCRIPTION_CHARS: "4000"
+      VISION_MAX_VISIBLE_TEXT_CHARS: "12000"
+      VISION_OCR_MODEL_DIR: /opt/rapidocr-models
       TELEGRAM_GATEWAY_LAUNCHER: /app/deploy/server/telegram-gateway
       TELEGRAM_API_ID_FILE: /run/secrets/telegram-api-id
       TELEGRAM_API_HASH_FILE: /run/secrets/telegram-api-hash
@@ -55,7 +67,7 @@ services:
     network_mode: service:warp
     read_only: true
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=128m
+      - /tmp:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=256m
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -72,8 +84,8 @@ services:
       start_period: 45s
     stop_grace_period: 30s
     pids_limit: 256
-    mem_limit: 768m
-    cpus: 1.5
+    mem_limit: 1536m
+    cpus: 2.0
     logging:
       driver: json-file
       options:

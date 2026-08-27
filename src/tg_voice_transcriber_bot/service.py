@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from .bot_api import BotApi, BotApiError, read_secret
+from .bot_api import BotApi, BotApiError, BotApiFileError, read_secret
 from .calendar import (
     CalendarClient,
     CalendarConnectionError,
@@ -73,6 +73,13 @@ from .ui import (
     parse_undo_callback,
     undo_reply_markup,
 )
+from .vision import (
+    GeminiVisionProvider,
+    OpenAICompatibleVisionProvider,
+    RapidOcrProvider,
+    VisionProviderChain,
+    VisionStage,
+)
 from .webhook import WebhookRuntime
 
 LOGGER = logging.getLogger("tg_voice_transcriber_bot")
@@ -87,7 +94,8 @@ START_TEXT = (
 )
 
 START_TEXT_V2 = (
-    "Пришлите голосовое сообщение или напишите календарную команду текстом. "
+    "Пришлите голосовое, напишите календарную команду текстом или "
+    "отправьте один скриншот. "
     "Голосовое Telegram расшифрует на своих серверах, а ИИ-планировщик "
     "с учётом последних команд сразу добавит, изменит или удалит событие в "
     "основном Google Calendar. Вы увидите ход обработки в одном обновляемом "
@@ -109,10 +117,166 @@ _MODEL_LOCATION_LIMIT = 300
 _MODEL_DESCRIPTION_LIMIT = 500
 _MODEL_RECURRENCE_LIMIT = 500
 _FAST_READ_MODEL_LABEL = "Без LLM · быстрый разбор"
+_IMAGE_INPUT_KINDS = frozenset({"image", "text_and_image"})
+_SUPPORTED_TELEGRAM_IMAGE_MIME_TYPES = frozenset(
+    {"image/jpeg", "image/png", "image/webp"}
+)
+_PLANNER_IMAGE_DESCRIPTION_BYTES = 1_536
+_PLANNER_IMAGE_VISIBLE_TEXT_BYTES = 6_656
 
 
 class _UnknownEventReference(ValueError):
     """The model selected an event reference outside the server allowlist."""
+
+
+def _nonnegative_telegram_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _telegram_image(message: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the largest Telegram photo or one image document."""
+
+    raw_photos = message.get("photo")
+    if isinstance(raw_photos, Sequence) and not isinstance(
+        raw_photos, (str, bytes, bytearray)
+    ):
+        photos = [
+            item
+            for item in raw_photos
+            if isinstance(item, Mapping)
+            and isinstance(item.get("file_id"), str)
+            and str(item["file_id"]).strip()
+        ]
+        if photos:
+
+            def photo_rank(item: Mapping[str, Any]) -> tuple[int, int]:
+                width = _nonnegative_telegram_int(item.get("width")) or 0
+                height = _nonnegative_telegram_int(item.get("height")) or 0
+                file_size = _nonnegative_telegram_int(item.get("file_size")) or 0
+                return width * height, file_size
+
+            largest = max(
+                photos,
+                key=photo_rank,
+            )
+            file_size = _nonnegative_telegram_int(largest.get("file_size"))
+            return {
+                "file_id": str(largest["file_id"]),
+                "mime_type": "image/jpeg",
+                "file_size": file_size,
+            }
+
+    document = message.get("document")
+    if not isinstance(document, Mapping):
+        return None
+    mime_type = document.get("mime_type")
+    file_id = document.get("file_id")
+    if (
+        not isinstance(mime_type, str)
+        or mime_type.casefold() not in _SUPPORTED_TELEGRAM_IMAGE_MIME_TYPES
+        or not isinstance(file_id, str)
+        or not file_id.strip()
+    ):
+        return None
+    file_size = _nonnegative_telegram_int(document.get("file_size"))
+    return {
+        "file_id": file_id,
+        "mime_type": mime_type.casefold(),
+        "file_size": file_size,
+    }
+
+
+def _vision_observation(result: Any) -> tuple[dict[str, str], str | None]:
+    """Convert a VisionResult-like value into bounded durable planner input."""
+
+    def value(name: str, limit: int) -> str:
+        raw = (
+            result.get(name)
+            if isinstance(result, Mapping)
+            else getattr(result, name, "")
+        )
+        return str(raw or "").strip()[:limit]
+
+    description = value("description", 4_000)
+    visible_text = value("visible_text", 16_000)
+    provider = value("provider", 128) or "unknown"
+    model = value("model", 200) or None
+    used_local_ocr = (
+        result.get("used_local_ocr")
+        if isinstance(result, Mapping)
+        else getattr(result, "used_local_ocr", False)
+    )
+    return (
+        {
+            "description": description,
+            "visible_text": visible_text,
+            "source": provider,
+            "mode": "local_ocr" if used_local_ocr is True else "vision",
+        },
+        model,
+    )
+
+
+def _job_image_observations(job: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    raw = job.get("image_observations", [])
+    if not isinstance(raw, list) or any(not isinstance(item, Mapping) for item in raw):
+        raise RuntimeError("Persisted image observations are invalid")
+    bounded: list[dict[str, Any]] = []
+    for item in raw:
+        copied = deepcopy(dict(item))
+        description = copied.get("description")
+        visible_text = copied.get("visible_text")
+        if isinstance(description, str):
+            copied["description"] = _truncate_utf8(
+                description, _PLANNER_IMAGE_DESCRIPTION_BYTES
+            )
+        if isinstance(visible_text, str):
+            copied["visible_text"] = _truncate_utf8(
+                visible_text, _PLANNER_IMAGE_VISIBLE_TEXT_BYTES
+            )
+        bounded.append(copied)
+    return tuple(bounded)
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    marker = "\n[… сокращено …]"
+    marker_bytes = marker.encode("utf-8")
+    prefix = encoded[: max(0, max_bytes - len(marker_bytes))]
+    return prefix.decode("utf-8", errors="ignore").rstrip() + marker
+
+
+def _job_memory_text(job: Mapping[str, Any]) -> str:
+    """Keep bounded image evidence in durable follow-up conversation memory."""
+
+    transcript = str(job.get("transcript") or "").strip()
+    source_kind = job.get("source_input_kind", job.get("input_kind"))
+    if source_kind not in _IMAGE_INPUT_KINDS:
+        return transcript
+
+    evidence: list[str] = []
+    for observation in _job_image_observations(job):
+        description = str(observation.get("description") or "").strip()[:150]
+        visible_text = str(observation.get("visible_text") or "").strip()[:650]
+        if visible_text:
+            evidence.append(f"Видимый текст: {visible_text}")
+        if description:
+            evidence.append(f"Описание: {description}")
+
+    parts: list[str] = []
+    if transcript:
+        # Preserve room for OCR facts needed by follow-ups even when the caption
+        # itself is long. The full current-turn evidence remains in the durable
+        # planner interaction; this is only compact cross-turn memory.
+        parts.append(transcript[:300] if evidence else transcript)
+    if evidence:
+        parts.append("Данные изображения:\n" + "\n".join(evidence))
+    memory = "\n\n".join(parts)
+    return memory if len(memory) <= 1_000 else memory[:999].rstrip() + "…"
 
 
 def _planner_model_name(value: Mapping[str, Any] | None) -> str | None:
@@ -196,6 +360,79 @@ def build_calendar_operations(
         calendar,
         timezone_name=config.calendar_timezone,
     )
+
+
+def build_vision_pipeline(
+    config: Config,
+    *,
+    openrouter_api_key: str | None,
+    gemini_api_key: str | None,
+) -> VisionProviderChain:
+    """Build cloud narration fallbacks followed by mandatory local OCR."""
+
+    stages: list[VisionStage] = []
+    if openrouter_api_key is not None:
+        endpoint_url = "https://openrouter.ai/api/v1/chat/completions"
+        stages.extend(
+            (
+                VisionStage(
+                    OpenAICompatibleVisionProvider(
+                        openrouter_api_key,
+                        endpoint_url=endpoint_url,
+                        provider_name="OpenRouter Vision",
+                        model=config.openrouter_vision_model,
+                        timeout_seconds=config.openrouter_vision_timeout_seconds,
+                        # The current free Gemma endpoints expose JSON mode but
+                        # do not guarantee strict-schema enforcement. The local
+                        # parser still rejects every field outside our neutral
+                        # description/visible_text contract.
+                        strict_json_schema=False,
+                    ),
+                    config.openrouter_vision_timeout_seconds,
+                ),
+                VisionStage(
+                    OpenAICompatibleVisionProvider(
+                        openrouter_api_key,
+                        endpoint_url=endpoint_url,
+                        provider_name="OpenRouter Vision",
+                        model=config.openrouter_vision_fallback_model,
+                        timeout_seconds=(
+                            config.openrouter_vision_fallback_timeout_seconds
+                        ),
+                        strict_json_schema=False,
+                    ),
+                    config.openrouter_vision_fallback_timeout_seconds,
+                ),
+            )
+        )
+    if gemini_api_key is not None:
+        stages.append(
+            VisionStage(
+                GeminiVisionProvider(
+                    gemini_api_key,
+                    model=config.gemini_vision_model,
+                    timeout_seconds=config.gemini_vision_timeout_seconds,
+                ),
+                config.gemini_vision_timeout_seconds,
+            )
+        )
+
+    pipeline = VisionProviderChain(
+        stages,
+        local_ocr=RapidOcrProvider(
+            model_root_dir=config.vision_ocr_model_dir,
+        ),
+        local_timeout_seconds=config.vision_local_ocr_timeout_seconds,
+        max_image_bytes=config.vision_max_image_bytes,
+        max_pixels=config.vision_max_image_pixels,
+        max_description_chars=config.vision_max_description_chars,
+        max_visible_text_chars=config.vision_max_visible_text_chars,
+    )
+    LOGGER.info(
+        "Image understanding configured; cloud_stages=%d local_ocr=enabled",
+        len(stages),
+    )
+    return pipeline
 
 
 def _record_action(record: dict[str, Any]) -> str:
@@ -702,6 +939,7 @@ class VoiceBotService:
         gemini: GeminiProvider,
         calendar_confirmation: CalendarConfirmationPipeline | None = None,
         calendar_operations: CalendarOperationPipeline | None = None,
+        vision: Any | None = None,
     ) -> None:
         self.config = config
         self.bot = bot
@@ -710,6 +948,7 @@ class VoiceBotService:
         self.gemini = gemini
         self.calendar_confirmation = calendar_confirmation
         self.calendar_operations = calendar_operations
+        self.vision = vision
         self.gemini_available = True
         self.enabled_accounts: frozenset[str] | None = None
 
@@ -770,6 +1009,10 @@ class VoiceBotService:
                 type(exc).__name__,
                 str(exc),
             )
+        if self.vision is not None:
+            validate_vision = getattr(self.vision, "validate", None)
+            if validate_vision is not None:
+                await validate_vision()
         LOGGER.info(
             "Bot, %d user session(s), and local integrations validated",
             len(available_accounts),
@@ -898,10 +1141,10 @@ class VoiceBotService:
                 f"Доступ подтверждён: {label} аккаунт. {telegram_status}. "
                 f"{gemini_status}. {calendar_status}."
                 + (
-                    " Пришлите голосовое сообщение или текстовую команду."
+                    " Пришлите голосовое, текстовую команду или один скриншот."
                     if self.enabled_accounts is None
                     or account in self.enabled_accounts
-                    else " Текстовые команды доступны без Telegram-сессии."
+                    else " Текстовые команды и скриншоты доступны без Telegram-сессии."
                 ),
                 reply_to_message_id=bot_message_id,
             )
@@ -923,12 +1166,47 @@ class VoiceBotService:
             )
             return
 
+        image = _telegram_image(message)
+        if image is not None:
+            if self.calendar_operations is None:
+                await self.bot.send_text(
+                    chat_id,
+                    "Обработка скриншотов доступна только в режиме Google Calendar.",
+                    reply_to_message_id=bot_message_id,
+                )
+                return
+            if message.get("media_group_id") is not None:
+                await self.bot.send_text(
+                    chat_id,
+                    "Пока отправьте один скриншот отдельным сообщением, не альбомом.",
+                    reply_to_message_id=bot_message_id,
+                )
+                return
+            raw_caption = message.get("caption")
+            caption = raw_caption if isinstance(raw_caption, str) else ""
+            await self._process_image_v2(
+                update_id=update_id,
+                account=account,
+                chat_id=chat_id,
+                bot_message_id=bot_message_id,
+                sent_at=int(message.get("date", 0) or 0),
+                file_id=str(image["file_id"]),
+                mime_type=str(image["mime_type"]),
+                file_size=(
+                    int(image["file_size"])
+                    if image.get("file_size") is not None
+                    else None
+                ),
+                caption=caption,
+            )
+            return
+
         voice = message.get("voice")
         if not isinstance(voice, dict):
             await self.bot.send_text(
                 chat_id,
                 "Пришлите голосовое сообщение, записанное в Telegram, или "
-                "напишите календарную команду текстом.",
+                "напишите календарную команду текстом или отправьте один скриншот.",
                 reply_to_message_id=bot_message_id,
             )
             return
@@ -1198,6 +1476,60 @@ class VoiceBotService:
         job["status"] = "sent"
         self.state.save_job(update_id, job)
 
+    async def _process_image_v2(
+        self,
+        *,
+        update_id: int,
+        account: str,
+        chat_id: int,
+        bot_message_id: int,
+        sent_at: int,
+        file_id: str,
+        mime_type: str,
+        file_size: int | None,
+        caption: str,
+    ) -> None:
+        """Download and understand one Telegram image before shared planning."""
+
+        input_kind = "text_and_image" if caption.strip() else "image"
+        job = self.state.job(update_id)
+        if job is None:
+            job = {
+                "account": account,
+                # Images do not advance the MTProto voice matching cursor.
+                "user_message_id": 0,
+                "sent_at": sent_at,
+                "started_at": time.time(),
+                "started_monotonic": time.monotonic(),
+                "input_kind": input_kind,
+                "source_input_kind": input_kind,
+                "transcript": caption,
+                "image_file_id": file_id,
+                "image_mime_type": mime_type,
+                "image_file_size": file_size,
+                "status": "image_pending",
+            }
+            self.state.save_job(update_id, job)
+        elif (
+            job.get("account") != account
+            or job.get("source_input_kind", job.get("input_kind")) != input_kind
+            or job.get("transcript") != caption
+            or job.get("image_file_id") != file_id
+            or job.get("image_mime_type") != mime_type
+            or job.get("image_file_size") != file_size
+        ):
+            raise RuntimeError("Persisted image job contradicts its Telegram update")
+
+        await self._process_voice_v2(
+            update_id=update_id,
+            account=account,
+            chat_id=chat_id,
+            bot_message_id=bot_message_id,
+            sent_at=sent_at,
+            duration=0,
+            file_size=file_size,
+        )
+
     async def _process_text_v2(
         self,
         *,
@@ -1273,7 +1605,10 @@ class VoiceBotService:
             # Jobs created before text support were necessarily voice jobs.
             job["input_kind"] = "voice"
             self.state.save_job(update_id, job)
-        input_kind = "text" if job.get("input_kind") == "text" else "voice"
+        raw_input_kind = job.get("input_kind")
+        if raw_input_kind not in {"voice", "text", "image", "text_and_image"}:
+            raise RuntimeError("Persisted calendar job has an invalid input kind")
+        input_kind = str(raw_input_kind)
         if int(job.get("status_message_id", 0) or 0) <= 0:
             initial_stage = "matching"
             initial_fast_read = False
@@ -1289,6 +1624,8 @@ class VoiceBotService:
                     timezone=self.config.calendar_timezone,
                 ) is not None:
                     initial_fast_read = True
+            elif input_kind in _IMAGE_INPUT_KINDS:
+                initial_stage = "image_downloading"
             matching_html = (
                 _fast_read_progress_card(input_kind=input_kind)
                 if initial_fast_read
@@ -1306,6 +1643,153 @@ class VoiceBotService:
             if job.get("status") == "starting":
                 job["status"] = "matching"
             self.state.save_job(update_id, job)
+
+        if job.get("status") == "image_pending":
+            transcript = str(job.get("transcript") or "")
+            if self.vision is None:
+                LOGGER.warning(
+                    "Image understanding unavailable for update %s; "
+                    "caption fallback=%s",
+                    update_id,
+                    bool(transcript.strip()),
+                )
+                if transcript.strip():
+                    job["image_observations"] = []
+                    job["vision_model"] = None
+                    job["input_kind"] = "text"
+                    input_kind = "text"
+                    job["status"] = "transcribed"
+                else:
+                    job["final_html"] = format_error_card(
+                        "Сейчас не удалось распознать изображение. "
+                        "Добавьте к нему подпись с датой, временем "
+                        "и названием события.",
+                        elapsed_seconds=self._elapsed(job),
+                    )
+                    job["final_reply_markup"] = None
+                    job["status"] = "final_ready"
+                self.state.save_job(update_id, job)
+            else:
+                image_limit = self.config.vision_max_image_bytes
+                try:
+                    declared_size = job.get("image_file_size")
+                    if (
+                        isinstance(declared_size, int)
+                        and not isinstance(declared_size, bool)
+                        and declared_size > image_limit
+                    ):
+                        raise BotApiFileError(
+                            "Telegram file exceeds the configured size limit"
+                        )
+                    file_info = await self.bot.get_file(
+                        str(job["image_file_id"]),
+                        max_file_size=image_limit,
+                    )
+                    file_path = file_info.get("file_path")
+                    if not isinstance(file_path, str) or not file_path.strip():
+                        raise BotApiFileError(
+                            "Telegram returned invalid image metadata"
+                        )
+                    image_data = await self.bot.download_file(
+                        file_path,
+                        max_bytes=image_limit,
+                    )
+                except BotApiFileError:
+                    LOGGER.warning(
+                        "Telegram image rejected for update %s; "
+                        "reason=file_validation caption_fallback=%s",
+                        update_id,
+                        bool(transcript.strip()),
+                    )
+                    if transcript.strip():
+                        job["image_observations"] = []
+                        job["vision_model"] = None
+                        job["input_kind"] = "text"
+                        input_kind = "text"
+                        job["status"] = "transcribed"
+                        self.state.save_job(update_id, job)
+                    else:
+                        job["final_html"] = format_error_card(
+                            "Изображение не удалось загрузить или оно превышает "
+                            "допустимый размер. Отправьте скриншот размером до "
+                            f"{image_limit // (1024 * 1024)} МБ.",
+                            elapsed_seconds=self._elapsed(job),
+                        )
+                        job["final_reply_markup"] = None
+                        job["status"] = "final_ready"
+                        self.state.save_job(update_id, job)
+                        await self._finish_v2_job(
+                            update_id=update_id,
+                            chat_id=chat_id,
+                            bot_message_id=bot_message_id,
+                            job=job,
+                        )
+                        return
+                else:
+                    await self._edit_progress_best_effort(
+                        chat_id=chat_id,
+                        job=job,
+                        html_text=format_progress_card(
+                            "vision", input_kind=input_kind  # type: ignore[arg-type]
+                        ),
+                    )
+                    self.state.save_job(update_id, job)
+                    # Keep the dependency optional for transcript-only deployments;
+                    # image-enabled runtimes provide the concrete module and chain.
+                    from .vision import VisionError, VisionImage
+
+                    try:
+                        vision_result = await self.vision.analyze(
+                            VisionImage(
+                                data=image_data,
+                                mime_type=str(job["image_mime_type"]),
+                            )
+                        )
+                        observation, vision_model = _vision_observation(vision_result)
+                        if (
+                            not observation["description"]
+                            and not observation["visible_text"]
+                        ):
+                            raise VisionError(
+                                "Vision providers returned no image evidence"
+                            )
+                    except VisionError as exc:
+                        LOGGER.warning(
+                            "Image understanding failed for update %s; error_type=%s; "
+                            "caption fallback=%s",
+                            update_id,
+                            type(exc).__name__,
+                            bool(transcript.strip()),
+                        )
+                        if transcript.strip():
+                            job["image_observations"] = []
+                            job["vision_model"] = None
+                            job["input_kind"] = "text"
+                            input_kind = "text"
+                            job["status"] = "transcribed"
+                        else:
+                            job["final_html"] = format_error_card(
+                                "Не удалось прочитать содержимое изображения. "
+                                "Попробуйте отправить его файлом или "
+                                "добавьте текстовую подпись.",
+                                elapsed_seconds=self._elapsed(job),
+                            )
+                            job["final_reply_markup"] = None
+                            job["status"] = "final_ready"
+                    else:
+                        job["image_observations"] = [observation]
+                        job["vision_model"] = vision_model
+                        job["status"] = "transcribed"
+                        LOGGER.info(
+                            "Image understanding succeeded for update %s; provider=%s "
+                            "mode=%s description_chars=%d visible_text_chars=%d",
+                            update_id,
+                            observation["source"],
+                            observation["mode"],
+                            len(observation["description"]),
+                            len(observation["visible_text"]),
+                        )
+                    self.state.save_job(update_id, job)
 
         if job.get("status") in {"starting", "matching"}:
             match: dict[str, Any] | None = None
@@ -1383,10 +1867,14 @@ class VoiceBotService:
             sent_time = datetime.fromtimestamp(
                 int(job["sent_at"]), tz=timezone.utc
             ).astimezone(ZoneInfo(self.config.calendar_timezone))
-            fast_plan = plan_fast_calendar_read(
-                transcript,
-                reference_time=sent_time,
-                timezone=self.config.calendar_timezone,
+            fast_plan = (
+                None
+                if input_kind in _IMAGE_INPUT_KINDS
+                else plan_fast_calendar_read(
+                    transcript,
+                    reference_time=sent_time,
+                    timezone=self.config.calendar_timezone,
+                )
             )
             if fast_plan is not None:
                 # Exact, bounded read phrases do not need an LLM round trip.
@@ -1429,6 +1917,8 @@ class VoiceBotService:
                             application_state=context.application_state,
                             recent_conversation=context.recent_conversation,
                             history_steps=context.history_steps,
+                            input_kind=input_kind,
+                            image_observations=_job_image_observations(job),
                         )
                     selected_model = _planner_model_name(plan)
                     if selected_model is not None:
@@ -1571,7 +2061,7 @@ class VoiceBotService:
                 account=account,
                 owner_user_id=chat_id,
                 chat_id=chat_id,
-                transcript=transcript,
+                transcript=_job_memory_text(job),
                 reference_time=sent_time,
                 lookup=lookup,
                 events=events,
@@ -1711,6 +2201,8 @@ class VoiceBotService:
                         application_state=application_state,
                         recent_conversation=context.recent_conversation,
                         history_steps=native_history,
+                        input_kind=input_kind,
+                        image_observations=_job_image_observations(job),
                     )
                 selected_model = _planner_model_name(resolved_plan)
                 if selected_model is not None:
@@ -1854,7 +2346,7 @@ class VoiceBotService:
                     account=account,
                     owner_user_id=chat_id,
                     chat_id=chat_id,
-                    transcript=transcript,
+                    transcript=_job_memory_text(job),
                     reference_time=sent_time,
                     plan=plan,
                     interaction_input=interaction_input,
@@ -2218,6 +2710,7 @@ async def async_main() -> None:
         completed_update_limit=config.webhook_completed_ids_limit,
     )
     planner_stages: list[GeminiProviderStage] = []
+    openrouter_api_key: str | None = None
     try:
         openrouter_api_key = read_secret(
             environment=config.openrouter_api_key_environment,
@@ -2259,8 +2752,8 @@ async def async_main() -> None:
                 ),
             )
         )
-        del openrouter_api_key
 
+    gemini_api_key: str | None = None
     try:
         gemini_api_key = read_secret(
             environment=config.gemini_api_key_environment,
@@ -2302,7 +2795,6 @@ async def async_main() -> None:
             max_retries=1,
         )
         terminal_name = "Gemini 3.7 Flash"
-        del gemini_api_key
 
     planner_stages.append(
         GeminiProviderStage(
@@ -2315,6 +2807,19 @@ async def async_main() -> None:
         planner_stages,
         timeout_seconds=config.calendar_planner_timeout_seconds,
     )
+    try:
+        vision = build_vision_pipeline(
+            config,
+            openrouter_api_key=openrouter_api_key,
+            gemini_api_key=gemini_api_key,
+        )
+    except Exception:
+        await gemini.aclose()
+        raise
+    # Provider instances retain the credentials they need. Drop the temporary
+    # builder references before entering the long-running service.
+    openrouter_api_key = None
+    gemini_api_key = None
 
     try:
         async with BotApi(token) as bot:
@@ -2348,6 +2853,7 @@ async def async_main() -> None:
                     # deployment wrappers that decorate VoiceBotService do not
                     # need a synchronized signature change.
                     service.calendar_operations = calendar_operations
+                    service.vision = vision
                     await service.initialize()
                     if config.bot_update_mode == "polling":
                         await service.run()
@@ -2383,7 +2889,10 @@ async def async_main() -> None:
                         finally:
                             await webhook.close()
     finally:
-        await gemini.aclose()
+        try:
+            await vision.aclose()
+        finally:
+            await gemini.aclose()
 
 
 def main() -> None:

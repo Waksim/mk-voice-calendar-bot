@@ -20,9 +20,22 @@ LOGGER = logging.getLogger("tg_voice_transcriber_bot.bot_api")
 
 
 class BotApiError(RuntimeError):
-    def __init__(self, message: str, *, retry_after: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: int | None = None,
+        http_status: int | None = None,
+        error_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.http_status = http_status
+        self.error_code = error_code
+
+
+class BotApiFileError(BotApiError):
+    """A permanent Telegram file validation/size failure."""
 
 
 class _UnsetType:
@@ -41,6 +54,7 @@ _BOT_API_METHODS = frozenset(
         "deleteWebhook",
         "editMessageReplyMarkup",
         "editMessageText",
+        "getFile",
         "getMe",
         "getUpdates",
         "sendChatAction",
@@ -52,6 +66,8 @@ _BOT_API_METHODS = frozenset(
     }
 )
 _MAX_SECRET_FILE_BYTES = 65_536
+_MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024
+_TELEGRAM_FILE_PATH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,1023}\Z")
 
 
 def read_keychain_secret(*, account: str, service: str) -> str:
@@ -176,7 +192,8 @@ class BotApi:
             )
             if response.status_code != 200:
                 raise BotApiError(
-                    f"Bot API HTTP status {response.status_code}"
+                    f"Bot API HTTP status {response.status_code}",
+                    http_status=response.status_code,
                 ) from None
             raise BotApiError("Bot API returned invalid JSON") from exc
         if not isinstance(body, dict):
@@ -207,6 +224,8 @@ class BotApi:
             raise BotApiError(
                 f"Bot API error {code}: {description}",
                 retry_after=(int(retry_after) if retry_after is not None else None),
+                http_status=response.status_code,
+                error_code=(safe_code if isinstance(safe_code, int) else None),
             )
         if response.status_code != 200:
             LOGGER.warning(
@@ -216,7 +235,10 @@ class BotApi:
                 response.status_code,
                 time.monotonic() - started,
             )
-            raise BotApiError(f"Bot API HTTP status {response.status_code}")
+            raise BotApiError(
+                f"Bot API HTTP status {response.status_code}",
+                http_status=response.status_code,
+            )
         LOGGER.info(
             "Telegram Bot API call finished; method=%s status=success "
             "http_status=%d elapsed=%.3fs",
@@ -235,6 +257,189 @@ class BotApi:
             payload["offset"] = offset
         result = await self.call("getUpdates", payload)
         return result if isinstance(result, list) else []
+
+    @staticmethod
+    def _validate_opaque_file_id(file_id: str) -> str:
+        if (
+            not isinstance(file_id, str)
+            or not 1 <= len(file_id) <= 1024
+            or any(ord(character) < 0x21 or ord(character) > 0x7E for character in file_id)
+        ):
+            raise ValueError("Telegram file ID is invalid")
+        return file_id
+
+    @staticmethod
+    def _validate_file_size_limit(value: int, *, field: str) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= _MAX_TELEGRAM_FILE_BYTES
+        ):
+            raise ValueError(
+                f"{field} must be between 1 and {_MAX_TELEGRAM_FILE_BYTES} bytes"
+            )
+        return value
+
+    @staticmethod
+    def _validate_telegram_file_path(file_path: str) -> str:
+        if (
+            not isinstance(file_path, str)
+            or not _TELEGRAM_FILE_PATH_RE.fullmatch(file_path)
+            or file_path.startswith("/")
+            or "//" in file_path
+            or any(segment in {"", ".", ".."} for segment in file_path.split("/"))
+        ):
+            raise ValueError("Telegram file path is invalid")
+        return file_path
+
+    async def get_file(
+        self,
+        file_id: str,
+        *,
+        max_file_size: int = _MAX_TELEGRAM_FILE_BYTES,
+    ) -> dict[str, Any]:
+        """Resolve one opaque Telegram file ID into validated download metadata.
+
+        Telegram may omit ``file_size`` from the response, so the download
+        boundary independently enforces its byte limit. Errors deliberately do
+        not include either opaque identifier returned by Telegram.
+        """
+
+        normalized_file_id = self._validate_opaque_file_id(file_id)
+        size_limit = self._validate_file_size_limit(
+            max_file_size, field="max_file_size"
+        )
+        try:
+            result = await self.call("getFile", {"file_id": normalized_file_id})
+        except BotApiError as exc:
+            status = exc.error_code or exc.http_status
+            if isinstance(status, int) and 400 <= status < 500 and status != 429:
+                raise BotApiFileError(
+                    "Bot API permanently rejected the Telegram file"
+                ) from None
+            raise BotApiError(
+                "Bot API could not resolve the Telegram file",
+                retry_after=exc.retry_after,
+                http_status=exc.http_status,
+                error_code=exc.error_code,
+            ) from None
+        if not isinstance(result, dict):
+            raise BotApiFileError("Bot API returned invalid Telegram file metadata")
+
+        returned_file_id = result.get("file_id")
+        file_unique_id = result.get("file_unique_id")
+        raw_file_size = result.get("file_size")
+        raw_file_path = result.get("file_path")
+        try:
+            validated_file_id = self._validate_opaque_file_id(returned_file_id)
+            if file_unique_id is not None:
+                validated_unique_id = self._validate_opaque_file_id(file_unique_id)
+            else:
+                validated_unique_id = None
+            if raw_file_size is not None and (
+                isinstance(raw_file_size, bool)
+                or not isinstance(raw_file_size, int)
+                or raw_file_size < 0
+            ):
+                raise ValueError
+            validated_path = self._validate_telegram_file_path(raw_file_path)
+        except (TypeError, ValueError):
+            raise BotApiFileError(
+                "Bot API returned invalid Telegram file metadata"
+            ) from None
+
+        if raw_file_size is not None and raw_file_size > size_limit:
+            raise BotApiFileError("Telegram file exceeds the configured size limit")
+        metadata: dict[str, Any] = {
+            "file_id": validated_file_id,
+            "file_path": validated_path,
+        }
+        if validated_unique_id is not None:
+            metadata["file_unique_id"] = validated_unique_id
+        if raw_file_size is not None:
+            metadata["file_size"] = raw_file_size
+        return metadata
+
+    async def download_file(
+        self,
+        file_path: str,
+        *,
+        max_bytes: int = _MAX_TELEGRAM_FILE_BYTES,
+    ) -> bytes:
+        """Download a Telegram file into memory under a strict byte ceiling."""
+
+        normalized_path = self._validate_telegram_file_path(file_path)
+        size_limit = self._validate_file_size_limit(max_bytes, field="max_bytes")
+        started = time.monotonic()
+        LOGGER.info("Telegram file download started; status=started")
+        url = f"https://api.telegram.org/file/bot{self._token}/{normalized_path}"
+        try:
+            async with self._client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    LOGGER.warning(
+                        "Telegram file download finished; status=http_error "
+                        "http_status=%d elapsed=%.3fs",
+                        response.status_code,
+                        time.monotonic() - started,
+                    )
+                    if 400 <= response.status_code < 500 and response.status_code != 429:
+                        raise BotApiFileError(
+                            "Telegram permanently rejected the file download"
+                        )
+                    raise BotApiError(
+                        f"Telegram file download HTTP status {response.status_code}",
+                        http_status=response.status_code,
+                    )
+
+                content_length = response.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError:
+                        declared_size = -1
+                    if declared_size > size_limit:
+                        LOGGER.warning(
+                            "Telegram file download finished; status=too_large "
+                            "elapsed=%.3fs",
+                            time.monotonic() - started,
+                        )
+                        raise BotApiFileError(
+                            "Telegram file exceeds the configured size limit"
+                        )
+
+                content = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(content) + len(chunk) > size_limit:
+                        LOGGER.warning(
+                            "Telegram file download finished; status=too_large "
+                            "elapsed=%.3fs",
+                            time.monotonic() - started,
+                        )
+                        raise BotApiFileError(
+                            "Telegram file exceeds the configured size limit"
+                        )
+                    content.extend(chunk)
+        except BotApiError:
+            raise
+        except httpx.HTTPError as exc:
+            LOGGER.warning(
+                "Telegram file download finished; status=transport_error "
+                "elapsed=%.3fs error_type=%s",
+                time.monotonic() - started,
+                type(exc).__name__,
+            )
+            raise BotApiError(
+                f"Telegram file download transport error: {type(exc).__name__}"
+            ) from None
+
+        if not content:
+            raise BotApiFileError("Telegram file download returned empty content")
+        LOGGER.info(
+            "Telegram file download finished; status=success bytes=%d elapsed=%.3fs",
+            len(content),
+            time.monotonic() - started,
+        )
+        return bytes(content)
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         await self.call("sendChatAction", {"chat_id": chat_id, "action": action})
@@ -421,8 +626,8 @@ class BotApi:
             "setMyDescription",
             {
                 "description": (
-                    "Пришлите голосовое сообщение или напишите календарную "
-                    "команду текстом. ИИ-планировщик сразу добавит, "
+                    "Пришлите голосовое, напишите календарную команду или "
+                    "отправьте скриншот. ИИ-планировщик сразу добавит, "
                     "изменит или удалит событие в Google Calendar. Любое "
                     "действие можно отменить кнопкой. Доступ ограничен двумя "
                     "аккаунтами владельца."
@@ -433,7 +638,7 @@ class BotApi:
             "setMyShortDescription",
             {
                 "short_description": (
-                    "Голос или текст → ИИ-планировщик → Google Calendar"
+                    "Голос, текст или скриншот → ИИ-планировщик → Google Calendar"
                 )
             },
         )

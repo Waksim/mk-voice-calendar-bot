@@ -32,14 +32,85 @@ from tg_voice_transcriber_bot.operations import (
 from tg_voice_transcriber_bot.service import (
     VoiceBotService,
     _compact_lookup_candidates,
+    _job_image_observations,
+    _job_memory_text,
     _resolve_plan_event_references,
+    build_vision_pipeline,
 )
 from tg_voice_transcriber_bot.state import StateStore
+from tg_voice_transcriber_bot.vision import VisionError, VisionResult
 
 
 OWNER = 100000001
 SENT_AT = 1787400000
 _EDIT_UNSET = object()
+
+
+def test_runtime_vision_pipeline_wires_cloud_fallbacks_then_local_ocr():
+    config = Config()
+    pipeline = build_vision_pipeline(
+        config,
+        openrouter_api_key="router-secret",
+        gemini_api_key="gemini-secret",
+    )
+    try:
+        assert [stage.provider.model for stage in pipeline.stages] == [
+            "google/gemma-4-31b-it:free",
+            "google/gemma-4-26b-a4b-it:free",
+            "gemini-3.7-flash",
+        ]
+        assert [stage.timeout_seconds for stage in pipeline.stages] == [
+            15,
+            12,
+            20,
+        ]
+        assert pipeline.local_ocr.model == "rapidocr/pp-ocrv5-cyrillic"
+        assert pipeline.local_timeout_seconds == 15
+    finally:
+        asyncio.run(pipeline.aclose())
+
+
+def test_image_followup_memory_reserves_space_for_visible_text():
+    memory = _job_memory_text(
+        {
+            "input_kind": "text_and_image",
+            "source_input_kind": "text_and_image",
+            "transcript": "Подпись " * 300,
+            "image_observations": [
+                {
+                    "description": "Описание " * 600,
+                    "visible_text": "29 августа 8:00–10:00, метро Киевская",
+                    "source": "Vision",
+                    "mode": "vision",
+                }
+            ],
+        }
+    )
+
+    assert len(memory) <= 1_000
+    assert "29 августа 8:00–10:00" in memory
+    assert "метро Киевская" in memory
+
+
+def test_planner_image_evidence_has_a_strict_utf8_byte_budget():
+    observations = _job_image_observations(
+        {
+            "image_observations": [
+                {
+                    "description": "описание" * 1_000,
+                    "visible_text": "текст со скриншота" * 2_000,
+                    "source": "Vision",
+                    "mode": "vision",
+                }
+            ]
+        }
+    )
+
+    observation = observations[0]
+    assert len(observation["description"].encode("utf-8")) <= 1_536
+    assert len(observation["visible_text"].encode("utf-8")) <= 6_656
+    assert observation["description"].endswith("[… сокращено …]")
+    assert observation["visible_text"].endswith("[… сокращено …]")
 
 
 def calendar_event(**changes):
@@ -217,7 +288,13 @@ def delete_plan(event_id, *, recurrence_scope=None):
 
 
 class FakeBot:
-    def __init__(self, *, fail_intermediate=False, fail_final=False):
+    def __init__(
+        self,
+        *,
+        fail_intermediate=False,
+        fail_final=False,
+        downloaded_image=b"image-bytes",
+    ):
         self.fail_intermediate = fail_intermediate
         self.fail_final = fail_final
         self.sent_html = []
@@ -225,6 +302,9 @@ class FakeBot:
         self.chat_actions = []
         self.callback_answers = []
         self.keyboard_removals = []
+        self.get_file_calls = []
+        self.download_file_calls = []
+        self.downloaded_image = downloaded_image
         self._next_message_id = 700
 
     async def send_chat_action(self, chat_id):
@@ -278,6 +358,14 @@ class FakeBot:
     async def remove_inline_keyboard(self, chat_id, message_id):
         self.keyboard_removals.append((chat_id, message_id))
 
+    async def get_file(self, file_id, *, max_file_size):
+        self.get_file_calls.append((file_id, max_file_size))
+        return {"file_path": f"photos/{file_id}.jpg"}
+
+    async def download_file(self, file_path, *, max_bytes):
+        self.download_file_calls.append((file_path, max_bytes))
+        return self.downloaded_image
+
 
 class FakeGateway:
     def __init__(self, transcripts=None):
@@ -311,6 +399,25 @@ class FakeGemini:
         if self.dynamic is not None:
             return self.dynamic(len(self.calls), transcript, kwargs)
         return self.plans.pop(0)
+
+
+class FakeVision:
+    def __init__(self, result=None, *, error=None):
+        self.result = result or VisionResult(
+            description="Экран бронирования корта",
+            visible_text="Сб 29 августа, 8:00–10:00, Lunda Padel",
+            provider="Gemini",
+            model="gemini-3.7-flash",
+            used_local_ocr=False,
+        )
+        self.error = error
+        self.calls = []
+
+    async def analyze(self, image):
+        self.calls.append(image)
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 class FakeCalendar:
@@ -440,7 +547,7 @@ class FakeCalendar:
         )
 
 
-def make_service(tmp_path, *, bot, gateway, gemini, calendar):
+def make_service(tmp_path, *, bot, gateway, gemini, calendar, vision=None):
     config = Config(
         state_path=tmp_path / "state.json",
         operation_state_path=tmp_path / "calendar-operations.json",
@@ -457,6 +564,7 @@ def make_service(tmp_path, *, bot, gateway, gemini, calendar):
         state,
         gemini,
         calendar_operations=pipeline,
+        vision=vision,
     )
     return service, state, pipeline
 
@@ -565,6 +673,398 @@ def test_text_enters_shared_calendar_pipeline_without_telegram_gateway(tmp_path)
     assert state.job(78)["status"] == "sent"
     assert state.job(78)["input_kind"] == "text"
     assert state.after_message_id("personal") == 0
+
+
+def test_photo_uses_largest_size_and_passes_captioned_observation_to_planner(
+    tmp_path,
+):
+    caption = "Добавь эту бронь в календарь"
+
+    async def scenario():
+        bot = FakeBot(downloaded_image=b"telegram-photo")
+        gateway = FakeGateway()
+        calendar = FakeCalendar()
+        gemini = FakeGemini([create_plan()])
+        vision = FakeVision()
+        service, state, pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=gateway,
+            gemini=gemini,
+            calendar=calendar,
+            vision=vision,
+        )
+        await service.handle_update(
+            {
+                "update_id": 801,
+                "message": {
+                    "message_id": 901,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "caption": caption,
+                    "photo": [
+                        {
+                            "file_id": "small-photo",
+                            "width": 320,
+                            "height": 200,
+                            "file_size": 50_000,
+                        },
+                        {
+                            "file_id": "large-photo",
+                            "width": 1280,
+                            "height": 800,
+                            "file_size": 400_000,
+                        },
+                    ],
+                },
+            }
+        )
+        return bot, gateway, calendar, gemini, vision, state, pipeline
+
+    bot, gateway, calendar, gemini, vision, state, pipeline = asyncio.run(
+        scenario()
+    )
+
+    assert gateway.read_calls == []
+    assert gateway.write_calls == []
+    assert bot.get_file_calls == [("large-photo", 8 * 1024 * 1024)]
+    assert bot.download_file_calls == [
+        ("photos/large-photo.jpg", 8 * 1024 * 1024)
+    ]
+    assert len(vision.calls) == 1
+    assert vision.calls[0].data == b"telegram-photo"
+    assert vision.calls[0].mime_type == "image/jpeg"
+    transcript, kwargs = gemini.calls[0]
+    assert transcript == caption
+    assert kwargs["input_kind"] == "text_and_image"
+    assert kwargs["image_observations"] == (
+        {
+            "description": "Экран бронирования корта",
+            "visible_text": "Сб 29 августа, 8:00–10:00, Lunda Padel",
+            "source": "Gemini",
+            "mode": "vision",
+        },
+    )
+    assert [call[0] for call in calendar.calls].count("create") == 1
+    assert "Загружаю изображение" in bot.sent_html[0]["html"]
+    assert any("Извлекаю текст" in edit["html"] for edit in bot.edited_html)
+    assert state.job(801)["input_kind"] == "text_and_image"
+    assert state.job(801)["vision_model"] == "gemini-3.7-flash"
+    memory = pipeline.store.find_by_source("telegram-update:801")["transcript"]
+    assert caption in memory
+    assert "Данные изображения" in memory
+    assert "Lunda Padel" in memory
+    assert len(memory) <= 1_000
+
+
+def test_image_document_without_caption_reaches_planner_as_image_only(tmp_path):
+    async def scenario():
+        bot = FakeBot(downloaded_image=b"png-image")
+        calendar = FakeCalendar()
+        gemini = FakeGemini([create_plan()])
+        vision = FakeVision()
+        service, state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+            vision=vision,
+        )
+        await service.handle_update(
+            {
+                "update_id": 802,
+                "message": {
+                    "message_id": 902,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "document": {
+                        "file_id": "original-image",
+                        "mime_type": "image/png",
+                        "file_size": 900_000,
+                    },
+                },
+            }
+        )
+        return bot, gemini, vision, state
+
+    bot, gemini, vision, state = asyncio.run(scenario())
+
+    assert vision.calls[0].data == b"png-image"
+    assert vision.calls[0].mime_type == "image/png"
+    transcript, kwargs = gemini.calls[0]
+    assert transcript == ""
+    assert kwargs["input_kind"] == "image"
+    assert kwargs["image_observations"][0]["visible_text"].startswith("Сб 29")
+    assert "Добавлено в календарь" in bot.edited_html[-1]["html"]
+    assert state.job(802)["status"] == "sent"
+
+
+def test_oversized_image_is_rejected_once_without_downloading_or_retrying(tmp_path):
+    async def scenario():
+        bot = FakeBot()
+        calendar = FakeCalendar()
+        gemini = FakeGemini([])
+        vision = FakeVision()
+        service, state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+            vision=vision,
+        )
+        await service.handle_update(
+            {
+                "update_id": 806,
+                "message": {
+                    "message_id": 906,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "photo": [
+                        {
+                            "file_id": "oversized-image",
+                            "width": 4096,
+                            "height": 4096,
+                            "file_size": service.config.vision_max_image_bytes + 1,
+                        }
+                    ],
+                },
+            }
+        )
+        return bot, calendar, gemini, vision, state
+
+    bot, calendar, gemini, vision, state = asyncio.run(scenario())
+
+    assert bot.get_file_calls == []
+    assert bot.download_file_calls == []
+    assert vision.calls == []
+    assert gemini.calls == []
+    assert calendar.calls == []
+    assert "до 8 МБ" in bot.edited_html[-1]["html"]
+    assert state.job(806)["status"] == "sent"
+
+
+def test_oversized_image_with_caption_continues_as_text_only(tmp_path):
+    caption = "Добавь встречу завтра в 17:30"
+
+    async def scenario():
+        bot = FakeBot()
+        calendar = FakeCalendar()
+        gemini = FakeGemini([create_plan()])
+        vision = FakeVision()
+        service, state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+            vision=vision,
+        )
+        await service.handle_update(
+            {
+                "update_id": 807,
+                "message": {
+                    "message_id": 907,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "caption": caption,
+                    "photo": [
+                        {
+                            "file_id": "oversized-captioned-image",
+                            "width": 4096,
+                            "height": 4096,
+                            "file_size": service.config.vision_max_image_bytes + 1,
+                        }
+                    ],
+                },
+            }
+        )
+        return bot, calendar, gemini, vision, state
+
+    bot, calendar, gemini, vision, state = asyncio.run(scenario())
+
+    assert bot.get_file_calls == []
+    assert bot.download_file_calls == []
+    assert vision.calls == []
+    transcript, kwargs = gemini.calls[0]
+    assert transcript == caption
+    assert kwargs["input_kind"] == "text"
+    assert kwargs["image_observations"] == ()
+    assert [call[0] for call in calendar.calls].count("create") == 1
+    assert "Добавлено в календарь" in bot.edited_html[-1]["html"]
+    assert state.job(807)["status"] == "sent"
+    assert state.job(807)["source_input_kind"] == "text_and_image"
+
+
+def test_image_observations_are_preserved_for_lookup_matching_pass(tmp_path):
+    async def scenario():
+        candidate = FakeCalendar.snapshot(
+            "booking-event",
+            calendar_event(title="Lunda Padel", location=None),
+        )
+        calendar = FakeCalendar(
+            query_result=CalendarEventQueryResult((candidate,), 1)
+        )
+        calendar.events[candidate.event_id] = candidate
+        gemini = FakeGemini(
+            [
+                discovery_plan(query="Lunda Padel"),
+                update_plan("c1", location="ул. Большая Филёвская, 32"),
+            ]
+        )
+        service, _state, _pipeline = make_service(
+            tmp_path,
+            bot=FakeBot(),
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+            vision=FakeVision(),
+        )
+        await service.handle_update(
+            {
+                "update_id": 805,
+                "message": {
+                    "message_id": 905,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "caption": "Добавь адрес к этой брони",
+                    "photo": [
+                        {"file_id": "lookup-image", "width": 1280, "height": 800}
+                    ],
+                },
+            }
+        )
+        return calendar, gemini
+
+    calendar, gemini = asyncio.run(scenario())
+
+    assert len(gemini.calls) == 2
+    first = gemini.calls[0][1]
+    second = gemini.calls[1][1]
+    assert first["input_kind"] == second["input_kind"] == "text_and_image"
+    assert first["image_observations"] == second["image_observations"]
+    assert first["image_observations"][0]["source"] == "Gemini"
+    update_calls = [call for call in calendar.calls if call[0] == "update"]
+    assert update_calls[0][3]["location"] == "ул. Большая Филёвская, 32"
+
+
+def test_captioned_image_never_bypasses_planner_via_text_fast_read(tmp_path):
+    async def scenario():
+        gemini = FakeGemini([create_plan()])
+        service, _state, _pipeline = make_service(
+            tmp_path,
+            bot=FakeBot(),
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=FakeCalendar(),
+            vision=FakeVision(),
+        )
+        await service.handle_update(
+            {
+                "update_id": 808,
+                "message": {
+                    "message_id": 908,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "caption": "Какие у меня события в ближайший час?",
+                    "photo": [
+                        {"file_id": "read-image", "width": 1280, "height": 800}
+                    ],
+                },
+            }
+        )
+        return gemini
+
+    gemini = asyncio.run(scenario())
+
+    assert len(gemini.calls) == 1
+    assert gemini.calls[0][1]["input_kind"] == "text_and_image"
+    assert gemini.calls[0][1]["image_observations"]
+
+
+def test_caption_falls_back_to_text_when_all_image_recognition_fails(tmp_path):
+    caption = "Добавь встречу завтра в 17:30"
+
+    async def scenario():
+        calendar = FakeCalendar()
+        gemini = FakeGemini([create_plan()])
+        bot = FakeBot()
+        service, state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+            vision=FakeVision(error=VisionError("all vision providers failed")),
+        )
+        await service.handle_update(
+            {
+                "update_id": 803,
+                "message": {
+                    "message_id": 903,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "caption": caption,
+                    "photo": [{"file_id": "captioned", "width": 800, "height": 600}],
+                },
+            }
+        )
+        return bot, calendar, gemini, state
+
+    bot, calendar, gemini, state = asyncio.run(scenario())
+
+    transcript, kwargs = gemini.calls[0]
+    assert transcript == caption
+    assert kwargs["input_kind"] == "text"
+    assert kwargs["image_observations"] == ()
+    assert [call[0] for call in calendar.calls].count("create") == 1
+    assert "Добавлено в календарь" in bot.edited_html[-1]["html"]
+    assert state.job(803)["input_kind"] == "text"
+    assert state.job(803)["source_input_kind"] == "text_and_image"
+
+
+def test_image_only_returns_bounded_error_when_all_recognition_fails(tmp_path):
+    async def scenario():
+        bot = FakeBot()
+        calendar = FakeCalendar()
+        gemini = FakeGemini([])
+        service, state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+            vision=FakeVision(error=VisionError("all vision providers failed")),
+        )
+        await service.handle_update(
+            {
+                "update_id": 804,
+                "message": {
+                    "message_id": 904,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "photo": [{"file_id": "unreadable", "width": 800, "height": 600}],
+                },
+            }
+        )
+        return bot, calendar, gemini, state
+
+    bot, calendar, gemini, state = asyncio.run(scenario())
+
+    assert gemini.calls == []
+    assert calendar.calls == []
+    assert "Не удалось прочитать содержимое" in bot.edited_html[-1]["html"]
+    assert "Google Calendar не изменён" in bot.edited_html[-1]["html"]
+    assert state.job(804)["status"] == "sent"
 
 
 def test_nearest_hour_read_skips_gemini_even_when_provider_is_unavailable(tmp_path):

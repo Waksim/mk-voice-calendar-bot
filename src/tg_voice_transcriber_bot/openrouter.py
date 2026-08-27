@@ -33,10 +33,12 @@ from .gemini import (
     _calendar_prompt,
     _copy_history_steps,
     _diagnostic_fingerprint,
+    _history_has_image_observations,
     _log_structured_output_failure,
     _safe_diagnostic_label,
     _safe_diagnostic_token,
     _validate_input,
+    _validate_planner_input,
 )
 from .intent import (
     CALENDAR_INTENT_SCHEMA,
@@ -1017,16 +1019,27 @@ class OpenRouterApi:
         application_state: Mapping[str, Any],
         recent_conversation: Sequence[Mapping[str, Any]],
         history_steps: Sequence[Mapping[str, Any]] = (),
+        input_kind: str = "text",
+        image_observations: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         try:
-            _validate_input(transcript, reference_time)
+            normalized_observations = _validate_planner_input(
+                transcript,
+                reference_time,
+                input_kind=input_kind,
+                image_observations=image_observations,
+            )
             if not isinstance(application_state, Mapping):
                 raise GeminiError("Application state must be an object")
             if isinstance(
                 recent_conversation, (str, bytes, bytearray)
             ) or not isinstance(recent_conversation, Sequence):
                 raise GeminiError("Recent conversation must be an array")
-            history_messages = self._history_messages(history_steps)
+            native_history = _copy_history_steps(history_steps)
+            reuse_image_evidence = bool(
+                normalized_observations
+            ) and _history_has_image_observations(native_history)
+            history_messages = self._history_messages(native_history)
             current_input = _calendar_operation_input(
                 transcript,
                 reference_time=reference_time,
@@ -1034,6 +1047,11 @@ class OpenRouterApi:
                 timezone=self.timezone,
                 application_state=application_state,
                 recent_conversation=recent_conversation,
+                input_kind=input_kind,
+                image_observations=(
+                    () if reuse_image_evidence else normalized_observations
+                ),
+                image_evidence_in_history=reuse_image_evidence,
             )
             current_text = self._step_text(current_input)
             if current_text is None:

@@ -72,6 +72,38 @@ the next command. Startup fails if no planner stage validates. Webhook mode also
 fails closed if the direct Gemini terminal stage fails credential/model checks;
 a transient Gemini validation failure remains eligible for the next request.
 
+Screenshot handling uses an independent observation-only chain before the
+calendar planner:
+
+1. OpenRouter `google/gemma-4-31b-it:free`, stage timeout 15 seconds;
+2. OpenRouter `google/gemma-4-26b-a4b-it:free`, stage timeout 12 seconds;
+3. direct Gemini API `gemini-3.7-flash`, stage timeout 20 seconds;
+4. local RapidOCR 3 / ONNX Runtime, stage timeout 15 seconds.
+
+The API stages may only describe pixels and transcribe visible text. Their
+bounded result is then sent to the normal planner chain, which remains solely
+responsible for calendar intent and CRUD. The terminal local stage uses
+PP-OCRv5's Cyrillic model first and ESLAV as a fallback. Both recognition
+weights plus the detector and orientation classifier are downloaded into
+`/opt/rapidocr-models` during the image build and made read-only. This prevents
+first-request downloads and makes OCR compatible with the container's
+read-only root filesystem.
+
+Vision defaults are controlled by `OPENROUTER_VISION_MODEL`,
+`OPENROUTER_VISION_TIMEOUT_SECONDS`, `OPENROUTER_VISION_FALLBACK_MODEL`,
+`OPENROUTER_VISION_FALLBACK_TIMEOUT_SECONDS`, `GEMINI_VISION_MODEL`,
+`GEMINI_VISION_TIMEOUT_SECONDS`, `VISION_LOCAL_OCR_TIMEOUT_SECONDS`,
+`VISION_MAX_IMAGE_BYTES`, `VISION_MAX_IMAGE_PIXELS`,
+`VISION_MAX_DESCRIPTION_CHARS`, `VISION_MAX_VISIBLE_TEXT_CHARS`, and
+`VISION_OCR_MODEL_DIR`. Production keeps the limits at 8 MiB, 20 million
+pixels, 4000 description characters, and 12000 OCR characters. Image and OCR
+content is not written to service logs.
+
+ONNX Runtime, OpenCV, and decoding a 20-megapixel image require more transient
+memory than text-only operation. The reviewed production Compose therefore
+gives the bot 1536 MiB RAM, 2 vCPU, and a 256 MiB `/tmp` tmpfs. These are hard
+container limits, not reservations.
+
 The bot, outbound API proxy (the legacy `gemini-proxy` service name), and
 webhook controller share the WARP network namespace. They use
 `/etc/mk-voice-calendar-bot/resolv.conf` with explicit public resolvers; this

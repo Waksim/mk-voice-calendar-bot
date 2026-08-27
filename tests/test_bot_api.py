@@ -8,6 +8,7 @@ from tg_voice_transcriber_bot import bot_api as bot_api_module
 from tg_voice_transcriber_bot.bot_api import (
     BotApi,
     BotApiError,
+    BotApiFileError,
     read_keychain_secret,
     read_secret,
 )
@@ -158,6 +159,230 @@ def test_bot_api_lifecycle_logs_are_secret_safe(caplog):
     assert "PRIVATE_BOT_API_RESULT" not in messages
     assert "PRIVATE_TRANSPORT_DIAGNOSTIC" not in messages
     assert "api.telegram.org" not in messages
+
+
+def test_get_file_and_bounded_download_are_validated_and_secret_safe(caplog):
+    token = "PRIVATE_BOT_TOKEN"
+    file_id = "PRIVATE_FILE_ID"
+    file_path = "photos/PRIVATE_FILE_PATH.jpg"
+    requests = []
+
+    async def scenario():
+        def handler(request):
+            requests.append((request.method, request.url.path, request.content))
+            if request.url.path.endswith("/getFile"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "result": {
+                            "file_id": file_id,
+                            "file_unique_id": "UNIQUE_FILE_ID",
+                            "file_size": 6,
+                            "file_path": file_path,
+                        },
+                    },
+                )
+            return httpx.Response(200, content=b"image!")
+
+        api = BotApi(token)
+        await api._client.aclose()
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            metadata = await api.get_file(file_id, max_file_size=10)
+            content = await api.download_file(metadata["file_path"], max_bytes=10)
+        finally:
+            await api._client.aclose()
+        return metadata, content
+
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.bot_api"):
+        metadata, content = asyncio.run(scenario())
+
+    assert metadata == {
+        "file_id": file_id,
+        "file_unique_id": "UNIQUE_FILE_ID",
+        "file_size": 6,
+        "file_path": file_path,
+    }
+    assert content == b"image!"
+    get_file_request = requests[0]
+    assert get_file_request[0] == "POST"
+    assert get_file_request[1].endswith("/getFile")
+    assert json.loads(get_file_request[2].decode("utf-8")) == {"file_id": file_id}
+    assert requests[1][0] == "GET"
+
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "method=getFile" in logs
+    assert "status=success" in logs
+    assert "bytes=6" in logs
+    assert token not in logs
+    assert file_id not in logs
+    assert file_path not in logs
+    assert "api.telegram.org" not in logs
+
+
+def test_get_file_rejects_invalid_or_oversized_metadata_without_identifiers():
+    async def scenario(result, *, max_file_size=10):
+        def handler(request):
+            return httpx.Response(200, json={"ok": True, "result": result})
+
+        api = BotApi("PRIVATE_BOT_TOKEN")
+        await api._client.aclose()
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(BotApiError) as caught:
+                await api.get_file("PRIVATE_FILE_ID", max_file_size=max_file_size)
+            return str(caught.value)
+        finally:
+            await api._client.aclose()
+
+    oversized_error = asyncio.run(
+        scenario(
+            {
+                "file_id": "PRIVATE_FILE_ID",
+                "file_unique_id": "PRIVATE_UNIQUE_ID",
+                "file_size": 11,
+                "file_path": "photos/PRIVATE_FILE_PATH.jpg",
+            }
+        )
+    )
+    invalid_path_error = asyncio.run(
+        scenario(
+            {
+                "file_id": "PRIVATE_FILE_ID",
+                "file_size": 5,
+                "file_path": "photos/../PRIVATE_FILE_PATH.jpg",
+            }
+        )
+    )
+
+    for message in (oversized_error, invalid_path_error):
+        assert "PRIVATE_BOT_TOKEN" not in message
+        assert "PRIVATE_FILE_ID" not in message
+        assert "PRIVATE_FILE_PATH" not in message
+
+
+def test_download_file_rejects_bad_paths_and_enforces_declared_and_streamed_size():
+    async def scenario():
+        calls = 0
+
+        class NoLengthStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"123"
+                yield b"456"
+
+        def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(
+                    200,
+                    headers={"content-length": "6"},
+                    content=b"123456",
+                )
+            return httpx.Response(200, stream=NoLengthStream())
+
+        api = BotApi("PRIVATE_BOT_TOKEN")
+        await api._client.aclose()
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            for bad_path in (
+                "/photos/file.jpg",
+                "photos/../file.jpg",
+                "photos//file.jpg",
+                "photos/file.jpg?token=secret",
+            ):
+                with pytest.raises(ValueError, match="path is invalid"):
+                    await api.download_file(bad_path, max_bytes=5)
+            with pytest.raises(BotApiError, match="size limit") as declared:
+                await api.download_file("photos/file.jpg", max_bytes=5)
+            with pytest.raises(BotApiError, match="size limit") as streamed:
+                await api.download_file("photos/file.jpg", max_bytes=5)
+            return str(declared.value), str(streamed.value), calls
+        finally:
+            await api._client.aclose()
+
+    declared_error, streamed_error, calls = asyncio.run(scenario())
+    assert calls == 2
+    for message in (declared_error, streamed_error):
+        assert "PRIVATE_BOT_TOKEN" not in message
+        assert "photos/file.jpg" not in message
+
+
+def test_file_download_transport_error_does_not_expose_token_or_path(caplog):
+    async def scenario():
+        def handler(request):
+            raise httpx.ConnectError(
+                "PRIVATE_TRANSPORT_DETAIL", request=request
+            )
+
+        api = BotApi("PRIVATE_BOT_TOKEN")
+        await api._client.aclose()
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(BotApiError, match="ConnectError") as caught:
+                await api.download_file(
+                    "photos/PRIVATE_FILE_PATH.jpg", max_bytes=100
+                )
+            return str(caught.value)
+        finally:
+            await api._client.aclose()
+
+    with caplog.at_level("INFO", logger="tg_voice_transcriber_bot.bot_api"):
+        message = asyncio.run(scenario())
+    combined = message + "\n" + "\n".join(
+        record.getMessage() for record in caplog.records
+    )
+    assert "PRIVATE_BOT_TOKEN" not in combined
+    assert "PRIVATE_FILE_PATH" not in combined
+    assert "PRIVATE_TRANSPORT_DETAIL" not in combined
+    assert "api.telegram.org" not in combined
+
+
+def test_permanent_file_api_errors_are_terminal_but_rate_limits_remain_retryable():
+    async def scenario():
+        responses = iter(
+            (
+                httpx.Response(
+                    400,
+                    json={
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "bad file",
+                    },
+                ),
+                httpx.Response(404, content=b"not found"),
+                httpx.Response(
+                    429,
+                    json={
+                        "ok": False,
+                        "error_code": 429,
+                        "description": "rate limited",
+                        "parameters": {"retry_after": 9},
+                    },
+                ),
+            )
+        )
+
+        def handler(_request):
+            return next(responses)
+
+        api = BotApi("PRIVATE_BOT_TOKEN")
+        await api._client.aclose()
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(BotApiFileError):
+                await api.get_file("PRIVATE_FILE_ID")
+            with pytest.raises(BotApiFileError):
+                await api.download_file("photos/file.jpg")
+            with pytest.raises(BotApiError) as rate_limited:
+                await api.get_file("PRIVATE_FILE_ID")
+            assert not isinstance(rate_limited.value, BotApiFileError)
+            assert rate_limited.value.retry_after == 9
+        finally:
+            await api._client.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_callbacks_are_polled_and_keyboard_is_attached_to_first_chunk_only():

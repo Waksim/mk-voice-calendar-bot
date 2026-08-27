@@ -14,11 +14,28 @@ def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     assert config.openrouter_fallback_timeout_seconds == 15
     assert config.openrouter_fallback_reasoning_effort == "high"
     assert config.openrouter_max_tokens == 8192
+    assert config.openrouter_vision_model == "google/gemma-4-31b-it:free"
+    assert config.openrouter_vision_timeout_seconds == 15
+    assert (
+        config.openrouter_vision_fallback_model
+        == "google/gemma-4-26b-a4b-it:free"
+    )
+    assert config.openrouter_vision_fallback_timeout_seconds == 12
     assert config.gemini_keychain_account == "codex.gemini.mk_voice_calendar_bot"
     assert config.gemini_keychain_service == "mk_voice_calendar_bot"
     assert config.gemini_api_key_environment == "GEMINI_API_KEY"
     assert config.gemini_model == "gemini-3.7-flash"
     assert config.gemini_timeout_seconds == 25
+    assert config.gemini_vision_model == "gemini-3.7-flash"
+    assert config.gemini_vision_timeout_seconds == 20
+    assert config.vision_local_ocr_timeout_seconds == 15
+    assert config.vision_max_image_bytes == 8 * 1024 * 1024
+    assert config.vision_max_image_pixels == 20_000_000
+    assert config.vision_max_description_chars == 4_000
+    assert config.vision_max_visible_text_chars == 12_000
+    assert config.vision_ocr_model_dir == (
+        PROJECT_ROOT / ".runtime" / "rapidocr-models"
+    )
     assert config.calendar_planner_timeout_seconds == 80
     assert config.gemini_cli_model == "gemini-3.7-flash-high"
     assert config.calendar_mcp_package_version == "2.6.2"
@@ -79,8 +96,22 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("OPENROUTER_FALLBACK_TIMEOUT_SECONDS", "20")
     monkeypatch.setenv("OPENROUTER_FALLBACK_REASONING_EFFORT", "low")
     monkeypatch.setenv("OPENROUTER_MAX_TOKENS", "4096")
+    monkeypatch.setenv("OPENROUTER_VISION_MODEL", "example/vision-primary:free")
+    monkeypatch.setenv("OPENROUTER_VISION_TIMEOUT_SECONDS", "31")
+    monkeypatch.setenv(
+        "OPENROUTER_VISION_FALLBACK_MODEL", "example/vision-fallback:free"
+    )
+    monkeypatch.setenv("OPENROUTER_VISION_FALLBACK_TIMEOUT_SECONDS", "29")
     monkeypatch.setenv("GEMINI_MODEL", "gemini-test-model")
     monkeypatch.setenv("GEMINI_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("GEMINI_VISION_MODEL", "gemini-test-vision-model")
+    monkeypatch.setenv("GEMINI_VISION_TIMEOUT_SECONDS", "41")
+    monkeypatch.setenv("VISION_LOCAL_OCR_TIMEOUT_SECONDS", "19")
+    monkeypatch.setenv("VISION_MAX_IMAGE_BYTES", "7340032")
+    monkeypatch.setenv("VISION_MAX_IMAGE_PIXELS", "19000000")
+    monkeypatch.setenv("VISION_MAX_DESCRIPTION_CHARS", "3900")
+    monkeypatch.setenv("VISION_MAX_VISIBLE_TEXT_CHARS", "11000")
+    monkeypatch.setenv("VISION_OCR_MODEL_DIR", str(tmp_path / "ocr-models"))
     monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "120")
     monkeypatch.setenv("GEMINI_CLI_MODEL", "gemini-cli-test-model")
 
@@ -100,8 +131,20 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.openrouter_fallback_timeout_seconds == 20
     assert config.openrouter_fallback_reasoning_effort == "low"
     assert config.openrouter_max_tokens == 4096
+    assert config.openrouter_vision_model == "example/vision-primary:free"
+    assert config.openrouter_vision_timeout_seconds == 31
+    assert config.openrouter_vision_fallback_model == "example/vision-fallback:free"
+    assert config.openrouter_vision_fallback_timeout_seconds == 29
     assert config.gemini_model == "gemini-test-model"
     assert config.gemini_timeout_seconds == 30
+    assert config.gemini_vision_model == "gemini-test-vision-model"
+    assert config.gemini_vision_timeout_seconds == 41
+    assert config.vision_local_ocr_timeout_seconds == 19
+    assert config.vision_max_image_bytes == 7 * 1024 * 1024
+    assert config.vision_max_image_pixels == 19_000_000
+    assert config.vision_max_description_chars == 3_900
+    assert config.vision_max_visible_text_chars == 11_000
+    assert config.vision_ocr_model_dir == tmp_path / "ocr-models"
     assert config.calendar_planner_timeout_seconds == 120
     assert config.gemini_cli_model == "gemini-cli-test-model"
 
@@ -121,8 +164,32 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
         ),
         ("OPENROUTER_MAX_TOKENS", "0", "MAX_TOKENS"),
         ("OPENROUTER_MAX_TOKENS", "65537", "MAX_TOKENS"),
+        ("OPENROUTER_VISION_MODEL", "", "VISION_MODEL"),
+        ("OPENROUTER_VISION_TIMEOUT_SECONDS", "0", "VISION_TIMEOUT"),
+        ("OPENROUTER_VISION_TIMEOUT_SECONDS", "301", "VISION_TIMEOUT"),
+        (
+            "OPENROUTER_VISION_FALLBACK_MODEL",
+            "",
+            "VISION_FALLBACK_MODEL",
+        ),
+        (
+            "OPENROUTER_VISION_FALLBACK_TIMEOUT_SECONDS",
+            "0",
+            "VISION_FALLBACK_TIMEOUT",
+        ),
         ("GEMINI_MODEL", "", "GEMINI_MODEL"),
         ("GEMINI_TIMEOUT_SECONDS", "0", "GEMINI_TIMEOUT"),
+        ("GEMINI_VISION_MODEL", "", "GEMINI_VISION_MODEL"),
+        ("GEMINI_VISION_TIMEOUT_SECONDS", "0", "GEMINI_VISION_TIMEOUT"),
+        ("VISION_LOCAL_OCR_TIMEOUT_SECONDS", "0", "LOCAL_OCR_TIMEOUT"),
+        ("VISION_MAX_IMAGE_BYTES", "0", "MAX_IMAGE_BYTES"),
+        ("VISION_MAX_IMAGE_BYTES", "20971521", "MAX_IMAGE_BYTES"),
+        ("VISION_MAX_IMAGE_PIXELS", "0", "MAX_IMAGE_PIXELS"),
+        ("VISION_MAX_IMAGE_PIXELS", "100000001", "MAX_IMAGE_PIXELS"),
+        ("VISION_MAX_DESCRIPTION_CHARS", "0", "MAX_DESCRIPTION_CHARS"),
+        ("VISION_MAX_DESCRIPTION_CHARS", "4001", "MAX_DESCRIPTION_CHARS"),
+        ("VISION_MAX_VISIBLE_TEXT_CHARS", "0", "MAX_VISIBLE_TEXT_CHARS"),
+        ("VISION_MAX_VISIBLE_TEXT_CHARS", "16001", "MAX_VISIBLE_TEXT_CHARS"),
         ("CALENDAR_PLANNER_TIMEOUT_SECONDS", "0", "CALENDAR_PLANNER_TIMEOUT"),
         ("GEMINI_CLI_MODEL", "", "GEMINI_CLI_MODEL"),
     ],
@@ -141,6 +208,14 @@ def test_primary_and_fallback_models_must_be_different(monkeypatch):
     monkeypatch.setenv("OPENROUTER_FALLBACK_MODEL", "example/same:free")
 
     with pytest.raises(ValueError, match="must be different"):
+        Config()
+
+
+def test_openrouter_vision_models_must_be_different(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_VISION_MODEL", "example/same:free")
+    monkeypatch.setenv("OPENROUTER_VISION_FALLBACK_MODEL", "example/same:free")
+
+    with pytest.raises(ValueError, match="vision models must be different"):
         Config()
 
 

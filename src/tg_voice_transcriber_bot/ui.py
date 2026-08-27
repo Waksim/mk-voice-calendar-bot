@@ -23,10 +23,12 @@ from .text import utf16_units
 CalendarAction = Literal["create", "read", "update", "delete"]
 MutationAction = Literal["create", "update", "delete"]
 UndoAction = Literal["create", "update", "delete", "mixed"]
-InputKind = Literal["voice", "text"]
+InputKind = Literal["voice", "text", "image", "text_and_image"]
 ProgressPhase = Literal[
     "matching",
     "transcribing",
+    "image_downloading",
+    "vision",
     "gemini",
     "calendar_lookup",
     "gemini_match",
@@ -212,18 +214,20 @@ def format_progress_card(
     """Render the current processing phase as a small editable status card."""
     if action is not None and action not in _ACTION_LABELS:
         raise ValueError("invalid calendar action")
-    if input_kind not in {"voice", "text"}:
+    if input_kind not in {"voice", "text", "image", "text_and_image"}:
         raise ValueError("invalid input kind")
-    processing_header = (
-        "🎙️ <b>Обрабатываю голосовое</b>"
-        if input_kind == "voice"
-        else "💬 <b>Обрабатываю текстовую команду</b>"
-    )
-    command_received = (
-        "✅ Расшифровка Telegram получена"
-        if input_kind == "voice"
-        else "✅ Текстовая команда получена"
-    )
+    processing_header = {
+        "voice": "🎙️ <b>Обрабатываю голосовое</b>",
+        "text": "💬 <b>Обрабатываю текстовую команду</b>",
+        "image": "🖼️ <b>Обрабатываю изображение</b>",
+        "text_and_image": "🖼️ <b>Обрабатываю изображение с подписью</b>",
+    }[input_kind]
+    command_received = {
+        "voice": "✅ Расшифровка Telegram получена",
+        "text": "✅ Текстовая команда получена",
+        "image": "✅ Данные изображения распознаны",
+        "text_and_image": "✅ Подпись и данные изображения подготовлены",
+    }[input_kind]
     cards = {
         "matching": (
             "🎙️ <b>Обрабатываю голосовое</b>\n\n"
@@ -236,6 +240,20 @@ def format_progress_card(
             "🎙️ <b>Обрабатываю голосовое</b>\n\n"
             "✅ Голосовое найдено\n"
             "⏳ Получаю расшифровку от Telegram…\n"
+            "▫️ ИИ-планировщик\n"
+            "▫️ Google Calendar"
+        ),
+        "image_downloading": (
+            f"{processing_header}\n\n"
+            "⏳ Загружаю изображение из Telegram…\n"
+            "▫️ Распознавание текста и деталей\n"
+            "▫️ ИИ-планировщик\n"
+            "▫️ Google Calendar"
+        ),
+        "vision": (
+            f"{processing_header}\n\n"
+            "✅ Изображение загружено\n"
+            "⏳ Извлекаю текст и детали…\n"
             "▫️ ИИ-планировщик\n"
             "▫️ Google Calendar"
         ),

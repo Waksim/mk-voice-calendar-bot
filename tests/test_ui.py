@@ -42,6 +42,10 @@ def test_progress_cards_are_single_safe_html_messages():
     transcribing = format_progress_card("transcribing")
     gemini = format_progress_card("gemini")
     text_gemini = format_progress_card("gemini", input_kind="text")
+    image_downloading = format_progress_card("image_downloading", input_kind="image")
+    image_vision = format_progress_card("vision", input_kind="image")
+    image_gemini = format_progress_card("gemini", input_kind="image")
+    captioned_image = format_progress_card("gemini", input_kind="text_and_image")
     lookup = format_progress_card("calendar_lookup")
     matching_candidates = format_progress_card("gemini_match")
     calendar = format_progress_card("calendar", action="update")
@@ -54,21 +58,32 @@ def test_progress_cards_are_single_safe_html_messages():
     assert "Расшифровка Telegram получена" in gemini
     assert "Текстовая команда получена" in text_gemini
     assert "Обрабатываю текстовую команду" in text_gemini
+    assert "Загружаю изображение из Telegram" in image_downloading
+    assert "Извлекаю текст и детали" in image_vision
+    assert "Данные изображения распознаны" in image_gemini
+    assert "изображение с подписью" in captioned_image
     assert "Ищу события в Google Calendar" in lookup
     assert "ИИ-планировщик выбирает точную запись" in matching_candidates
     assert "ИИ-планировщик: изменить событие" in calendar
     assert "Обновляю событие" in calendar
     assert "Читаю события" in reading
-    assert all(utf16_units(ui._visible_text(card)) <= 4096 for card in (
-        matching,
-        transcribing,
-        gemini,
-        text_gemini,
-        lookup,
-        matching_candidates,
-        calendar,
-        reading,
-    ))
+    assert all(
+        utf16_units(ui._visible_text(card)) <= 4096
+        for card in (
+            matching,
+            transcribing,
+            gemini,
+            text_gemini,
+            image_downloading,
+            image_vision,
+            image_gemini,
+            captioned_image,
+            lookup,
+            matching_candidates,
+            calendar,
+            reading,
+        )
+    )
 
     with pytest.raises(ValueError, match="phase"):
         format_progress_card("unknown")  # type: ignore[arg-type]

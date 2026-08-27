@@ -10,6 +10,11 @@ from urllib.parse import urlsplit
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _MAX_USER_ID_FILE_BYTES = 128
 _MAX_TELEGRAM_USER_ID = (1 << 63) - 1
+_MAX_VISION_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_VISION_IMAGE_PIXELS = 100_000_000
+_MAX_VISION_DESCRIPTION_CHARS = 4_000
+_MAX_VISION_VISIBLE_TEXT_CHARS = 16_000
+_MAX_VISION_TIMEOUT_SECONDS = 300
 
 
 def _environment_path(name: str, default: Path) -> Path:
@@ -157,6 +162,27 @@ class Config:
     openrouter_max_tokens: int = field(
         default_factory=lambda: _environment_int("OPENROUTER_MAX_TOKENS", 8192)
     )
+    openrouter_vision_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "OPENROUTER_VISION_MODEL", "google/gemma-4-31b-it:free"
+        ).strip()
+    )
+    openrouter_vision_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int(
+            "OPENROUTER_VISION_TIMEOUT_SECONDS", 15
+        )
+    )
+    openrouter_vision_fallback_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "OPENROUTER_VISION_FALLBACK_MODEL",
+            "google/gemma-4-26b-a4b-it:free",
+        ).strip()
+    )
+    openrouter_vision_fallback_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int(
+            "OPENROUTER_VISION_FALLBACK_TIMEOUT_SECONDS", 12
+        )
+    )
     gemini_keychain_account: str = "codex.gemini.mk_voice_calendar_bot"
     gemini_keychain_service: str = "mk_voice_calendar_bot"
     gemini_api_key_environment: str = "GEMINI_API_KEY"
@@ -167,6 +193,47 @@ class Config:
     )
     gemini_timeout_seconds: int = field(
         default_factory=lambda: _environment_int("GEMINI_TIMEOUT_SECONDS", 25)
+    )
+    gemini_vision_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "GEMINI_VISION_MODEL", "gemini-3.7-flash"
+        ).strip()
+    )
+    gemini_vision_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int(
+            "GEMINI_VISION_TIMEOUT_SECONDS", 20
+        )
+    )
+    vision_local_ocr_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int(
+            "VISION_LOCAL_OCR_TIMEOUT_SECONDS", 15
+        )
+    )
+    vision_max_image_bytes: int = field(
+        default_factory=lambda: _environment_int(
+            "VISION_MAX_IMAGE_BYTES", 8 * 1024 * 1024
+        )
+    )
+    vision_max_image_pixels: int = field(
+        default_factory=lambda: _environment_int(
+            "VISION_MAX_IMAGE_PIXELS", 20_000_000
+        )
+    )
+    vision_max_description_chars: int = field(
+        default_factory=lambda: _environment_int(
+            "VISION_MAX_DESCRIPTION_CHARS", 4_000
+        )
+    )
+    vision_max_visible_text_chars: int = field(
+        default_factory=lambda: _environment_int(
+            "VISION_MAX_VISIBLE_TEXT_CHARS", 12_000
+        )
+    )
+    vision_ocr_model_dir: Path = field(
+        default_factory=lambda: _environment_path(
+            "VISION_OCR_MODEL_DIR",
+            PROJECT_ROOT / ".runtime" / "rapidocr-models",
+        ).resolve()
     )
     calendar_planner_timeout_seconds: int = field(
         default_factory=lambda: _environment_int(
@@ -295,10 +362,70 @@ class Config:
             raise ValueError(
                 "OPENROUTER_MAX_TOKENS must be between 1 and 65536"
             )
+        if not self.openrouter_vision_model:
+            raise ValueError("OPENROUTER_VISION_MODEL must not be empty")
+        if not (
+            1
+            <= self.openrouter_vision_timeout_seconds
+            <= _MAX_VISION_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "OPENROUTER_VISION_TIMEOUT_SECONDS must be between 1 and 300"
+            )
+        if not self.openrouter_vision_fallback_model:
+            raise ValueError("OPENROUTER_VISION_FALLBACK_MODEL must not be empty")
+        if self.openrouter_vision_fallback_model == self.openrouter_vision_model:
+            raise ValueError("OpenRouter vision models must be different")
+        if not (
+            1
+            <= self.openrouter_vision_fallback_timeout_seconds
+            <= _MAX_VISION_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "OPENROUTER_VISION_FALLBACK_TIMEOUT_SECONDS must be between 1 and 300"
+            )
         if not self.gemini_model:
             raise ValueError("GEMINI_MODEL must not be empty")
         if self.gemini_timeout_seconds <= 0:
             raise ValueError("GEMINI_TIMEOUT_SECONDS must be positive")
+        if not self.gemini_vision_model:
+            raise ValueError("GEMINI_VISION_MODEL must not be empty")
+        if not 1 <= self.gemini_vision_timeout_seconds <= _MAX_VISION_TIMEOUT_SECONDS:
+            raise ValueError(
+                "GEMINI_VISION_TIMEOUT_SECONDS must be between 1 and 300"
+            )
+        if not (
+            1
+            <= self.vision_local_ocr_timeout_seconds
+            <= _MAX_VISION_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "VISION_LOCAL_OCR_TIMEOUT_SECONDS must be between 1 and 300"
+            )
+        if not 1 <= self.vision_max_image_bytes <= _MAX_VISION_IMAGE_BYTES:
+            raise ValueError(
+                "VISION_MAX_IMAGE_BYTES must be between 1 and 20971520"
+            )
+        if not 1 <= self.vision_max_image_pixels <= _MAX_VISION_IMAGE_PIXELS:
+            raise ValueError(
+                "VISION_MAX_IMAGE_PIXELS must be between 1 and 100000000"
+            )
+        if not (
+            1
+            <= self.vision_max_description_chars
+            <= _MAX_VISION_DESCRIPTION_CHARS
+        ):
+            raise ValueError(
+                "VISION_MAX_DESCRIPTION_CHARS must be between 1 and 4000"
+            )
+        if not (
+            1
+            <= self.vision_max_visible_text_chars
+            <= _MAX_VISION_VISIBLE_TEXT_CHARS
+        ):
+            raise ValueError(
+                "VISION_MAX_VISIBLE_TEXT_CHARS must be between 1 and 16000"
+            )
         if self.calendar_planner_timeout_seconds <= 0:
             raise ValueError("CALENDAR_PLANNER_TIMEOUT_SECONDS must be positive")
         minimum_chain_timeout = (

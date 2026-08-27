@@ -807,8 +807,8 @@ def test_model_context_is_bounded_and_never_contains_event_snapshots(tmp_path):
         separators=(",", ":"),
     )
 
-    assert len(context.application_state["candidate_events"]) == 12
-    assert len(context.event_id_by_ref) == 12
+    assert len(context.application_state["candidate_events"]) == 8
+    assert len(context.event_id_by_ref) == 8
     assert len(model_payload.encode("utf-8")) < 40_000
     assert "thought_signature" not in model_payload
     assert '"before"' not in model_payload

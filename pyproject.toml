@@ -5,13 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tg-voice-transcriber-bot"
 version = "0.1.0"
-description = "Owner-only Telegram voice/text bot for Google Calendar"
+description = "Owner-only Telegram voice/text/image bot for Google Calendar"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.12.15,<4",
     "httpx>=0.28.1,<1",
     "mcp>=1.23.0,<2",
+    "onnxruntime>=1.23,<2",
+    "pillow>=11.3,<13",
     "python-dotenv>=1.1,<2",
+    "rapidocr>=3.9.2,<4",
 ]
 
 [project.scripts]
