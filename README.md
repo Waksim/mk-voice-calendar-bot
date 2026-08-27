@@ -6,25 +6,27 @@ Bot API. Голосовое
 сопоставляется с исходящим сообщением в выбранной пользовательской сессии и
 расшифровывается вызовом Telegram MTProto `messages.transcribeAudio`; файл не
 скачивается, распознавание выполняется на серверах Telegram. Текст сразу
-переходит к планированию без Telegram user session. Planner по строгой JSON
-Schema вызывает провайдеров в фиксированном порядке: бесплатный
-`nvidia/nemotron-3-super-120b-a12b:free` через OpenRouter, затем бесплатный
-`z-ai/glm-5.2:free` через OpenRouter и, если оба не ответили пригодным планом,
-напрямую Gemini API. Эта цепочка планирует создание, изменение или удаление
-календарных событий. Однозначные команды чтения вроде «покажи события в
+переходит к планированию без Telegram user session. Planner вызывает провайдеров
+в фиксированном порядке: direct API `GigaChat-2-Max` с принудительным вызовом
+функции и строгой схемой аргументов, бесплатный
+`nvidia/nemotron-3-super-120b-a12b:free` через OpenRouter, бесплатный
+`z-ai/glm-5.2:free` через OpenRouter и затем direct Gemini API. Эта цепочка
+планирует создание, изменение или удаление календарных событий. Однозначные
+команды чтения вроде «покажи события в
 ближайший час» разбираются детерминированно без LLM. Операция сразу выполняется
 в основном Google Calendar, а финальная карточка содержит кнопку отмены. Для
 удаления событий с расширенными provider-метаданными отмена восстанавливает
 основные календарные поля, но может не вернуть гостей, цвет, конференцию или
 нестандартные напоминания.
 
-У OpenRouter-ступеней нет внутренних повторов: тайм-аут, `408`, `429`, `5xx`,
-отказ маршрута или ответ вне схемы сразу передают тот же запрос следующей
-модели. Nemotron получает не более 35 секунд, GLM — 15 секунд, прямой Gemini —
-25 секунд; весь один вызов planner дополнительно ограничен общим дедлайном 80
-секунд, поэтому поздняя ступень получает только оставшееся время. Ошибки
-авторизации и лимитов показываются как недоступность провайдера, а не как ошибка
-разбора календарной команды.
+GigaChat получает не более 45 секунд и делает не более одного ограниченного
+повтора при `429`/`5xx`. У OpenRouter-ступеней нет внутренних повторов: тайм-аут,
+`408`, `429`, `5xx`, отказ маршрута или ответ вне схемы сразу передают тот же
+запрос следующей модели. Nemotron получает не более 35 секунд, GLM — 15 секунд,
+прямой Gemini — 25 секунд; весь один вызов planner дополнительно ограничен общим
+дедлайном 125 секунд, поэтому поздняя ступень получает только оставшееся время.
+Ошибки авторизации и лимитов показываются как недоступность провайдера, а не как
+ошибка разбора календарной команды.
 
 К каждому новому запросу модель получает максимум два последних диалоговых хода
 и одно компактное, нормализованное представление каждого релевантного события.
@@ -77,17 +79,28 @@ provider reject подтверждается чтением детерминир
 `personal` и `work` оба направляются в авторизованный MCP-аккаунт `owner` и
 календарь `primary`.
 
-Основные OpenRouter-модели используют бесплатные `:free`-маршруты. Бесплатность
+Основной текстовый planner — direct API `GigaChat-2-Max`. Бот получает
+короткоживущий OAuth-токен по `GIGACHAT_CREDENTIALS`, кэширует его и проверяет
+TLS официальным корневым сертификатом НУЦ Минцифры из
+`deploy/server/certs/russian_trusted_root_ca_pem.crt`. В Git credential и
+access token не сохраняются. Формат интеграции следует официальной документации
+по [авторизации](https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/gigachat-api),
+[вызову функций](https://developers.sber.ru/docs/ru/gigachat/guides/functions/generating-arguments-for-custom-functions)
+и [сертификатам](https://developers.sber.ru/docs/ru/gigachat/certificates).
+
+Резервные OpenRouter-модели используют бесплатные `:free`-маршруты. Бесплатность
 не означает гарантированную доступность: OpenRouter может применять низкие
 rate limits, возвращать `429`, временно не иметь подходящего upstream-провайдера
 или изменить доступность модели. Поэтому Gemini API остаётся независимой
-третьей ступенью; для полноценного production failover обязательны оба секрета
-`OPENROUTER_API_KEY` и `GEMINI_API_KEY`. Положительный платный баланс
+четвёртой ступенью; для полноценной production-цепочки нужны секреты
+`GIGACHAT_CREDENTIALS`, `OPENROUTER_API_KEY` и `GEMINI_API_KEY`. Положительный платный баланс
 OpenRouter для `:free`-моделей не требуется, однако API-ключ должен быть
 валидным и не иметь исчерпанного собственного лимита.
 
 Параметры цепочки по умолчанию:
 
+- GigaChat: `GIGACHAT_MODEL=GigaChat-2-Max`,
+  `GIGACHAT_SCOPE=GIGACHAT_API_CORP`, `GIGACHAT_TIMEOUT_SECONDS=45`;
 - Nemotron: `OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free`,
   `OPENROUTER_REASONING_EFFORT=medium`,
   `OPENROUTER_TIMEOUT_SECONDS=35`;
@@ -97,7 +110,7 @@ OpenRouter для `:free`-моделей не требуется, однако A
 - Gemini: `GEMINI_MODEL=gemini-3.7-flash`,
   `GEMINI_TIMEOUT_SECONDS=25`;
 - общий предел одного planner-вызова:
-  `CALENDAR_PLANNER_TIMEOUT_SECONDS=80`.
+  `CALENDAR_PLANNER_TIMEOUT_SECONDS=125`.
 
 Для обеих OpenRouter-ступеней общий потолок ответа задаётся
 `OPENROUTER_MAX_TOKENS` (по умолчанию 8192). Stage timeout ограничивает один
@@ -110,8 +123,8 @@ OpenRouter для `:free`-моделей не требуется, однако A
 только нейтральное описание и максимально буквальную расшифровку видимого
 текста. Эти два поля передаются в уже существующий planner как недоверенное
 содержимое изображения вместе с подписью пользователя, если она есть. Решение о
-CRUD, датах, времени и намерении пользователя по-прежнему принимает цепочка
-Nemotron → GLM → Gemini.
+CRUD, датах, времени и намерении пользователя по-прежнему принимает текстовая
+цепочка GigaChat 2 Max → Nemotron → GLM → Gemini.
 
 Vision-провайдеры вызываются по одному, без общего дедлайна между ступенями:
 
@@ -147,9 +160,10 @@ read-only, поэтому контейнеру не нужен доступ к �
 - Production-секреты не хранятся в GitHub. Они монтируются read-only из
   `/etc/mk-voice-calendar-bot`; runtime и OAuth state живут отдельно в
   `/srv/mk-voice-calendar-bot/runtime`.
-- Ключи OpenRouter и Gemini читаются из environment/secret files и передаются
-  только в заголовках провайдерских HTTPS-запросов; они не попадают в URL или
-  сообщения об ошибках.
+- GigaChat credential, ключи OpenRouter и Gemini читаются из environment/secret
+  files и передаются только в заголовках провайдерских HTTPS-запросов; они не
+  попадают в URL или сообщения об ошибках. GigaChat access token хранится только
+  в памяти процесса.
 - Telegram user sessions получает из файлов только изолированный gateway;
   приложение обращается к нему как к MCP subprocess.
 - Calendar MCP запускается с allowlist только из `create-event`, `get-event`,
@@ -181,7 +195,8 @@ commit read-only deploy key, собирает content-addressed образы, ж
 ```sh
 cp .env.example .env
 chmod 600 .env
-# Заполните оба Telegram user ID, OPENROUTER_API_KEY и GEMINI_API_KEY.
+# Заполните оба Telegram user ID, GIGACHAT_CREDENTIALS, OPENROUTER_API_KEY и
+# GEMINI_API_KEY.
 uv sync --locked --group dev
 uv run pytest -q
 docker compose -f deploy/server/compose.yaml config --quiet

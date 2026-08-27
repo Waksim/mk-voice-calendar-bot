@@ -42,6 +42,15 @@ from .gemini import (
     PLANNER_MODEL_FIELD,
     planner_diagnostic_context,
 )
+from .gigachat import (
+    GigaChatApi,
+    GigaChatApiError,
+    GigaChatAuthenticationError,
+    GigaChatConfigurationError,
+    GigaChatQuotaError,
+    GigaChatRateLimitError,
+    GigaChatRequestRejectedError,
+)
 from .intent import format_calendar_preview
 from .operations import (
     CalendarOperationError,
@@ -825,6 +834,31 @@ def _planner_timed_out(exc: GeminiError) -> bool:
 
 
 def _planner_failure_copy(exc: GeminiError, *, matching: bool = False) -> str:
+    if isinstance(exc, GigaChatAuthenticationError):
+        return (
+            "GigaChat отклонил авторизацию, а резервные модели тоже не "
+            "ответили. Проверьте credentials и scope, затем повторите команду."
+        )
+    if isinstance(exc, GigaChatConfigurationError):
+        return (
+            "GigaChat отклонил настройки модели или подключения, а резервные "
+            "модели тоже не ответили. Проверьте конфигурацию и повторите команду."
+        )
+    if isinstance(exc, GigaChatRequestRejectedError):
+        return (
+            "GigaChat отклонил запрос, а резервные модели тоже не ответили. "
+            "Google Calendar не изменён; уточните формулировку и повторите."
+        )
+    if isinstance(exc, GigaChatQuotaError):
+        return (
+            "GigaChat отклонил запрос из-за квоты или тарифа, а резервные "
+            "модели тоже не ответили. Проверьте доступ и повторите команду."
+        )
+    if isinstance(exc, GigaChatRateLimitError):
+        return (
+            "Провайдеры ИИ-планировщика временно ограничили запросы. "
+            "Подождите немного и повторите команду."
+        )
     if isinstance(exc, OpenRouterAuthenticationError):
         return (
             "OpenRouter отклонил API-ключ, а резервные модели тоже не ответили. "
@@ -2710,6 +2744,45 @@ async def async_main() -> None:
         completed_update_limit=config.webhook_completed_ids_limit,
     )
     planner_stages: list[GeminiProviderStage] = []
+    gigachat_credentials: str | None = None
+    try:
+        gigachat_credentials = read_secret(
+            environment=config.gigachat_credentials_environment,
+            account=config.gigachat_keychain_account,
+            service=config.gigachat_keychain_service,
+        )
+    except RuntimeError:
+        LOGGER.warning("GigaChat credentials unavailable; skipping GigaChat")
+    else:
+        try:
+            gigachat_provider = GigaChatApi(
+                gigachat_credentials,
+                ca_bundle_path=config.gigachat_ca_bundle_file,
+                timeout_seconds=config.gigachat_timeout_seconds,
+                timezone=config.calendar_timezone,
+                scope=config.gigachat_scope,
+                model=config.gigachat_model,
+                base_url=config.gigachat_base_url,
+                auth_url=config.gigachat_auth_url,
+                max_retries=1,
+            )
+        except GigaChatApiError as exc:
+            LOGGER.warning(
+                "GigaChat provider configuration unavailable; "
+                "error_type=%s error=%s; skipping GigaChat",
+                type(exc).__name__,
+                str(exc),
+            )
+        else:
+            planner_stages.append(
+                GeminiProviderStage(
+                    "GigaChat 2 Max",
+                    gigachat_provider,
+                    config.gigachat_timeout_seconds,
+                )
+            )
+        finally:
+            gigachat_credentials = None
     openrouter_api_key: str | None = None
     try:
         openrouter_api_key = read_secret(
@@ -2771,7 +2844,7 @@ async def async_main() -> None:
                     await cleanup_chain.aclose()
                 except GeminiError:
                     LOGGER.warning(
-                        "OpenRouter client cleanup failed during startup abort"
+                        "Planner provider cleanup failed during startup abort"
                     )
             raise RuntimeError(
                 "Gemini API key is required in webhook mode"

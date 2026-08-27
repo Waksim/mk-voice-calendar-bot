@@ -25,9 +25,15 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         openrouter_fallback_timeout_seconds=15,
         openrouter_fallback_reasoning_effort="high",
         openrouter_max_tokens=8192,
+        gigachat_scope="GIGACHAT_API_CORP",
+        gigachat_model="GigaChat-2-Max",
+        gigachat_base_url="https://giga.example.test/v1",
+        gigachat_auth_url="https://oauth.giga.example.test/token",
+        gigachat_ca_bundle_file=tmp_path / "giga-root.pem",
+        gigachat_timeout_seconds=45,
         gemini_model="gemini-3.7-flash",
         gemini_timeout_seconds=25,
-        calendar_planner_timeout_seconds=80,
+        calendar_planner_timeout_seconds=125,
         calendar_mcp_working_directory=calendar_root,
         calendar_mcp_binary_path=binary,
         calendar_mcp_oauth_credentials_path=tmp_path / "oauth.json",
@@ -39,6 +45,11 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
     def fake_read_secret(*, environment, account=None, service=None):
         if environment == config.bot_token_environment:
             return "fake-bot-token"
+        if environment == config.gigachat_credentials_environment:
+            assert account == config.gigachat_keychain_account
+            assert service == config.gigachat_keychain_service
+            sequence.append("gigachat_secret_read")
+            return "fake-gigachat-credentials"
         if environment == config.openrouter_api_key_environment:
             assert account == config.openrouter_keychain_account
             assert service == config.openrouter_keychain_service
@@ -50,6 +61,16 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
             sequence.append("gemini_secret_read")
             return "fake-gemini-key"
         raise RuntimeError("Unexpected secret request")
+
+    class FakeGigaChatApi:
+        def __init__(self, credentials, **kwargs):
+            assert credentials == "fake-gigachat-credentials"
+            self.model = kwargs["model"]
+            self.kwargs = kwargs
+            captured["gigachat_client"] = self
+
+        async def aclose(self):
+            sequence.append(f"provider_close:{self.model}")
 
     class FakeOpenRouterApi:
         def __init__(self, api_key, **kwargs):
@@ -132,6 +153,7 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         service_module, "read_secret", fake_read_secret
     )
     monkeypatch.setattr(service_module, "BotApi", FakeBotApi)
+    monkeypatch.setattr(service_module, "GigaChatApi", FakeGigaChatApi)
     monkeypatch.setattr(service_module, "OpenRouterApi", FakeOpenRouterApi)
     monkeypatch.setattr(service_module, "GeminiApi", FakeGeminiApi)
     monkeypatch.setattr(service_module, "open_gateway", fake_open_gateway)
@@ -175,6 +197,17 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         "max_tokens": 8192,
         "max_retries": 0,
     }
+    gigachat_client = captured["gigachat_client"]
+    assert gigachat_client.kwargs == {
+        "ca_bundle_path": tmp_path / "giga-root.pem",
+        "timeout_seconds": 45,
+        "timezone": "Europe/Moscow",
+        "scope": "GIGACHAT_API_CORP",
+        "model": "GigaChat-2-Max",
+        "base_url": "https://giga.example.test/v1",
+        "auth_url": "https://oauth.giga.example.test/token",
+        "max_retries": 1,
+    }
     gemini_client = captured["gemini_client"]
     assert gemini_client.kwargs == {
         "model": "gemini-3.7-flash",
@@ -184,19 +217,22 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
     }
     planner = captured["planner"]
     assert isinstance(planner, service_module.GeminiProviderChain)
-    assert planner.timeout_seconds == 80
+    assert planner.timeout_seconds == 125
     assert [stage.name for stage in planner.stages] == [
+        "GigaChat 2 Max",
         "Nemotron 3 Super",
         "GLM 5.2 Free",
         "Gemini 3.7 Flash",
     ]
-    assert [stage.timeout_seconds for stage in planner.stages] == [35, 15, 25]
+    assert [stage.timeout_seconds for stage in planner.stages] == [45, 35, 15, 25]
     assert [stage.provider for stage in planner.stages] == [
+        gigachat_client,
         openrouter_clients[0],
         openrouter_clients[1],
         gemini_client,
     ]
     assert sequence == [
+        "gigachat_secret_read",
         "openrouter_secret_read",
         "gemini_secret_read",
         "bot_open",
@@ -208,6 +244,7 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         "calendar_close",
         "gateway_close",
         "bot_close",
+        "provider_close:GigaChat-2-Max",
         "provider_close:nvidia/nemotron-3-super-120b-a12b:free",
         "provider_close:z-ai/glm-5.2:free",
         "provider_close:gemini-3.7-flash",
@@ -235,15 +272,30 @@ def test_webhook_listener_registration_ownership(
     )
     sequence = []
     planners = []
+    secret_requests = []
+    gigachat_constructor_attempts = []
 
     def fake_read_secret(*, environment, account=None, service=None):
+        secret_requests.append((environment, account, service))
         if environment == config.bot_token_environment:
             return "fake-bot-token"
         if environment == config.webhook_secret_environment:
             return "webhook_secret-123"
+        if environment == config.gigachat_credentials_environment:
+            if register_with_telegram:
+                return "fake-gigachat-credentials"
+            raise RuntimeError("GigaChat credentials intentionally absent")
         if environment == config.gemini_api_key_environment:
             return "fake-gemini-key"
         raise RuntimeError("OpenRouter key intentionally absent")
+
+    class RejectedGigaChatApi:
+        def __init__(self, credentials, **kwargs):
+            assert credentials == "fake-gigachat-credentials"
+            gigachat_constructor_attempts.append(kwargs)
+            raise service_module.GigaChatConfigurationError(
+                "GigaChat CA bundle is unavailable"
+            )
 
     class FakeBotApi:
         def __init__(self, token):
@@ -304,6 +356,7 @@ def test_webhook_listener_registration_ownership(
     monkeypatch.setattr(service_module, "Config", lambda: config)
     monkeypatch.setattr(service_module, "read_secret", fake_read_secret)
     monkeypatch.setattr(service_module, "BotApi", FakeBotApi)
+    monkeypatch.setattr(service_module, "GigaChatApi", RejectedGigaChatApi)
     monkeypatch.setattr(service_module, "open_gateway", fake_open_gateway)
     monkeypatch.setattr(service_module, "open_calendar_mcp", fake_open_calendar_mcp)
     monkeypatch.setattr(service_module, "VoiceBotService", FakeVoiceBotService)
@@ -318,6 +371,11 @@ def test_webhook_listener_registration_ownership(
     assert "webhook_run" in sequence
     assert "webhook_close" in sequence
     assert len(planners) == 1
+    assert (
+        config.gigachat_credentials_environment,
+        config.gigachat_keychain_account,
+        config.gigachat_keychain_service,
+    ) in secret_requests
     assert isinstance(planners[0], service_module.GeminiProviderChain)
     assert planners[0].timeout_seconds == config.calendar_planner_timeout_seconds
     assert [stage.name for stage in planners[0].stages] == [
@@ -328,6 +386,7 @@ def test_webhook_listener_registration_ownership(
         planners[0].stages[0].timeout_seconds
         == config.gemini_timeout_seconds
     )
+    assert len(gigachat_constructor_attempts) == int(register_with_telegram)
     assert sequence[-3:] == ["calendar_close", "gateway_close", "bot_close"]
 
 

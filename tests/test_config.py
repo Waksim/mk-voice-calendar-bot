@@ -6,6 +6,22 @@ from tg_voice_transcriber_bot.config import PROJECT_ROOT, Config
 def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     config = Config()
 
+    assert config.gigachat_credentials_environment == "GIGACHAT_CREDENTIALS"
+    assert config.gigachat_scope == "GIGACHAT_API_CORP"
+    assert config.gigachat_model == "GigaChat-2-Max"
+    assert config.gigachat_base_url == "https://api.giga.chat/v1"
+    assert (
+        config.gigachat_auth_url
+        == "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    )
+    assert config.gigachat_ca_bundle_file == (
+        PROJECT_ROOT
+        / "deploy"
+        / "server"
+        / "certs"
+        / "russian_trusted_root_ca_pem.crt"
+    )
+    assert config.gigachat_timeout_seconds == 45
     assert config.openrouter_api_key_environment == "OPENROUTER_API_KEY"
     assert config.openrouter_model == "nvidia/nemotron-3-super-120b-a12b:free"
     assert config.openrouter_timeout_seconds == 35
@@ -36,7 +52,7 @@ def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     assert config.vision_ocr_model_dir == (
         PROJECT_ROOT / ".runtime" / "rapidocr-models"
     )
-    assert config.calendar_planner_timeout_seconds == 80
+    assert config.calendar_planner_timeout_seconds == 125
     assert config.gemini_cli_model == "gemini-3.7-flash-high"
     assert config.calendar_mcp_package_version == "2.6.2"
     assert config.calendar_mcp_working_directory == PROJECT_ROOT / "calendar-mcp"
@@ -89,6 +105,12 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("TELEGRAM_WEBHOOK_REGISTER", "false")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_PATH", "/telegram/managed/webhook")
     monkeypatch.setenv("CALENDAR_MCP_PROCESS_PATH", "/usr/local/bin:/usr/bin:/bin")
+    monkeypatch.setenv("GIGACHAT_SCOPE", "GIGACHAT_API_B2B")
+    monkeypatch.setenv("GIGACHAT_MODEL", "GigaChat-test")
+    monkeypatch.setenv("GIGACHAT_BASE_URL", "https://giga.example.test/v1")
+    monkeypatch.setenv("GIGACHAT_AUTH_URL", "https://auth.example.test/oauth")
+    monkeypatch.setenv("GIGACHAT_CA_BUNDLE_FILE", str(tmp_path / "giga-ca.crt"))
+    monkeypatch.setenv("GIGACHAT_TIMEOUT_SECONDS", "50")
     monkeypatch.setenv("OPENROUTER_MODEL", "meta/muse-spark-1.2")
     monkeypatch.setenv("OPENROUTER_TIMEOUT_SECONDS", "60")
     monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", "medium")
@@ -112,7 +134,7 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("VISION_MAX_DESCRIPTION_CHARS", "3900")
     monkeypatch.setenv("VISION_MAX_VISIBLE_TEXT_CHARS", "11000")
     monkeypatch.setenv("VISION_OCR_MODEL_DIR", str(tmp_path / "ocr-models"))
-    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "165")
     monkeypatch.setenv("GEMINI_CLI_MODEL", "gemini-cli-test-model")
 
     config = Config()
@@ -124,6 +146,12 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.webhook_listen_host == "0.0.0.0"
     assert config.webhook_listen_port == 8090
     assert config.calendar_mcp_env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+    assert config.gigachat_scope == "GIGACHAT_API_B2B"
+    assert config.gigachat_model == "GigaChat-test"
+    assert config.gigachat_base_url == "https://giga.example.test/v1"
+    assert config.gigachat_auth_url == "https://auth.example.test/oauth"
+    assert config.gigachat_ca_bundle_file == tmp_path / "giga-ca.crt"
+    assert config.gigachat_timeout_seconds == 50
     assert config.openrouter_model == "meta/muse-spark-1.2"
     assert config.openrouter_timeout_seconds == 60
     assert config.openrouter_reasoning_effort == "medium"
@@ -145,13 +173,18 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.vision_max_description_chars == 3_900
     assert config.vision_max_visible_text_chars == 11_000
     assert config.vision_ocr_model_dir == tmp_path / "ocr-models"
-    assert config.calendar_planner_timeout_seconds == 120
+    assert config.calendar_planner_timeout_seconds == 165
     assert config.gemini_cli_model == "gemini-cli-test-model"
 
 
 @pytest.mark.parametrize(
     "environment,value,error",
     [
+        ("GIGACHAT_SCOPE", "invalid", "GIGACHAT_SCOPE"),
+        ("GIGACHAT_MODEL", "", "GIGACHAT_MODEL"),
+        ("GIGACHAT_TIMEOUT_SECONDS", "0", "GIGACHAT_TIMEOUT"),
+        ("GIGACHAT_BASE_URL", "http://giga.test/v1", "plain HTTPS"),
+        ("GIGACHAT_AUTH_URL", "https://user@giga.test/oauth", "plain HTTPS"),
         ("OPENROUTER_MODEL", "", "MODEL"),
         ("OPENROUTER_TIMEOUT_SECONDS", "0", "TIMEOUT"),
         ("OPENROUTER_REASONING_EFFORT", "maximum", "REASONING"),
@@ -220,7 +253,7 @@ def test_openrouter_vision_models_must_be_different(monkeypatch):
 
 
 def test_planner_deadline_must_cover_every_provider_stage(monkeypatch):
-    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "74")
+    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "119")
 
     with pytest.raises(ValueError, match="must cover all provider stages"):
         Config()

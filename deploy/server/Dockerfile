@@ -51,6 +51,12 @@ RUN mkdir -p /opt/rapidocr-models \
     && test -s /opt/rapidocr-models/cyrillic_PP-OCRv5_rec_mobile.onnx \
     && chmod -R a-w /opt/rapidocr-models
 
+# GigaChat uses the Russian National Certification Authority chain. Keep the
+# public root certificate pinned in the image and verify both OAuth and API TLS
+# instead of disabling certificate validation.
+COPY deploy/server/certs/russian_trusted_root_ca_pem.crt /opt/gigachat-ca/russian_trusted_root_ca_pem.crt
+RUN chmod 0444 /opt/gigachat-ca/russian_trusted_root_ca_pem.crt
+
 COPY README.md /app/
 COPY src /app/src
 RUN /opt/venv/bin/pip install --no-cache-dir --no-deps /app

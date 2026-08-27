@@ -128,6 +128,43 @@ class Config:
     )
     gateway_call_timeout_seconds: int = 30
     transcription_timeout_seconds: int = 180
+    gigachat_keychain_account: str = "codex.gigachat.mk_voice_calendar_bot"
+    gigachat_keychain_service: str = "mk_voice_calendar_bot"
+    gigachat_credentials_environment: str = "GIGACHAT_CREDENTIALS"
+    gigachat_scope: str = field(
+        default_factory=lambda: os.environ.get(
+            "GIGACHAT_SCOPE", "GIGACHAT_API_CORP"
+        ).strip()
+    )
+    gigachat_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "GIGACHAT_MODEL", "GigaChat-2-Max"
+        ).strip()
+    )
+    gigachat_base_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "GIGACHAT_BASE_URL", "https://api.giga.chat/v1"
+        ).strip()
+    )
+    gigachat_auth_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "GIGACHAT_AUTH_URL",
+            "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+        ).strip()
+    )
+    gigachat_ca_bundle_file: Path = field(
+        default_factory=lambda: _environment_path(
+            "GIGACHAT_CA_BUNDLE_FILE",
+            PROJECT_ROOT
+            / "deploy"
+            / "server"
+            / "certs"
+            / "russian_trusted_root_ca_pem.crt",
+        ).resolve()
+    )
+    gigachat_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int("GIGACHAT_TIMEOUT_SECONDS", 45)
+    )
     openrouter_keychain_account: str = "codex.openrouter.mk_voice_calendar_bot"
     openrouter_keychain_service: str = "mk_voice_calendar_bot"
     openrouter_api_key_environment: str = "OPENROUTER_API_KEY"
@@ -237,7 +274,7 @@ class Config:
     )
     calendar_planner_timeout_seconds: int = field(
         default_factory=lambda: _environment_int(
-            "CALENDAR_PLANNER_TIMEOUT_SECONDS", 80
+            "CALENDAR_PLANNER_TIMEOUT_SECONDS", 125
         )
     )
     gemini_cli_path: Path = field(
@@ -334,6 +371,30 @@ class Config:
     )
 
     def __post_init__(self) -> None:
+        if self.gigachat_scope not in {
+            "GIGACHAT_API_PERS",
+            "GIGACHAT_API_B2B",
+            "GIGACHAT_API_CORP",
+        }:
+            raise ValueError("GIGACHAT_SCOPE is invalid")
+        if not self.gigachat_model:
+            raise ValueError("GIGACHAT_MODEL must not be empty")
+        if self.gigachat_timeout_seconds <= 0:
+            raise ValueError("GIGACHAT_TIMEOUT_SECONDS must be positive")
+        for environment, value in (
+            ("GIGACHAT_BASE_URL", self.gigachat_base_url),
+            ("GIGACHAT_AUTH_URL", self.gigachat_auth_url),
+        ):
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(f"{environment} must be a plain HTTPS URL")
         if not self.openrouter_model:
             raise ValueError("OPENROUTER_MODEL must not be empty")
         if self.openrouter_timeout_seconds <= 0:
@@ -429,7 +490,8 @@ class Config:
         if self.calendar_planner_timeout_seconds <= 0:
             raise ValueError("CALENDAR_PLANNER_TIMEOUT_SECONDS must be positive")
         minimum_chain_timeout = (
-            self.openrouter_timeout_seconds
+            self.gigachat_timeout_seconds
+            + self.openrouter_timeout_seconds
             + self.openrouter_fallback_timeout_seconds
             + self.gemini_timeout_seconds
         )

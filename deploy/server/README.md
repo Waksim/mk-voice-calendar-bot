@@ -16,6 +16,7 @@ are mounted read-only from `/etc/mk-voice-calendar-bot/secrets`. Required values
 must use mode `0600`:
 
 - `telegram-bot-token`
+- `gigachat-credentials`
 - `openrouter-api-key`
 - `gemini-api-key`
 - `telegram-api-id`
@@ -27,10 +28,11 @@ must use mode `0600`:
 - `telegram-webhook-secret`
 
 The bot reads provider credentials only through
-`OPENROUTER_API_KEY_FILE=/run/secrets/openrouter-api-key` and
-`GEMINI_API_KEY_FILE=/run/secrets/gemini-api-key`. Both secrets are required for
-the complete failover chain. Do not put either key in Compose, an image layer,
-or the release checkout.
+`GIGACHAT_CREDENTIALS_FILE=/run/secrets/gigachat-credentials`,
+`OPENROUTER_API_KEY_FILE=/run/secrets/openrouter-api-key`, and
+`GEMINI_API_KEY_FILE=/run/secrets/gemini-api-key`. All three secrets are required
+for the complete failover chain. Do not put them in Compose, an image layer, or
+the release checkout.
 
 At least one of the two `telegram-session-*` files must contain a dedicated
 production `StringSession`; the other may be absent or empty while that account
@@ -40,27 +42,35 @@ duplicated and permanently revokes that session.
 
 Calendar planning uses a strict ordered provider chain:
 
-1. OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`, reasoning effort
-   `medium`, stage timeout 35 seconds;
-2. OpenRouter `z-ai/glm-5.2:free`, reasoning effort `high`, stage timeout 15
+1. direct GigaChat API `GigaChat-2-Max`, forced function call, stage timeout 45
    seconds;
-3. direct Gemini API `gemini-3.7-flash`, stage timeout 25 seconds.
+2. OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`, reasoning effort
+   `medium`, stage timeout 35 seconds;
+3. OpenRouter `z-ai/glm-5.2:free`, reasoning effort `high`, stage timeout 15
+   seconds;
+4. direct Gemini API `gemini-3.7-flash`, stage timeout 25 seconds.
 
-Each planner invocation also has an 80-second overall deadline. A later stage
-receives at most the time left under that deadline. The two free OpenRouter
+Each planner invocation also has a 125-second overall deadline. A later stage
+receives at most the time left under that deadline. GigaChat makes at most one
+bounded retry for `429` and retryable `5xx` responses. The two free OpenRouter
 stages deliberately use no same-model retries: timeout, `408`, `429`, `5xx`, an
-unavailable route, or invalid structured output advances immediately to the
-next stage. This prevents a throttled free route from consuming the whole
-request budget before Gemini can run.
+unavailable route, or invalid structured output advances immediately to the next
+stage. This prevents a throttled route from consuming the whole request budget
+before the terminal provider can run.
 
 Free OpenRouter routes provide no capacity or latency guarantee. They may have
 low rate limits, return `429`, lose an eligible upstream provider, or change
 availability. They do not require positive paid OpenRouter credit, but the API
 key must remain valid and its own optional usage limit must not be exhausted.
 Direct Gemini is therefore an operational fallback, not an unused rollback
-credential.
+credential. GigaChat is reached directly from its HTTP client with environment
+proxy discovery disabled and TLS verified against the bundled official Russian
+Trusted Root CA; the remaining external provider calls keep their existing WARP
+route.
 
-Defaults can be overridden with `OPENROUTER_MODEL`,
+Defaults can be overridden with `GIGACHAT_MODEL`, `GIGACHAT_SCOPE`,
+`GIGACHAT_BASE_URL`, `GIGACHAT_AUTH_URL`, `GIGACHAT_CA_BUNDLE_FILE`,
+`GIGACHAT_TIMEOUT_SECONDS`, `OPENROUTER_MODEL`,
 `OPENROUTER_REASONING_EFFORT`, `OPENROUTER_TIMEOUT_SECONDS`,
 `OPENROUTER_FALLBACK_MODEL`, `OPENROUTER_FALLBACK_REASONING_EFFORT`,
 `OPENROUTER_FALLBACK_TIMEOUT_SECONDS`, `OPENROUTER_MAX_TOKENS`, `GEMINI_MODEL`,

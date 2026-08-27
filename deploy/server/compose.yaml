@@ -25,6 +25,14 @@ services:
       TELEGRAM_WEBHOOK_PATH: /telegram/mk-voice-text-bot/webhook
       TELEGRAM_WEBHOOK_SECRET_FILE: /run/secrets/telegram-webhook-secret
       TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram-bot-token
+      GIGACHAT_CREDENTIALS_FILE: /run/secrets/gigachat-credentials
+      GIGACHAT_SCOPE: GIGACHAT_API_CORP
+      GIGACHAT_MODEL: GigaChat-2-Max
+      GIGACHAT_BASE_URL: https://api.giga.chat/v1
+      GIGACHAT_AUTH_URL: https://ngw.devices.sberbank.ru:9443/api/v2/oauth
+      GIGACHAT_CA_BUNDLE_FILE: /opt/gigachat-ca/russian_trusted_root_ca_pem.crt
+      GIGACHAT_TIMEOUT_SECONDS: "45"
+      CALENDAR_PLANNER_TIMEOUT_SECONDS: "125"
       TELEGRAM_BOT_STATE_PATH: /app/.runtime/state.json
       TELEGRAM_BOT_CONFIRMATION_STATE_PATH: /app/.runtime/calendar-confirmations.json
       TELEGRAM_BOT_OPERATION_STATE_PATH: /app/.runtime/calendar-operations.json

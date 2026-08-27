@@ -10,9 +10,17 @@ from tg_voice_transcriber_bot.gemini import (
     GeminiProviderChain,
     GeminiProviderStage,
 )
+from tg_voice_transcriber_bot.gigachat import (
+    GigaChatAuthenticationError,
+    GigaChatConfigurationError,
+    GigaChatQuotaError,
+    GigaChatRateLimitError,
+    GigaChatRequestRejectedError,
+)
 from tg_voice_transcriber_bot.openrouter import OpenRouterCreditError
 from tg_voice_transcriber_bot.service import (
     VoiceBotService,
+    _planner_failure_copy,
     message_command,
     transcription_reply,
 )
@@ -40,6 +48,23 @@ def test_quota_error_is_actionable():
     )
     assert "Premium" in response
     assert "квота" in response
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (GigaChatAuthenticationError("sensitive"), "авторизацию"),
+        (GigaChatConfigurationError("sensitive"), "настройки"),
+        (GigaChatRequestRejectedError("sensitive"), "отклонил запрос"),
+        (GigaChatQuotaError("sensitive"), "квоты"),
+        (GigaChatRateLimitError("sensitive"), "временно ограничили"),
+    ],
+)
+def test_gigachat_failure_copy_is_actionable_and_sanitized(error, expected):
+    response = _planner_failure_copy(error)
+
+    assert expected in response
+    assert "sensitive" not in response
 
 
 def test_initialize_accepts_one_configured_production_account(tmp_path):
