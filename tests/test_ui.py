@@ -205,8 +205,8 @@ def test_ignore_card_uses_provider_neutral_copy():
 def test_model_badge_is_escaped_and_precedes_timing_in_every_result_card():
     model_name = 'Gemini </b><script>alert("x")</script> & Co'
     escaped_badge = (
-        "🤖 Модель: <b>Gemini &lt;/b&gt;&lt;script&gt;alert(&quot;x&quot;)"
-        "&lt;/script&gt; &amp; Co</b>"
+        "🤖 <code>Gemini &lt;/b&gt;&lt;script&gt;alert(&quot;x&quot;)"
+        "&lt;/script&gt; &amp; Co</code>"
     )
     cards = [
         format_create_card(
@@ -281,7 +281,7 @@ def test_empty_model_name_does_not_render_a_model_badge():
         model_name="   ",
     )
 
-    assert "🤖 Модель:" not in card
+    assert "🤖 <code>" not in card
 
 
 def test_mixed_batch_has_one_bounded_card_and_generic_undo():

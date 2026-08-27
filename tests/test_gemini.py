@@ -1859,7 +1859,7 @@ def test_provider_chain_labels_calendar_plan_with_actual_fallback_model():
     result = asyncio.run(scenario())
 
     assert result[PLANNER_MODEL_FIELD] == (
-        "GLM 5.2 Free (z-ai/glm-5.2:free)"
+        "z-ai/glm-5.2"
     )
     assert {
         key: value

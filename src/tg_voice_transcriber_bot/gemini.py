@@ -268,7 +268,7 @@ class GeminiProviderChain:
     def _selected_model_label(stage: GeminiProviderStage) -> str:
         configured_model = getattr(stage.provider, "model", None)
         if isinstance(configured_model, str) and configured_model.strip():
-            return f"{stage.name} ({configured_model.strip()})"
+            return configured_model.strip().removesuffix(":free")
         return stage.name
 
     @staticmethod

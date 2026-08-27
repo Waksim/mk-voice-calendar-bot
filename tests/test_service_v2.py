@@ -616,7 +616,7 @@ def test_nearest_hour_read_skips_gemini_even_when_provider_is_unavailable(tmp_pa
     ]
     assert "События в календаре" in bot.edited_html[-1]["html"]
     assert "Ближайшая встреча" in bot.edited_html[-1]["html"]
-    assert "🤖 Модель: <b>Без LLM · быстрый разбор</b>" in (
+    assert "🤖 <code>Без LLM · быстрый разбор</code>" in (
         bot.edited_html[-1]["html"]
     )
     assert state.job(79)["status"] == "sent"
@@ -803,9 +803,7 @@ def test_v2_sends_one_status_then_edits_each_phase_and_applies_create_immediatel
         bot = FakeBot()
         calendar = FakeCalendar(on_create=lambda: clock.update(now=104.8))
         plan = create_plan()
-        plan[PLANNER_MODEL_FIELD] = (
-            "Nemotron 3 Super (nvidia/nemotron-3-super-120b-a12b:free)"
-        )
+        plan[PLANNER_MODEL_FIELD] = "nvidia/nemotron-3-super-120b-a12b"
         service, state, pipeline = make_service(
             tmp_path,
             bot=bot,
@@ -838,8 +836,7 @@ def test_v2_sends_one_status_then_edits_each_phase_and_applies_create_immediatel
     assert [call[0] for call in calendar.calls].count("create") == 1
     assert "4,8 с" in bot.edited_html[-1]["html"]
     assert (
-        "🤖 Модель: <b>Nemotron 3 Super "
-        "(nvidia/nemotron-3-super-120b-a12b:free)</b>"
+        "🤖 <code>nvidia/nemotron-3-super-120b-a12b</code>"
         in bot.edited_html[-1]["html"]
     )
     markup = bot.edited_html[-1]["reply_markup"]
@@ -1581,13 +1578,9 @@ def test_lookup_then_second_gemini_updates_exact_external_event(tmp_path):
         )
         calendar.events[candidate.event_id] = candidate
         initial_plan = discovery_plan()
-        initial_plan[PLANNER_MODEL_FIELD] = (
-            "Nemotron 3 Super (nvidia/nemotron-3-super-120b-a12b:free)"
-        )
+        initial_plan[PLANNER_MODEL_FIELD] = "nvidia/nemotron-3-super-120b-a12b"
         resolved_plan = update_plan("c1")
-        resolved_plan[PLANNER_MODEL_FIELD] = (
-            "Gemini 3.7 Flash (gemini-3.7-flash)"
-        )
+        resolved_plan[PLANNER_MODEL_FIELD] = "gemini-3.7-flash"
         gemini = FakeGemini([initial_plan, resolved_plan])
         bot = FakeBot()
         service, state, pipeline = make_service(
@@ -1654,7 +1647,7 @@ def test_lookup_then_second_gemini_updates_exact_external_event(tmp_path):
     assert "Обновляю событие" in progress
     assert "Событие обновлено" in bot.edited_html[-1]["html"]
     assert (
-        "🤖 Модель: <b>Gemini 3.7 Flash (gemini-3.7-flash)</b>"
+        "🤖 <code>gemini-3.7-flash</code>"
         in bot.edited_html[-1]["html"]
     )
     assert "Nemotron 3 Super" not in bot.edited_html[-1]["html"]

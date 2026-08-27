@@ -38,7 +38,7 @@ MAX_EVENTS_PER_CARD = 5
 
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _HTML_TAGS = re.compile(
-    r'</?(?:b|i|s|a|blockquote)(?: expandable| href="[^"]*")?>'
+    r'</?(?:b|i|s|a|code|blockquote)(?: expandable| href="[^"]*")?>'
 )
 _UNDO_CALLBACK = re.compile(r"cal:undo:([A-Za-z0-9_-]{16,32})\Z")
 _OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{16,32}\Z")
@@ -436,7 +436,7 @@ def _model_block(model_name: object | None) -> str | None:
     cleaned = _clean_text(model_name) if model_name is not None else ""
     if not cleaned:
         return None
-    return f"🤖 Модель: <b>{_dynamic(cleaned, limit=100)}</b>"
+    return f"🤖 <code>{_dynamic(cleaned, limit=100)}</code>"
 
 
 def format_operation_card(
