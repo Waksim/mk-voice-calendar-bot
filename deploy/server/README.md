@@ -96,8 +96,11 @@ Vision defaults are controlled by `OPENROUTER_VISION_MODEL`,
 `VISION_MAX_IMAGE_BYTES`, `VISION_MAX_IMAGE_PIXELS`,
 `VISION_MAX_DESCRIPTION_CHARS`, `VISION_MAX_VISIBLE_TEXT_CHARS`, and
 `VISION_OCR_MODEL_DIR`. Production keeps the limits at 8 MiB, 20 million
-pixels, 4000 description characters, and 12000 OCR characters. Image and OCR
-content is not written to service logs.
+pixels, 4000 stored description characters, and 12000 stored OCR characters.
+Before the planner call, its 64 KiB request envelope applies a stricter 1536-byte
+description and 6656-byte visible-text UTF-8 budget. Long evidence receives an
+explicit truncation marker; image bytes never enter the planner request. Image
+and OCR content is not written to service logs.
 
 ONNX Runtime, OpenCV, and decoding a 20-megapixel image require more transient
 memory than text-only operation. The reviewed production Compose therefore

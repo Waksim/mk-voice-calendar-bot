@@ -128,8 +128,13 @@ read-only, поэтому контейнеру не нужен доступ к �
 первого OCR-вызова.
 
 По умолчанию принимается не более 8 MiB encoded image и 20 миллионов пикселей.
-Описание ограничено 4000 символами, видимый текст — 12000 символами. Пределы и
-timeouts настраиваются через `OPENROUTER_VISION_MODEL`,
+Сохранённый результат распознавания ограничен 4000 символами описания и 12000
+символами видимого текста. Непосредственно перед planner эти поля получают ещё
+более строгий общий бюджет: 1536 и 6656 UTF-8 байт соответственно. Это оставляет
+место для кандидатов и истории внутри жёсткого лимита planner-запроса 64 KiB;
+длинный OCR-текст завершается явной отметкой о сокращении. Исходные байты
+изображения planner не получает. Пределы распознавания и timeouts настраиваются
+через `OPENROUTER_VISION_MODEL`,
 `OPENROUTER_VISION_TIMEOUT_SECONDS`, `OPENROUTER_VISION_FALLBACK_MODEL`,
 `OPENROUTER_VISION_FALLBACK_TIMEOUT_SECONDS`, `GEMINI_VISION_MODEL`,
 `GEMINI_VISION_TIMEOUT_SECONDS`, `VISION_LOCAL_OCR_TIMEOUT_SECONDS`,
