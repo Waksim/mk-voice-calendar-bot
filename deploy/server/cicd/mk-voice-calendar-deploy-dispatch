@@ -15,5 +15,5 @@ exec /usr/bin/systemd-run \
   --pipe \
   --service-type=exec \
   --unit="mk-voice-calendar-deploy-${deploy_sha}" \
-  --property=RuntimeMaxSec=30min \
+  --property=RuntimeMaxSec=60min \
   /usr/local/sbin/mk-voice-calendar-deploy "$deploy_sha"
