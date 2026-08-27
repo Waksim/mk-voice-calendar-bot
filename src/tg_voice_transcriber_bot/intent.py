@@ -201,6 +201,24 @@ _ROOT_KEYS = frozenset(CALENDAR_INTENT_SCHEMA["properties"])
 _EVENT_KEYS = frozenset(
     CALENDAR_INTENT_SCHEMA["properties"]["events"]["items"]["properties"]
 )
+_LITERAL_DESCRIPTION_LINE_BREAK = re.compile(
+    r"(?<!\\)(?:\\r\\n|\\n|\\r)"
+)
+
+
+def _normalize_description_line_breaks(value: Any) -> Any:
+    """Turn model-emitted JSON-style line breaks into Calendar newlines.
+
+    Some providers copy the escaped ``\\n`` visible in JSON prompt evidence into
+    function arguments as two literal characters.  Call this only when the
+    original user/image evidence used real line breaks and did not itself
+    contain literal line-break escape sequences.  General escape decoding would
+    corrupt Unicode, URLs, Windows paths, and intentional literal ``\\\\n`` text.
+    """
+
+    if not isinstance(value, str):
+        return value
+    return _LITERAL_DESCRIPTION_LINE_BREAK.sub("\n", value)
 
 
 def _optional_text(value: Any, field: str, *, max_length: int) -> str | None:
@@ -389,7 +407,9 @@ def validate_calendar_intent(
                     raw_event.get("location"), "location", max_length=500
                 ),
                 "description": _optional_text(
-                    raw_event.get("description"), "description", max_length=5000
+                    raw_event.get("description"),
+                    "description",
+                    max_length=5000,
                 ),
                 "recurrence_rrule": recurrence,
             }
@@ -470,7 +490,9 @@ def _normalize_event_patch(
         )
     if "description" in raw_patch:
         normalized["description"] = _patch_text(
-            raw_patch["description"], "description", max_length=5000
+            raw_patch["description"],
+            "description",
+            max_length=5000,
         )
     if "recurrence_rrule" in raw_patch:
         recurrence = _validate_rrule(raw_patch["recurrence_rrule"])
@@ -741,7 +763,10 @@ def validate_calendar_operation_plan(
 
 
 def normalize_calendar_intent(
-    payload: Any, *, expected_timezone: str = "Europe/Moscow"
+    payload: Any,
+    *,
+    expected_timezone: str = "Europe/Moscow",
+    decode_description_line_breaks: bool = False,
 ) -> dict[str, Any]:
     """Normalize model output without applying Calendar semantics locally.
 
@@ -771,6 +796,10 @@ def normalize_calendar_intent(
             key: raw_event.get(key)
             for key in _EVENT_KEYS
         }
+        if decode_description_line_breaks:
+            event["description"] = _normalize_description_line_breaks(
+                event.get("description")
+            )
         if event.get("timezone") is None:
             event["timezone"] = expected_timezone
         events.append(event)
@@ -797,6 +826,8 @@ def normalize_calendar_operation_plan(
     payload: Any,
     allowed_event_ids: Collection[str],
     expected_timezone: str = "Europe/Moscow",
+    *,
+    decode_description_line_breaks: bool = False,
 ) -> dict[str, Any]:
     """Normalize a CRUD plan while retaining only routing and ownership checks.
 
@@ -845,6 +876,10 @@ def normalize_calendar_operation_plan(
                 key: raw_event.get(key)
                 for key in _EVENT_KEYS
             }
+            if decode_description_line_breaks:
+                event["description"] = _normalize_description_line_breaks(
+                    event.get("description")
+                )
             if event.get("timezone") is None:
                 event["timezone"] = expected_timezone
             operations.append(
@@ -886,6 +921,10 @@ def normalize_calendar_operation_plan(
             if isinstance(raw_patch, dict)
             else {}
         )
+        if "description" in patch and decode_description_line_breaks:
+            patch["description"] = _normalize_description_line_breaks(
+                patch["description"]
+            )
         raw_clear_fields = raw_operation.get("clear_fields")
         clear_fields = list(
             dict.fromkeys(

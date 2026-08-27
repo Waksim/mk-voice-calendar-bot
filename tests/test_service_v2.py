@@ -665,6 +665,8 @@ def test_text_enters_shared_calendar_pipeline_without_telegram_gateway(tmp_path)
     assert "ИИ-планировщик разбирает команду" in bot.sent_html[0]["html"]
     assert "OpenRouter" not in bot.sent_html[0]["html"]
     assert "Текстовая команда получена" in bot.sent_html[0]["html"]
+    assert "💬 <b>Команда</b>" in bot.sent_html[0]["html"]
+    assert command in bot.sent_html[0]["html"]
     assert "Ищу сообщение в Telegram" not in bot.sent_html[0]["html"]
     assert bot.sent_html[0]["reply_to_message_id"] == 457
     assert "Добавлено в календарь" in bot.edited_html[-1]["html"]
@@ -749,6 +751,17 @@ def test_photo_uses_largest_size_and_passes_captioned_observation_to_planner(
     assert [call[0] for call in calendar.calls].count("create") == 1
     assert "Загружаю изображение" in bot.sent_html[0]["html"]
     assert any("Извлекаю текст" in edit["html"] for edit in bot.edited_html)
+    planner_progress = next(
+        edit["html"]
+        for edit in bot.edited_html
+        if "ИИ-планировщик разбирает команду" in edit["html"]
+    )
+    assert "💬 <b>Подпись</b>" in planner_progress
+    assert caption in planner_progress
+    assert "🖼️ <b>Описание изображения</b>" in planner_progress
+    assert "Экран бронирования корта" in planner_progress
+    assert "🔤 <b>Текст на изображении</b>" in planner_progress
+    assert "Lunda Padel" in planner_progress
     assert state.job(801)["input_kind"] == "text_and_image"
     assert state.job(801)["vision_model"] == "gemini-3.7-flash"
     memory = pipeline.store.find_by_source("telegram-update:801")["transcript"]
@@ -798,8 +811,60 @@ def test_image_document_without_caption_reaches_planner_as_image_only(tmp_path):
     assert transcript == ""
     assert kwargs["input_kind"] == "image"
     assert kwargs["image_observations"][0]["visible_text"].startswith("Сб 29")
+    planner_progress = next(
+        edit["html"]
+        for edit in bot.edited_html
+        if "ИИ-планировщик разбирает команду" in edit["html"]
+    )
+    assert "Описание изображения" in planner_progress
+    assert "Текст на изображении" in planner_progress
+    assert "Lunda Padel" in planner_progress
     assert "Добавлено в календарь" in bot.edited_html[-1]["html"]
     assert state.job(802)["status"] == "sent"
+
+
+def test_image_evidence_remains_visible_when_planner_is_unavailable(tmp_path):
+    async def scenario():
+        bot = FakeBot(downloaded_image=b"png-image")
+        calendar = FakeCalendar()
+        gemini = FakeGemini([])
+        service, state, _pipeline = make_service(
+            tmp_path,
+            bot=bot,
+            gateway=FakeGateway(),
+            gemini=gemini,
+            calendar=calendar,
+            vision=FakeVision(),
+        )
+        service.gemini_available = False
+        await service.handle_update(
+            {
+                "update_id": 805,
+                "message": {
+                    "message_id": 905,
+                    "date": SENT_AT,
+                    "from": {"id": OWNER},
+                    "chat": {"id": OWNER, "type": "private"},
+                    "document": {
+                        "file_id": "original-image",
+                        "mime_type": "image/png",
+                        "file_size": 900_000,
+                    },
+                },
+            }
+        )
+        return bot, calendar, gemini, state
+
+    bot, calendar, gemini, state = asyncio.run(scenario())
+
+    final_html = bot.edited_html[-1]["html"]
+    assert gemini.calls == []
+    assert calendar.calls == []
+    assert "ИИ-планировщик сейчас недоступен" in final_html
+    assert "Данные изображения" in final_html
+    assert "Экран бронирования корта" in final_html
+    assert "Lunda Padel" in final_html
+    assert state.job(805)["status"] == "sent"
 
 
 def test_oversized_image_is_rejected_once_without_downloading_or_retrying(tmp_path):
@@ -1332,6 +1397,9 @@ def test_v2_sends_one_status_then_edits_each_phase_and_applies_create_immediatel
             strict=True,
         )
     ] == [True, True, True, True]
+    assert "🎙️ <b>Расшифровка Telegram</b>" in bot.edited_html[1]["html"]
+    assert "Запиши планёрку" in bot.edited_html[1]["html"]
+    assert "Запиши планёрку" in bot.edited_html[2]["html"]
     assert {edit["message_id"] for edit in bot.edited_html} == {700}
     assert [call[0] for call in calendar.calls].count("create") == 1
     assert "4,8 с" in bot.edited_html[-1]["html"]

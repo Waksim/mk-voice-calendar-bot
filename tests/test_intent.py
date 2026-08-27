@@ -3,6 +3,7 @@ import pytest
 from tg_voice_transcriber_bot.intent import (
     CALENDAR_OPERATION_SCHEMA,
     format_calendar_preview,
+    normalize_calendar_intent,
     normalize_calendar_operation_plan,
     validate_calendar_intent,
     validate_calendar_operation_plan,
@@ -234,6 +235,64 @@ def test_create_operation_requires_and_normalizes_a_complete_event():
     assert plan["operations"][0]["event"]["title"] == "Встреча с Анной"
     assert plan["operations"][0]["patch"] is None
     assert plan["operations"][0]["recurrence_scope"] is None
+
+
+def test_model_literal_line_breaks_are_decoded_only_in_descriptions():
+    raw_description = r"Корт №6\nДля игры 2х2\r\nТелефон\rЧек отправлен"
+    expected_description = "Корт №6\nДля игры 2х2\nТелефон\nЧек отправлен"
+    raw_title = r"Название\nс литералом"
+    raw_location = r"Москва\nФили"
+    event = valid_event()["events"][0]
+    event.update(
+        {
+            "title": raw_title,
+            "location": raw_location,
+            "description": raw_description,
+        }
+    )
+
+    create = normalize_calendar_operation_plan(
+        operation_plan(create_operation(event)),
+        set(),
+        decode_description_line_breaks=True,
+    )
+    update = normalize_calendar_operation_plan(
+        operation_plan(
+            update_operation(patch={"description": raw_description})
+        ),
+        {"known-event"},
+        decode_description_line_breaks=True,
+    )
+    legacy = valid_event()
+    legacy["events"][0]["description"] = raw_description
+
+    assert create["operations"][0]["event"]["description"] == expected_description
+    assert create["operations"][0]["event"]["title"] == raw_title
+    assert create["operations"][0]["event"]["location"] == raw_location
+    assert update["operations"][0]["patch"]["description"] == expected_description
+    assert normalize_calendar_intent(
+        legacy, decode_description_line_breaks=True
+    )["events"][0][
+        "description"
+    ] == expected_description
+    assert validate_calendar_intent(legacy)["events"][0][
+        "description"
+    ] == raw_description
+
+
+def test_description_normalization_preserves_other_escape_sequences():
+    description = (
+        r"Литерал \\n; табуляция \t; путь C:\new\meeting.txt; "
+        r"https://example.test/path?q=\n"
+    )
+    event = valid_event()["events"][0]
+    event["description"] = description
+
+    plan = normalize_calendar_operation_plan(
+        operation_plan(create_operation(event)), set()
+    )
+
+    assert plan["operations"][0]["event"]["description"] == description
 
 
 def test_two_recurring_series_accept_distinct_meeting_links():

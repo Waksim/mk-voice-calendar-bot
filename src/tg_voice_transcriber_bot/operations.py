@@ -1652,6 +1652,18 @@ class CalendarOperationPipeline:
                 trusted_event_ids = tuple(
                     dict.fromkeys((*trusted_event_ids, *journal_target_ids))
                 )
+            # Providers occasionally copy JSON-escaped OCR line breaks into a
+            # description as the two characters ``\\n``.  Decode them only for
+            # a fresh operation whose original evidence was genuinely
+            # multiline and did not itself contain such a literal sequence.
+            # This keeps legitimate values such as ``C:\\new\\meeting.txt``
+            # byte-for-byte intact.
+            decode_description_line_breaks = (
+                existing is None
+                and ("\n" in transcript or "\r" in transcript)
+                and "\\n" not in transcript
+                and "\\r" not in transcript
+            )
             normalized = normalize_calendar_operation_plan(
                 {
                     key: deepcopy(value)
@@ -1660,6 +1672,7 @@ class CalendarOperationPipeline:
                 },
                 trusted_event_ids,
                 expected_timezone=self.timezone_name,
+                decode_description_line_breaks=decode_description_line_breaks,
             )
             normalized_displayed = self._normalize_displayed_candidates(
                 account, displayed_candidates

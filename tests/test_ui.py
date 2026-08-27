@@ -91,6 +91,40 @@ def test_progress_cards_are_single_safe_html_messages():
         format_progress_card("gemini", input_kind="unknown")  # type: ignore[arg-type]
 
 
+def test_progress_card_shows_bounded_escaped_extraction_preview():
+    voice = format_progress_card(
+        "gemini",
+        input_kind="voice",
+        transcript='Позвонить <b>Бабе Тане</b> & записать\nна завтра',
+    )
+    image = format_progress_card(
+        "calendar",
+        action="create",
+        input_kind="text_and_image",
+        transcript="Добавь эту бронь",
+        image_description="Экран <оплаты>",
+        image_visible_text="29 августа\n8:00–10:00\nLunda & Padel",
+    )
+    huge = format_progress_card(
+        "gemini",
+        input_kind="text_and_image",
+        transcript="💬" * 5_000,
+        image_description="🖼" * 5_000,
+        image_visible_text="🔤" * 5_000,
+    )
+
+    assert "🔎 <b>Извлечённые данные</b>" in voice
+    assert "🎙️ <b>Расшифровка Telegram</b>" in voice
+    assert "&lt;b&gt;Бабе Тане&lt;/b&gt; &amp; записать\nна завтра" in voice
+    assert "💬 <b>Подпись</b>" in image
+    assert "🖼️ <b>Описание изображения</b>" in image
+    assert "🔤 <b>Текст на изображении</b>" in image
+    assert "Экран &lt;оплаты&gt;" in image
+    assert "29 августа\n8:00–10:00\nLunda &amp; Padel" in image
+    assert "…" in huge
+    assert utf16_units(ui._visible_text(huge)) <= 4096
+
+
 def test_create_card_is_localized_linked_and_escaped():
     malicious = '</b><a href="https://evil.example">click</a>&'
     card = format_create_card(

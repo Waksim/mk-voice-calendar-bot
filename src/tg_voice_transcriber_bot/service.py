@@ -67,7 +67,9 @@ from .openrouter import (
 from .state import StateStore
 from .text import telegram_text_chunks
 from .ui import (
+    CalendarAction,
     FieldChange,
+    ProgressPhase,
     format_clarify_card,
     format_create_card,
     format_delete_card,
@@ -107,8 +109,10 @@ START_TEXT_V2 = (
     "отправьте один скриншот. "
     "Голосовое Telegram расшифрует на своих серверах, а ИИ-планировщик "
     "с учётом последних команд сразу добавит, изменит или удалит событие в "
-    "основном Google Calendar. Вы увидите ход обработки в одном обновляемом "
-    "сообщении и итоговую карточку со временем выполнения. Если результат не "
+    "основном Google Calendar. В одном обновляемом сообщении будут видны ход "
+    "обработки и извлечённые данные: расшифровка голоса либо описание и текст "
+    "изображения. Затем оно станет итоговой карточкой со временем выполнения. "
+    "Если результат не "
     "подходит, нажмите кнопку отмены или исправьте его новым сообщением. "
     "Аудиофайл бот не скачивает."
 )
@@ -247,6 +251,29 @@ def _job_image_observations(job: Mapping[str, Any]) -> tuple[dict[str, Any], ...
             )
         bounded.append(copied)
     return tuple(bounded)
+
+
+def _job_progress_card(
+    job: Mapping[str, Any],
+    phase: ProgressPhase,
+    *,
+    action: CalendarAction | None = None,
+) -> str:
+    """Render a phase with the exact bounded evidence sent to the planner."""
+
+    input_kind = job.get("input_kind")
+    if input_kind not in {"voice", "text", "image", "text_and_image"}:
+        raise RuntimeError("Persisted calendar job has an invalid input kind")
+    observations = _job_image_observations(job)
+    observation = observations[0] if observations else {}
+    return format_progress_card(
+        phase,
+        action=action,
+        input_kind=input_kind,
+        transcript=job.get("transcript"),
+        image_description=observation.get("description"),
+        image_visible_text=observation.get("visible_text"),
+    )
 
 
 def _truncate_utf8(value: str, max_bytes: int) -> str:
@@ -897,24 +924,6 @@ def _planner_failure_copy(exc: GeminiError, *, matching: bool = False) -> str:
     return (
         "ИИ-планировщик не смог надёжно разобрать календарную команду. "
         "Попробуйте уточнить её новым сообщением."
-    )
-
-
-def _fast_read_progress_card(*, input_kind: str) -> str:
-    header = (
-        "🎙️ <b>Обрабатываю голосовое</b>"
-        if input_kind == "voice"
-        else "💬 <b>Обрабатываю текстовую команду</b>"
-    )
-    received = (
-        "✅ Расшифровка Telegram получена"
-        if input_kind == "voice"
-        else "✅ Текстовая команда получена"
-    )
-    return (
-        f"{header}\n\n{received}\n"
-        "✅ Период поиска определён\n"
-        "⏳ Ищу события в Google Calendar…"
     )
 
 
@@ -1661,11 +1670,11 @@ class VoiceBotService:
             elif input_kind in _IMAGE_INPUT_KINDS:
                 initial_stage = "image_downloading"
             matching_html = (
-                _fast_read_progress_card(input_kind=input_kind)
+                _job_progress_card(job, "fast_read")
                 if initial_fast_read
-                else format_progress_card(
+                else _job_progress_card(
+                    job,
                     initial_stage,  # type: ignore[arg-type]
-                    input_kind=input_kind,
                 )
             )
             job["status_message_id"] = await self.bot.send_html(
@@ -1763,8 +1772,9 @@ class VoiceBotService:
                     await self._edit_progress_best_effort(
                         chat_id=chat_id,
                         job=job,
-                        html_text=format_progress_card(
-                            "vision", input_kind=input_kind  # type: ignore[arg-type]
+                        html_text=_job_progress_card(
+                            job,
+                            "vision",
                         ),
                     )
                     self.state.save_job(update_id, job)
@@ -1863,9 +1873,7 @@ class VoiceBotService:
             await self._edit_progress_best_effort(
                 chat_id=chat_id,
                 job=job,
-                html_text=format_progress_card(
-                    "transcribing", input_kind=input_kind
-                ),
+                html_text=_job_progress_card(job, "transcribing"),
             )
             self.state.save_job(update_id, job)
             result = await self.gateway.write(
@@ -1921,7 +1929,7 @@ class VoiceBotService:
             elif not self.gemini_available:
                 job["final_html"] = format_error_card(
                     "ИИ-планировщик сейчас недоступен. Команда сохранена в этой карточке.",
-                    transcript=transcript,
+                    transcript=_job_memory_text(job),
                     elapsed_seconds=self._elapsed(job),
                 )
                 job["final_reply_markup"] = None
@@ -1931,9 +1939,7 @@ class VoiceBotService:
                 await self._edit_progress_best_effort(
                     chat_id=chat_id,
                     job=job,
-                    html_text=format_progress_card(
-                        "gemini", input_kind=input_kind
-                    ),
+                    html_text=_job_progress_card(job, "gemini"),
                 )
                 self.state.save_job(update_id, job)
                 context = pipeline.context(
@@ -2020,10 +2026,11 @@ class VoiceBotService:
                     chat_id=chat_id,
                     job=job,
                     html_text=(
-                        _fast_read_progress_card(input_kind=input_kind)
+                        _job_progress_card(job, "fast_read")
                         if job.get("fast_read") is True
-                        else format_progress_card(
-                            "calendar_lookup", input_kind=input_kind
+                        else _job_progress_card(
+                            job,
+                            "calendar_lookup",
                         )
                     ),
                 )
@@ -2181,9 +2188,7 @@ class VoiceBotService:
             await self._edit_progress_best_effort(
                 chat_id=chat_id,
                 job=job,
-                html_text=format_progress_card(
-                    "gemini_match", input_kind=input_kind
-                ),
+                html_text=_job_progress_card(job, "gemini_match"),
             )
             self.state.save_job(update_id, job)
             sent_time = datetime.fromtimestamp(
@@ -2338,10 +2343,10 @@ class VoiceBotService:
                 await self._edit_progress_best_effort(
                     chat_id=chat_id,
                     job=job,
-                    html_text=format_progress_card(
+                    html_text=_job_progress_card(
+                        job,
                         "calendar",
                         action=progress_action,  # type: ignore[arg-type]
-                        input_kind=input_kind,
                     ),
                 )
                 self.state.save_job(update_id, job)

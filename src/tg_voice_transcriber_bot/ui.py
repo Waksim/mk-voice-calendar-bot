@@ -30,6 +30,7 @@ ProgressPhase = Literal[
     "image_downloading",
     "vision",
     "gemini",
+    "fast_read",
     "calendar_lookup",
     "gemini_match",
     "calendar",
@@ -210,6 +211,9 @@ def format_progress_card(
     *,
     action: CalendarAction | None = None,
     input_kind: InputKind = "voice",
+    transcript: object | None = None,
+    image_description: object | None = None,
+    image_visible_text: object | None = None,
 ) -> str:
     """Render the current processing phase as a small editable status card."""
     if action is not None and action not in _ACTION_LABELS:
@@ -228,6 +232,39 @@ def format_progress_card(
         "image": "✅ Данные изображения распознаны",
         "text_and_image": "✅ Подпись и данные изображения подготовлены",
     }[input_kind]
+
+    def extraction_preview() -> str:
+        blocks: list[str] = []
+
+        def add(label: str, value: object | None, *, limit: int) -> None:
+            if value is None:
+                return
+            rendered = _dynamic(value, limit=limit, multiline=True)
+            if rendered:
+                blocks.append(
+                    f"{label}\n<blockquote expandable>{rendered}</blockquote>"
+                )
+
+        transcript_label = {
+            "voice": "🎙️ <b>Расшифровка Telegram</b>",
+            "text": "💬 <b>Команда</b>",
+            "image": "💬 <b>Подпись</b>",
+            "text_and_image": "💬 <b>Подпись</b>",
+        }[input_kind]
+        add(transcript_label, transcript, limit=1_400)
+        add("🖼️ <b>Описание изображения</b>", image_description, limit=500)
+        add(
+            "🔤 <b>Текст на изображении</b>",
+            image_visible_text,
+            limit=1_300,
+        )
+        if not blocks:
+            return ""
+        return "\n\n🔎 <b>Извлечённые данные</b>\n" + "\n".join(blocks)
+
+    def render(base: str) -> str:
+        return _bounded(base + extraction_preview())
+
     cards = {
         "matching": (
             "🎙️ <b>Обрабатываю голосовое</b>\n\n"
@@ -263,6 +300,12 @@ def format_progress_card(
             "⏳ ИИ-планировщик разбирает команду и контекст…\n"
             "▫️ Google Calendar"
         ),
+        "fast_read": (
+            f"{processing_header}\n\n"
+            f"{command_received}\n"
+            "✅ Период поиска определён\n"
+            "⏳ Ищу события в Google Calendar…"
+        ),
     }
     if phase == "calendar":
         operation = _ACTION_LABELS.get(action or "", "обработать команду")
@@ -272,28 +315,28 @@ def format_progress_card(
             "update": "Обновляю событие в Google Calendar…",
             "delete": "Удаляю событие из Google Calendar…",
         }.get(action, "Синхронизирую данные с Google Calendar…")
-        return _bounded(
+        return render(
             f"{processing_header}\n\n"
             f"{command_received}\n"
             f"✅ ИИ-планировщик: {operation}\n"
             f"⏳ {verb}"
         )
     if phase == "calendar_lookup":
-        return _bounded(
+        return render(
             f"{processing_header}\n\n"
             f"{command_received}\n"
             "✅ ИИ-планировщик определил период поиска\n"
             "⏳ Ищу события в Google Calendar…"
         )
     if phase == "gemini_match":
-        return _bounded(
+        return render(
             f"{processing_header}\n\n"
             f"{command_received}\n"
             "✅ Подходящие события найдены\n"
             "⏳ ИИ-планировщик выбирает точную запись…"
         )
     try:
-        return _bounded(cards[phase])
+        return render(cards[phase])
     except KeyError:
         raise ValueError("invalid progress phase") from None
 

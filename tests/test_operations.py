@@ -406,6 +406,65 @@ def test_create_is_immediate_replay_safe_and_undo_is_exactly_once(tmp_path):
     assert pipeline.context(account="personal", chat_id=OWNER, now=NOW).allowed_event_ids == ()
 
 
+def test_multiline_image_evidence_decodes_model_description_line_breaks(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        result = await apply(
+            pipeline,
+            1010,
+            plan(
+                create_op(
+                    event(
+                        description=(
+                            r"Корт №6 тип PadelTech Full Vision\nДля игры 2х2"
+                            r"\nТелефон: +7(495) 568-00-68"
+                        )
+                    )
+                )
+            ),
+            transcript=(
+                "Данные изображения:\n"
+                "Видимый текст: Корт №6 тип PadelTech Full Vision\n"
+                "Для игры 2х2\nТелефон: +7(495) 568-00-68"
+            ),
+        )
+        return calendar, result
+
+    calendar, result = asyncio.run(scenario())
+    expected = (
+        "Корт №6 тип PadelTech Full Vision\nДля игры 2х2\n"
+        "Телефон: +7(495) 568-00-68"
+    )
+    created_event = next(iter(calendar.events.values()))
+    assert created_event.description == expected
+    assert result.record["items"][0]["request"]["event"]["description"] == expected
+    assert r"\n" not in created_event.description
+
+
+def test_literal_windows_path_is_not_decoded_as_a_line_break(tmp_path):
+    async def scenario():
+        calendar = FakeCalendar()
+        pipeline = CalendarOperationPipeline(
+            OperationStore(tmp_path / "ops.json"), calendar
+        )
+        description = r"Материалы: C:\new\meeting.txt"
+        result = await apply(
+            pipeline,
+            1011,
+            plan(create_op(event(description=description))),
+            transcript=description,
+        )
+        return calendar, result, description
+
+    calendar, result, description = asyncio.run(scenario())
+    created_event = next(iter(calendar.events.values()))
+    assert created_event.description == description
+    assert result.record["items"][0]["request"]["event"]["description"] == description
+
+
 def test_recent_actions_are_isolated_per_telegram_conversation(tmp_path):
     async def scenario():
         calendar = FakeCalendar()
