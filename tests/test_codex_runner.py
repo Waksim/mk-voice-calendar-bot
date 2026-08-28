@@ -99,6 +99,13 @@ def _safe_event_stream():
     return b"\n".join(json.dumps(event).encode() for event in events) + b"\n"
 
 
+def test_runner_rejects_non_url_safe_token(monkeypatch):
+    monkeypatch.setenv("CODEX_RUNNER_TOKEN", "я" * 32)
+
+    with pytest.raises(RuntimeError, match="token is invalid"):
+        codex_runner._read_runner_token()
+
+
 def test_health_requires_executable_binary_and_writable_auth(tmp_path):
     executor = _ready_executor(tmp_path)
     assert executor.healthy() is True
@@ -124,6 +131,16 @@ def test_validate_checks_chatgpt_login_status(tmp_path, monkeypatch):
     asyncio.run(executor.validate())
 
     assert observed == [(('login', 'status'), {})]
+
+
+def test_validate_accepts_chatgpt_login_status_from_stderr(tmp_path, monkeypatch):
+    executor = _ready_executor(tmp_path)
+
+    async def fake_run(*_arguments, **_kwargs):
+        return b"", b"Logged in using ChatGPT\n"
+
+    monkeypatch.setattr(executor, "_run_process", fake_run)
+    asyncio.run(executor.validate())
 
 
 def test_validate_rejects_non_chatgpt_auth_status(tmp_path, monkeypatch):

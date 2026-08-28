@@ -29,6 +29,7 @@ _MAX_PROMPT_BYTES = 96 * 1024
 _MAX_SCHEMA_BYTES = 64 * 1024
 _MAX_PROCESS_OUTPUT_BYTES = 1_000_000
 _FINGERPRINT_KEY = os.urandom(32)
+_RUNNER_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,256}")
 _TASK_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "extract_event": _portable_strict_schema(CALENDAR_INTENT_SCHEMA),
     "plan_calendar_actions": _strict_operation_wire_schema(),
@@ -311,8 +312,9 @@ class CodexExecutor:
                 status=503,
             )
         async with self._lock:
-            stdout, _ = await self._run_process("login", "status")
-        if "logged in using chatgpt" not in stdout.decode(
+            stdout, stderr = await self._run_process("login", "status")
+        status_output = b"\n".join((stdout, stderr))
+        if "logged in using chatgpt" not in status_output.decode(
             "utf-8", errors="replace"
         ).casefold():
             raise RunnerError(
@@ -490,11 +492,7 @@ def _read_runner_token() -> str:
             raise RuntimeError("Cannot read Codex runner token file") from None
     else:
         token = (direct or "").strip()
-    if (
-        len(token) < 32
-        or len(token) > 256
-        or any(character.isspace() for character in token)
-    ):
+    if not _RUNNER_TOKEN_RE.fullmatch(token):
         raise RuntimeError("Codex runner token is invalid")
     return token
 

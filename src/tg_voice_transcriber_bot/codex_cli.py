@@ -48,8 +48,8 @@ from .openrouter import (
 
 LOGGER = logging.getLogger("tg_voice_transcriber_bot.codex_cli")
 _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+_RUNNER_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,256}")
 _MAX_RUNNER_RESPONSE_BYTES = 1_000_000
-_MIN_RUNNER_TOKEN_LENGTH = 32
 _CODEX_CALENDAR_INTENT_SCHEMA = _portable_strict_schema(CALENDAR_INTENT_SCHEMA)
 _CODEX_CALENDAR_OPERATION_SCHEMA = _strict_operation_wire_schema()
 _CODEX_EXECUTION_INSTRUCTION = """<codex_execution_contract>
@@ -118,10 +118,18 @@ class CodexCliRunnerApi:
         timezone: str,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        parsed = urlsplit(base_url)
+        try:
+            parsed = urlsplit(base_url)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            raise CodexCliConfigurationError(
+                "Codex CLI runner URL must be loopback HTTP"
+            ) from None
         if (
             parsed.scheme != "http"
-            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or hostname not in {"127.0.0.1", "localhost", "::1"}
+            or (port is not None and not 1 <= port <= 65535)
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
@@ -133,11 +141,8 @@ class CodexCliRunnerApi:
             )
         if not _MODEL_RE.fullmatch(model):
             raise CodexCliConfigurationError("Configured Codex model name is invalid")
-        if (
-            not isinstance(bearer_token, str)
-            or len(bearer_token) < _MIN_RUNNER_TOKEN_LENGTH
-            or len(bearer_token) > 256
-            or any(character.isspace() for character in bearer_token)
+        if not isinstance(bearer_token, str) or not _RUNNER_TOKEN_RE.fullmatch(
+            bearer_token
         ):
             raise CodexCliConfigurationError(
                 "Codex CLI runner bearer token is invalid"

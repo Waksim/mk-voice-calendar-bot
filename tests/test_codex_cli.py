@@ -76,6 +76,35 @@ def _provider(client: httpx.AsyncClient) -> CodexCliRunnerApi:
     )
 
 
+@pytest.mark.parametrize(
+    "url",
+    ("http://localhost:abc", "http://localhost:65536", "http://[::1"),
+)
+def test_provider_rejects_invalid_loopback_url(url):
+    with pytest.raises(CodexCliConfigurationError, match="loopback HTTP"):
+        CodexCliRunnerApi(
+            base_url=url,
+            bearer_token=RUNNER_TOKEN,
+            model="gpt-5.6-luna",
+            reasoning_effort="high",
+            timeout_seconds=55,
+            timezone="Europe/Moscow",
+        )
+
+
+@pytest.mark.parametrize("token", ("short", "я" * 32, "a" * 31 + ":"))
+def test_provider_rejects_non_url_safe_bearer_token(token):
+    with pytest.raises(CodexCliConfigurationError, match="bearer token"):
+        CodexCliRunnerApi(
+            base_url="http://127.0.0.1:8091",
+            bearer_token=token,
+            model="gpt-5.6-luna",
+            reasoning_effort="high",
+            timeout_seconds=55,
+            timezone="Europe/Moscow",
+        )
+
+
 def test_extract_posts_bounded_task_and_normalizes_runner_output():
     observed = {}
 
