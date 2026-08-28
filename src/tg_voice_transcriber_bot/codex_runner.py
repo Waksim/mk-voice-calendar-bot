@@ -554,12 +554,17 @@ def build_application(executor: CodexExecutor, *, bearer_token: str) -> web.Appl
                     "configuration", "Execution request is invalid", status=400
                 )
             prompt = payload["prompt"]
+            task_kind = payload["task_kind"]
             if not isinstance(prompt, str):
                 raise RunnerError(
                     "configuration", "Execution payload is invalid", status=400
                 )
+            if not isinstance(task_kind, str) or task_kind not in _TASK_SCHEMAS:
+                raise RunnerError(
+                    "configuration", "Codex task kind is invalid", status=422
+                )
             output = await executor.execute(
-                task_kind=payload["task_kind"],
+                task_kind=task_kind,
                 prompt=prompt,
             )
         except RunnerError as error:
