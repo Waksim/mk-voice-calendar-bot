@@ -71,11 +71,7 @@ RUN /opt/venv/bin/pip install --no-cache-dir --no-deps /app
 COPY deploy/server/telegram_gateway.py deploy/server/telegram-gateway /app/deploy/server/
 RUN chmod 0555 /app/deploy/server/telegram-gateway \
     && mkdir -p /app/.runtime /tmp/telegram-gateway-files \
-    && chown -R 1000:1000 /app/.runtime /tmp/telegram-gateway-files \
-    && groupadd --gid 10002 codex-rpc \
-    && groupadd --gid 10001 codex-runner \
-    && useradd --uid 10001 --gid 10001 --home-dir /var/lib/codex-runner \
-        --no-create-home --shell /usr/sbin/nologin codex-runner
+    && chown -R 1000:1000 /app/.runtime /tmp/telegram-gateway-files
 
 USER 1000:1000
 EXPOSE 8080
