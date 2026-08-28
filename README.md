@@ -7,11 +7,11 @@ Bot API. Голосовое
 расшифровывается вызовом Telegram MTProto `messages.transcribeAudio`; файл не
 скачивается, распознавание выполняется на серверах Telegram. Текст сразу
 переходит к планированию без Telegram user session. Planner вызывает провайдеров
-в фиксированном порядке: subscription-backed Codex CLI `gpt-5.6-luna`, direct
-API `GigaChat-2-Max` с принудительным вызовом функции и строгой схемой
-аргументов, бесплатный
-`nvidia/nemotron-3-super-120b-a12b:free` через OpenRouter, бесплатный
-`z-ai/glm-5.2:free` через OpenRouter и затем direct Gemini API. Эта цепочка
+в фиксированном порядке: subscription-backed Codex CLI `gpt-5.6-luna`,
+бесплатный `nvidia/nemotron-3-super-120b-a12b:free` через OpenRouter,
+бесплатный `z-ai/glm-5.2:free` через OpenRouter, direct Gemini API и последним
+direct API `GigaChat-2-Max` с принудительным вызовом функции и строгой схемой
+аргументов. Эта цепочка
 планирует создание, изменение или удаление календарных событий. Однозначные
 команды чтения вроде «покажи события в
 ближайший час» разбираются детерминированно без LLM. Операция сразу выполняется
@@ -91,7 +91,7 @@ effort и JSON Schema задаются самим runner. Запуск сери�
 non-interactive режима: [Codex authentication](https://developers.openai.com/codex/auth)
 и [Codex non-interactive mode](https://developers.openai.com/codex/noninteractive).
 
-Первый API-фолбэк — direct API `GigaChat-2-Max`. Бот получает
+Последний API-фолбэк — direct API `GigaChat-2-Max`. Бот получает
 короткоживущий OAuth-токен по `GIGACHAT_CREDENTIALS`, кэширует его и проверяет
 TLS официальным корневым сертификатом НУЦ Минцифры из
 `deploy/server/certs/russian_trusted_root_ca_pem.crt`. В Git credential и
@@ -103,8 +103,8 @@ access token не сохраняются. Формат интеграции сл
 Резервные OpenRouter-модели используют бесплатные `:free`-маршруты. Бесплатность
 не означает гарантированную доступность: OpenRouter может применять низкие
 rate limits, возвращать `429`, временно не иметь подходящего upstream-провайдера
-или изменить доступность модели. Поэтому Gemini API остаётся независимой
-пятой ступенью; для полноценной production-цепочки нужны Codex ChatGPT-сессия и
+или изменить доступность модели. Gemini API остаётся независимой четвёртой
+ступенью, а GigaChat — пятой; для полноценной production-цепочки нужны Codex ChatGPT-сессия и
 секреты `CODEX_RUNNER_TOKEN`, `GIGACHAT_CREDENTIALS`, `OPENROUTER_API_KEY` и
 `GEMINI_API_KEY`. Положительный платный баланс
 OpenRouter для `:free`-моделей не требуется, однако API-ключ должен быть
@@ -139,7 +139,7 @@ OpenRouter для `:free`-моделей не требуется, однако A
 текста. Эти два поля передаются в уже существующий planner как недоверенное
 содержимое изображения вместе с подписью пользователя, если она есть. Решение о
 CRUD, датах, времени и намерении пользователя по-прежнему принимает текстовая
-цепочка Codex Luna → GigaChat 2 Max → Nemotron → GLM → Gemini.
+цепочка Codex Luna → Nemotron → GLM → Gemini → GigaChat 2 Max.
 
 Vision-провайдеры вызываются по одному, без общего дедлайна между ступенями:
 

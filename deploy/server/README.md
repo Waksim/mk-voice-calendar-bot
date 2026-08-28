@@ -63,13 +63,13 @@ Calendar planning uses a strict ordered provider chain:
 
 1. subscription-backed Codex CLI `gpt-5.6-luna`, reasoning effort `high`, stage
    timeout 55 seconds;
-2. direct GigaChat API `GigaChat-2-Max`, forced function call, stage timeout 45
-   seconds;
-3. OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`, reasoning effort
+2. OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`, reasoning effort
    `medium`, stage timeout 35 seconds;
-4. OpenRouter `z-ai/glm-5.2:free`, reasoning effort `high`, stage timeout 15
+3. OpenRouter `z-ai/glm-5.2:free`, reasoning effort `high`, stage timeout 15
    seconds;
-5. direct Gemini API `gemini-3.7-flash`, stage timeout 25 seconds.
+4. direct Gemini API `gemini-3.7-flash`, stage timeout 25 seconds;
+5. direct GigaChat API `GigaChat-2-Max`, forced function call, stage timeout 45
+   seconds.
 
 Each planner invocation also has a 180-second overall deadline. A later stage
 receives at most the time left under that deadline. GigaChat makes at most one

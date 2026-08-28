@@ -242,18 +242,24 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
     }
     assert [stage.name for stage in planner.stages] == [
         "Codex Luna",
-        "GigaChat 2 Max",
         "Nemotron 3 Super",
         "GLM 5.2 Free",
         "Gemini 3.7 Flash",
+        "GigaChat 2 Max",
     ]
-    assert [stage.timeout_seconds for stage in planner.stages] == [55, 45, 35, 15, 25]
+    assert [stage.timeout_seconds for stage in planner.stages] == [
+        55,
+        35,
+        15,
+        25,
+        45,
+    ]
     assert [stage.provider for stage in planner.stages] == [
         codex_client,
-        gigachat_client,
         openrouter_clients[0],
         openrouter_clients[1],
         gemini_client,
+        gigachat_client,
     ]
     assert sequence == [
         "gigachat_secret_read",
@@ -269,10 +275,10 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         "gateway_close",
         "bot_close",
         "provider_close:gpt-5.6-luna",
-        "provider_close:GigaChat-2-Max",
         "provider_close:nvidia/nemotron-3-super-120b-a12b:free",
         "provider_close:z-ai/glm-5.2:free",
         "provider_close:gemini-3.7-flash",
+        "provider_close:GigaChat-2-Max",
     ]
 
 
@@ -415,7 +421,7 @@ def test_webhook_listener_registration_ownership(
     assert planners[0].timeout_seconds == config.calendar_planner_timeout_seconds
     assert [stage.name for stage in planners[0].stages] == [
         "Codex Luna",
-        "Gemini 3.7 Flash"
+        "Gemini 3.7 Flash",
     ]
     assert isinstance(
         planners[0].stages[0].provider, FakeCodexRunnerApi

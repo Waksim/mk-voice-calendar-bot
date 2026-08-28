@@ -101,6 +101,14 @@ from .vision import (
 from .webhook import WebhookRuntime
 
 LOGGER = logging.getLogger("tg_voice_transcriber_bot")
+_PLANNER_STAGE_PRIORITIES = {
+    "Codex Luna": 0,
+    "Nemotron 3 Super": 1,
+    "GLM 5.2 Free": 2,
+    "Gemini 3.7 Flash": 3,
+    "Gemini CLI": 3,
+    "GigaChat 2 Max": 4,
+}
 
 START_TEXT = (
     "Пришлите голосовое сообщение или напишите календарную команду текстом. "
@@ -2932,6 +2940,9 @@ async def async_main() -> None:
             terminal_provider,
             config.gemini_timeout_seconds,
         )
+    )
+    planner_stages.sort(
+        key=lambda stage: _PLANNER_STAGE_PRIORITIES[stage.name]
     )
     gemini = GeminiProviderChain(
         planner_stages,
