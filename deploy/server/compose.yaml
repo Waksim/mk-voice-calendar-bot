@@ -17,6 +17,8 @@ services:
         condition: service_healthy
         restart: true
     user: "1000:1000"
+    group_add:
+      - "10002"
     environment:
       TELEGRAM_BOT_UPDATE_MODE: webhook
       TELEGRAM_WEBHOOK_LISTEN_HOST: 0.0.0.0
@@ -32,7 +34,12 @@ services:
       GIGACHAT_AUTH_URL: https://ngw.devices.sberbank.ru:9443/api/v2/oauth
       GIGACHAT_CA_BUNDLE_FILE: /opt/gigachat-ca/russian_trusted_root_ca_pem.crt
       GIGACHAT_TIMEOUT_SECONDS: "45"
-      CALENDAR_PLANNER_TIMEOUT_SECONDS: "125"
+      CODEX_RUNNER_URL: http://127.0.0.1:8091
+      CODEX_RUNNER_TOKEN_FILE: /run/secrets/codex-runner-token
+      CODEX_MODEL: gpt-5.6-luna
+      CODEX_REASONING_EFFORT: high
+      CODEX_TIMEOUT_SECONDS: "55"
+      CALENDAR_PLANNER_TIMEOUT_SECONDS: "180"
       TELEGRAM_BOT_STATE_PATH: /app/.runtime/state.json
       TELEGRAM_BOT_CONFIRMATION_STATE_PATH: /app/.runtime/calendar-confirmations.json
       TELEGRAM_BOT_OPERATION_STATE_PATH: /app/.runtime/calendar-operations.json
@@ -94,6 +101,71 @@ services:
     pids_limit: 256
     mem_limit: 1536m
     cpus: 2.0
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  codex-runner:
+    # Deliberately pinned: ordinary app deploys cannot replace code that can
+    # access the password-equivalent ChatGPT session. Updating this digest-like
+    # tag requires a separate trusted-Compose review.
+    image: mk-voice-calendar-bot:${CODEX_RUNNER_IMAGE_TAG:-cb3b06fb21f99c671c8183db5daa77313357b93c}
+    container_name: mk-voice-calendar-bot-codex-runner
+    restart: unless-stopped
+    init: true
+    entrypoint:
+      - /opt/venv/bin/tg-calendar-codex-runner
+    depends_on:
+      warp:
+        condition: service_healthy
+        restart: true
+      gemini-proxy:
+        condition: service_healthy
+        restart: true
+    user: "10001:10001"
+    group_add:
+      - "10002"
+    environment:
+      CODEX_BINARY_PATH: /usr/local/bin/codex
+      CODEX_HOME: /var/lib/codex
+      CODEX_RUNNER_LISTEN_HOST: 127.0.0.1
+      CODEX_RUNNER_LISTEN_PORT: "8091"
+      CODEX_RUNNER_TIMEOUT_SECONDS: "50"
+      CODEX_RUNNER_TOKEN_FILE: /run/secrets/codex-runner-token
+      CODEX_MODEL: gpt-5.6-luna
+      CODEX_REASONING_EFFORT: high
+      HTTPS_PROXY: http://127.0.0.1:1080
+      NO_PROXY: 127.0.0.1,localhost
+      HOME: /tmp
+      TZ: Europe/Moscow
+    volumes:
+      - /srv/mk-voice-calendar-bot/codex-home:/var/lib/codex
+      - /etc/mk-voice-calendar-bot/secrets/codex-runner-token:/run/secrets/codex-runner-token:ro
+      - /etc/mk-voice-calendar-bot/resolv.conf:/etc/resolv.conf:ro
+    network_mode: service:warp
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700,size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/healthz', timeout=3).read()"
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 10s
+    pids_limit: 96
+    mem_limit: 512m
+    cpus: 0.75
     logging:
       driver: json-file
       options:

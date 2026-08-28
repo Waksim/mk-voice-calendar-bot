@@ -23,6 +23,13 @@ from .calendar import (
 from .calendar_mcp import open_calendar_mcp
 from .config import PROJECT_ROOT, Config
 from .confirmation import CalendarConfirmationPipeline, ConfirmationStore
+from .codex_cli import (
+    CodexCliAuthenticationError,
+    CodexCliConfigurationError,
+    CodexCliError,
+    CodexCliQuotaError,
+    CodexCliRunnerApi,
+)
 from .fast_read import plan_fast_calendar_read
 from .gateway import (
     GatewayConnectionError,
@@ -861,6 +868,21 @@ def _planner_timed_out(exc: GeminiError) -> bool:
 
 
 def _planner_failure_copy(exc: GeminiError, *, matching: bool = False) -> str:
+    if isinstance(exc, CodexCliAuthenticationError):
+        return (
+            "Codex отклонил ChatGPT-сессию, а резервные модели тоже не "
+            "ответили. Обновите вход Codex на сервере и повторите команду."
+        )
+    if isinstance(exc, CodexCliConfigurationError):
+        return (
+            "Codex runner отклонил настройки, а резервные модели тоже не "
+            "ответили. Проверьте серверную конфигурацию и повторите команду."
+        )
+    if isinstance(exc, CodexCliQuotaError):
+        return (
+            "Лимит Codex по ChatGPT-подписке исчерпан, а резервные модели "
+            "тоже не ответили. Дождитесь сброса лимита и повторите команду."
+        )
     if isinstance(exc, GigaChatAuthenticationError):
         return (
             "GigaChat отклонил авторизацию, а резервные модели тоже не "
@@ -2749,6 +2771,36 @@ async def async_main() -> None:
         completed_update_limit=config.webhook_completed_ids_limit,
     )
     planner_stages: list[GeminiProviderStage] = []
+    codex_runner_token: str | None = None
+    try:
+        codex_runner_token = read_secret(
+            environment=config.codex_runner_token_environment,
+        )
+        codex_provider = CodexCliRunnerApi(
+            base_url=config.codex_runner_url,
+            bearer_token=codex_runner_token,
+            model=config.codex_model,
+            reasoning_effort=config.codex_reasoning_effort,
+            timeout_seconds=config.codex_timeout_seconds,
+            timezone=config.calendar_timezone,
+        )
+    except (CodexCliError, RuntimeError) as exc:
+        LOGGER.warning(
+            "Codex CLI provider configuration unavailable; "
+            "error_type=%s error=%s; skipping Codex CLI",
+            type(exc).__name__,
+            str(exc),
+        )
+    else:
+        planner_stages.append(
+            GeminiProviderStage(
+                "Codex Luna",
+                codex_provider,
+                config.codex_timeout_seconds,
+            )
+        )
+    finally:
+        codex_runner_token = None
     gigachat_credentials: str | None = None
     try:
         gigachat_credentials = read_secret(

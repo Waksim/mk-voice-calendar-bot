@@ -6,6 +6,11 @@ from tg_voice_transcriber_bot.config import PROJECT_ROOT, Config
 def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     config = Config()
 
+    assert config.codex_runner_url == "http://127.0.0.1:8091"
+    assert config.codex_runner_token_environment == "CODEX_RUNNER_TOKEN"
+    assert config.codex_model == "gpt-5.6-luna"
+    assert config.codex_reasoning_effort == "high"
+    assert config.codex_timeout_seconds == 55
     assert config.gigachat_credentials_environment == "GIGACHAT_CREDENTIALS"
     assert config.gigachat_scope == "GIGACHAT_API_CORP"
     assert config.gigachat_model == "GigaChat-2-Max"
@@ -52,7 +57,7 @@ def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     assert config.vision_ocr_model_dir == (
         PROJECT_ROOT / ".runtime" / "rapidocr-models"
     )
-    assert config.calendar_planner_timeout_seconds == 125
+    assert config.calendar_planner_timeout_seconds == 180
     assert config.gemini_cli_model == "gemini-3.7-flash-high"
     assert config.calendar_mcp_package_version == "2.6.2"
     assert config.calendar_mcp_working_directory == PROJECT_ROOT / "calendar-mcp"
@@ -105,6 +110,10 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("TELEGRAM_WEBHOOK_REGISTER", "false")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_PATH", "/telegram/managed/webhook")
     monkeypatch.setenv("CALENDAR_MCP_PROCESS_PATH", "/usr/local/bin:/usr/bin:/bin")
+    monkeypatch.setenv("CODEX_RUNNER_URL", "http://localhost:18091")
+    monkeypatch.setenv("CODEX_MODEL", "gpt-5.6-luna-test")
+    monkeypatch.setenv("CODEX_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("CODEX_TIMEOUT_SECONDS", "40")
     monkeypatch.setenv("GIGACHAT_SCOPE", "GIGACHAT_API_B2B")
     monkeypatch.setenv("GIGACHAT_MODEL", "GigaChat-test")
     monkeypatch.setenv("GIGACHAT_BASE_URL", "https://giga.example.test/v1")
@@ -134,7 +143,7 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("VISION_MAX_DESCRIPTION_CHARS", "3900")
     monkeypatch.setenv("VISION_MAX_VISIBLE_TEXT_CHARS", "11000")
     monkeypatch.setenv("VISION_OCR_MODEL_DIR", str(tmp_path / "ocr-models"))
-    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "165")
+    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "205")
     monkeypatch.setenv("GEMINI_CLI_MODEL", "gemini-cli-test-model")
 
     config = Config()
@@ -146,6 +155,10 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.webhook_listen_host == "0.0.0.0"
     assert config.webhook_listen_port == 8090
     assert config.calendar_mcp_env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+    assert config.codex_runner_url == "http://localhost:18091"
+    assert config.codex_model == "gpt-5.6-luna-test"
+    assert config.codex_reasoning_effort == "xhigh"
+    assert config.codex_timeout_seconds == 40
     assert config.gigachat_scope == "GIGACHAT_API_B2B"
     assert config.gigachat_model == "GigaChat-test"
     assert config.gigachat_base_url == "https://giga.example.test/v1"
@@ -173,13 +186,19 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.vision_max_description_chars == 3_900
     assert config.vision_max_visible_text_chars == 11_000
     assert config.vision_ocr_model_dir == tmp_path / "ocr-models"
-    assert config.calendar_planner_timeout_seconds == 165
+    assert config.calendar_planner_timeout_seconds == 205
     assert config.gemini_cli_model == "gemini-cli-test-model"
 
 
 @pytest.mark.parametrize(
     "environment,value,error",
     [
+        ("CODEX_RUNNER_URL", "https://runner.example.test", "loopback HTTP"),
+        ("CODEX_RUNNER_URL", "http://localhost:abc", "loopback HTTP"),
+        ("CODEX_RUNNER_URL", "http://localhost:65536", "loopback HTTP"),
+        ("CODEX_MODEL", "", "CODEX_MODEL"),
+        ("CODEX_REASONING_EFFORT", "ultra", "CODEX_REASONING"),
+        ("CODEX_TIMEOUT_SECONDS", "0", "CODEX_TIMEOUT"),
         ("GIGACHAT_SCOPE", "invalid", "GIGACHAT_SCOPE"),
         ("GIGACHAT_MODEL", "", "GIGACHAT_MODEL"),
         ("GIGACHAT_TIMEOUT_SECONDS", "0", "GIGACHAT_TIMEOUT"),
@@ -253,7 +272,7 @@ def test_openrouter_vision_models_must_be_different(monkeypatch):
 
 
 def test_planner_deadline_must_cover_every_provider_stage(monkeypatch):
-    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "119")
+    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "174")
 
     with pytest.raises(ValueError, match="must cover all provider stages"):
         Config()

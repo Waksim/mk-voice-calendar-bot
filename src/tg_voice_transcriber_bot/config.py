@@ -128,6 +128,25 @@ class Config:
     )
     gateway_call_timeout_seconds: int = 30
     transcription_timeout_seconds: int = 180
+    codex_runner_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CODEX_RUNNER_URL", "http://127.0.0.1:8091"
+        ).strip()
+    )
+    codex_runner_token_environment: str = "CODEX_RUNNER_TOKEN"
+    codex_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "CODEX_MODEL", "gpt-5.6-luna"
+        ).strip()
+    )
+    codex_reasoning_effort: str = field(
+        default_factory=lambda: os.environ.get(
+            "CODEX_REASONING_EFFORT", "high"
+        ).strip().lower()
+    )
+    codex_timeout_seconds: int = field(
+        default_factory=lambda: _environment_int("CODEX_TIMEOUT_SECONDS", 55)
+    )
     gigachat_keychain_account: str = "codex.gigachat.mk_voice_calendar_bot"
     gigachat_keychain_service: str = "mk_voice_calendar_bot"
     gigachat_credentials_environment: str = "GIGACHAT_CREDENTIALS"
@@ -274,7 +293,7 @@ class Config:
     )
     calendar_planner_timeout_seconds: int = field(
         default_factory=lambda: _environment_int(
-            "CALENDAR_PLANNER_TIMEOUT_SECONDS", 125
+            "CALENDAR_PLANNER_TIMEOUT_SECONDS", 180
         )
     )
     gemini_cli_path: Path = field(
@@ -371,6 +390,35 @@ class Config:
     )
 
     def __post_init__(self) -> None:
+        try:
+            parsed_codex_url = urlsplit(self.codex_runner_url)
+            codex_hostname = parsed_codex_url.hostname
+            codex_port = parsed_codex_url.port
+        except ValueError:
+            raise ValueError("CODEX_RUNNER_URL must be loopback HTTP") from None
+        if (
+            parsed_codex_url.scheme != "http"
+            or codex_hostname not in {"127.0.0.1", "localhost", "::1"}
+            or (codex_port is not None and not 1 <= codex_port <= 65535)
+            or parsed_codex_url.username is not None
+            or parsed_codex_url.password is not None
+            or parsed_codex_url.query
+            or parsed_codex_url.fragment
+            or parsed_codex_url.path not in {"", "/"}
+        ):
+            raise ValueError("CODEX_RUNNER_URL must be loopback HTTP")
+        if not self.codex_model:
+            raise ValueError("CODEX_MODEL must not be empty")
+        if self.codex_reasoning_effort not in {
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }:
+            raise ValueError("CODEX_REASONING_EFFORT is invalid")
+        if self.codex_timeout_seconds <= 0:
+            raise ValueError("CODEX_TIMEOUT_SECONDS must be positive")
         if self.gigachat_scope not in {
             "GIGACHAT_API_PERS",
             "GIGACHAT_API_B2B",
@@ -490,7 +538,8 @@ class Config:
         if self.calendar_planner_timeout_seconds <= 0:
             raise ValueError("CALENDAR_PLANNER_TIMEOUT_SECONDS must be positive")
         minimum_chain_timeout = (
-            self.gigachat_timeout_seconds
+            self.codex_timeout_seconds
+            + self.gigachat_timeout_seconds
             + self.openrouter_timeout_seconds
             + self.openrouter_fallback_timeout_seconds
             + self.gemini_timeout_seconds

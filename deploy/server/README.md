@@ -13,7 +13,7 @@ an account/token or an unfiltered public endpoint is available.
 
 Runtime state is stored in `/srv/mk-voice-calendar-bot/runtime`. Secret files
 are mounted read-only from `/etc/mk-voice-calendar-bot/secrets`. Required values
-must use mode `0600`:
+normally use mode `0600`:
 
 - `telegram-bot-token`
 - `gigachat-credentials`
@@ -26,6 +26,11 @@ must use mode `0600`:
 - `telegram-personal-user-id`
 - `telegram-work-user-id`
 - `telegram-webhook-secret`
+- `codex-runner-token`
+
+`codex-runner-token` is the one exception: both isolated containers need it, so
+production owns it as `root:10002` with mode `0640`; Compose grants only the bot
+and runner that supplemental group.
 
 The bot reads provider credentials only through
 `GIGACHAT_CREDENTIALS_FILE=/run/secrets/gigachat-credentials`,
@@ -40,17 +45,33 @@ is disabled. Never reuse a production value in a local Telegram MCP/Telethon
 process: Telegram treats one auth key used concurrently from different IPs as
 duplicated and permanently revokes that session.
 
+The subscription-backed Codex session is stored separately at
+`/srv/mk-voice-calendar-bot/codex-home/auth.json` (directory mode `0700`, file
+mode `0600`, owner UID/GID `10001`). It is writable so Codex can refresh its
+credentials, but it is mounted only into `codex-runner`. The runner receives no
+Telegram, Google Calendar, GigaChat, OpenRouter, or Gemini credentials. Its
+`/v1/*` RPC requires `codex-runner-token`, while model, reasoning effort, and
+the two allowed output schemas are fixed inside the runner.
+
+The runner uses the immutable, separately bootstrapped app image tag
+`cb3b06fb21f99c671c8183db5daa77313357b93c`. Normal pushes rebuild and replace
+the bot image but cannot replace the code that sees the password-equivalent
+ChatGPT session. Updating runner code requires a separate trusted-Compose and
+deploy-helper review plus a newly pinned image tag.
+
 Calendar planning uses a strict ordered provider chain:
 
-1. direct GigaChat API `GigaChat-2-Max`, forced function call, stage timeout 45
+1. subscription-backed Codex CLI `gpt-5.6-luna`, reasoning effort `high`, stage
+   timeout 55 seconds;
+2. direct GigaChat API `GigaChat-2-Max`, forced function call, stage timeout 45
    seconds;
-2. OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`, reasoning effort
+3. OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`, reasoning effort
    `medium`, stage timeout 35 seconds;
-3. OpenRouter `z-ai/glm-5.2:free`, reasoning effort `high`, stage timeout 15
+4. OpenRouter `z-ai/glm-5.2:free`, reasoning effort `high`, stage timeout 15
    seconds;
-4. direct Gemini API `gemini-3.7-flash`, stage timeout 25 seconds.
+5. direct Gemini API `gemini-3.7-flash`, stage timeout 25 seconds.
 
-Each planner invocation also has a 125-second overall deadline. A later stage
+Each planner invocation also has a 180-second overall deadline. A later stage
 receives at most the time left under that deadline. GigaChat makes at most one
 bounded retry for `429` and retryable `5xx` responses. The two free OpenRouter
 stages deliberately use no same-model retries: timeout, `408`, `429`, `5xx`, an
@@ -68,7 +89,8 @@ proxy discovery disabled and TLS verified against the bundled official Russian
 Trusted Root CA; the remaining external provider calls keep their existing WARP
 route.
 
-Defaults can be overridden with `GIGACHAT_MODEL`, `GIGACHAT_SCOPE`,
+Defaults can be overridden with `CODEX_RUNNER_URL`, `CODEX_MODEL`,
+`CODEX_REASONING_EFFORT`, `CODEX_TIMEOUT_SECONDS`, `GIGACHAT_MODEL`, `GIGACHAT_SCOPE`,
 `GIGACHAT_BASE_URL`, `GIGACHAT_AUTH_URL`, `GIGACHAT_CA_BUNDLE_FILE`,
 `GIGACHAT_TIMEOUT_SECONDS`, `OPENROUTER_MODEL`,
 `OPENROUTER_REASONING_EFFORT`, `OPENROUTER_TIMEOUT_SECONDS`,

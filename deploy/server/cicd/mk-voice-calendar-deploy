@@ -14,6 +14,7 @@ readonly github_known_hosts=/etc/mk-voice-calendar-bot/github-deploy/known_hosts
 readonly repository_url=git@github.com:Waksim/mk-voice-calendar-bot.git
 readonly compose_project=mk-voice-calendar-bot
 readonly legacy_image_tag=20260822
+readonly codex_runner_image_tag=cb3b06fb21f99c671c8183db5daa77313357b93c
 
 if (( $# != 1 )) || [[ ! "$1" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'Usage: mk-voice-calendar-deploy <40-hex-sha>\n' >&2
@@ -50,6 +51,7 @@ compose_for() {
   (( ${#image_tags[@]} == 3 )) || return 1
   RELEASE_DIR="$release_path" \
     BOT_IMAGE_TAG="${image_tags[0]}" \
+    CODEX_RUNNER_IMAGE_TAG="$codex_runner_image_tag" \
     WARP_IMAGE_TAG="${image_tags[1]}" \
     WEBHOOK_IMAGE_TAG="${image_tags[2]}" \
     /usr/bin/docker compose \
@@ -89,6 +91,7 @@ verify_runtime() {
   local -a image_tags
   local -a containers=(
     mk-voice-calendar-bot
+    mk-voice-calendar-bot-codex-runner
     mk-voice-calendar-bot-warp
     mk-voice-calendar-bot-gemini-proxy
     mk-voice-calendar-bot-webhook-tunnel
@@ -114,6 +117,7 @@ verify_runtime() {
     }
   done <<EOF
 mk-voice-calendar-bot mk-voice-calendar-bot ${image_tags[0]}
+mk-voice-calendar-bot-codex-runner mk-voice-calendar-bot ${codex_runner_image_tag}
 mk-voice-calendar-bot-warp mk-telegram-warp ${image_tags[1]}
 mk-voice-calendar-bot-webhook-tunnel mk-webhook-tunnel ${image_tags[2]}
 EOF
@@ -157,6 +161,10 @@ build_target_images() {
   (( ${#image_tags[@]} == 3 )) || return 1
 
   compose_for "$target_release" build bot
+
+  /usr/bin/docker image inspect \
+    "mk-voice-calendar-bot:$codex_runner_image_tag" >/dev/null 2>&1 \
+    || fail 'the reviewed Codex runner image is missing'
 
   if ! /usr/bin/docker image inspect "mk-telegram-warp:${image_tags[1]}" >/dev/null 2>&1; then
     compose_for "$target_release" build warp
@@ -205,6 +213,7 @@ start_new_release() {
       all_healthy=1
       for container in \
         mk-voice-calendar-bot \
+        mk-voice-calendar-bot-codex-runner \
         mk-voice-calendar-bot-warp \
         mk-voice-calendar-bot-gemini-proxy \
         mk-voice-calendar-bot-webhook-tunnel; do

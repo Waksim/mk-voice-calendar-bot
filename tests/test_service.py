@@ -3,6 +3,11 @@ import asyncio
 import pytest
 
 from tg_voice_transcriber_bot.config import Config
+from tg_voice_transcriber_bot.codex_cli import (
+    CodexCliAuthenticationError,
+    CodexCliConfigurationError,
+    CodexCliQuotaError,
+)
 from tg_voice_transcriber_bot.gemini import (
     GeminiApiError,
     GeminiAuthenticationError,
@@ -61,6 +66,21 @@ def test_quota_error_is_actionable():
     ],
 )
 def test_gigachat_failure_copy_is_actionable_and_sanitized(error, expected):
+    response = _planner_failure_copy(error)
+
+    assert expected in response
+    assert "sensitive" not in response
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (CodexCliAuthenticationError("sensitive"), "ChatGPT-сессию"),
+        (CodexCliConfigurationError("sensitive"), "настройки"),
+        (CodexCliQuotaError("sensitive"), "Лимит Codex"),
+    ],
+)
+def test_codex_failure_copy_is_actionable_and_sanitized(error, expected):
     response = _planner_failure_copy(error)
 
     assert expected in response
