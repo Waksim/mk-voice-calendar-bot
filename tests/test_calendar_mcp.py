@@ -266,6 +266,58 @@ def test_timed_weekday_recurrence_uses_wall_clock_plus_iana_timezone():
     assert created[0].event_id == event_id
 
 
+def test_create_accepts_google_reordered_rrule_components():
+    event = timed_event(
+        recurrence_rrule="RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=7"
+    )
+    event_id = google_event_id("reordered-create", 0)
+    provider_event = stored_event(event_id, event)
+    provider_event["recurrence"] = [
+        "RRULE:FREQ=WEEKLY;COUNT=7;INTERVAL=2"
+    ]
+    provider_event["start"]["timeZone"] = "Europe/Moscow"
+    provider_event["end"]["timeZone"] = "Europe/Moscow"
+    session = FakeSession([result({"event": provider_event})])
+
+    created = asyncio.run(
+        client(session).create_events(
+            account="personal",
+            events=[event],
+            idempotency_key="reordered-create",
+        )
+    )
+
+    assert created[0].event_id == event_id
+    assert [call[0] for call in session.calls] == ["create-event"]
+
+
+def test_create_recovery_accepts_google_reordered_rrule_components():
+    event = timed_event(
+        recurrence_rrule="RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=7"
+    )
+    event_id = google_event_id("reordered-recovery", 0)
+    provider_event = stored_event(event_id, event)
+    provider_event["recurrence"] = [
+        "RRULE:FREQ=WEEKLY;COUNT=7;INTERVAL=2"
+    ]
+    provider_event["start"]["timeZone"] = "Europe/Moscow"
+    provider_event["end"]["timeZone"] = "Europe/Moscow"
+    session = FakeSession(
+        [result(error=True), result({"event": provider_event})]
+    )
+
+    created = asyncio.run(
+        client(session).create_events(
+            account="personal",
+            events=[event],
+            idempotency_key="reordered-recovery",
+        )
+    )
+
+    assert created[0].event_id == event_id
+    assert [call[0] for call in session.calls] == ["create-event", "get-event"]
+
+
 def test_timed_recurrence_recovery_verifies_original_instants():
     event = timed_event(
         start_at="2027-02-01T09:15:00+03:00",
@@ -1373,6 +1425,61 @@ def test_update_event_replaces_series_recurrence_with_explicit_all_scope():
         "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"],
         "modificationScope": "all",
     }
+
+
+def test_update_accepts_google_reordered_rrule_components():
+    before = timed_event(recurrence_rrule="RRULE:FREQ=WEEKLY;COUNT=4")
+    requested_rule = "RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=7"
+    after = timed_event(recurrence_rrule=requested_rule)
+    provider_after = stored_event("event-42", after)
+    provider_after["recurrence"] = [
+        "RRULE:FREQ=WEEKLY;COUNT=7;INTERVAL=2"
+    ]
+    session = FakeSession(
+        [
+            result({"event": stored_event("event-42", before)}),
+            result({"event": provider_after}),
+        ]
+    )
+
+    updated = asyncio.run(
+        client(session).update_event(
+            account="personal",
+            event_id="event-42",
+            patch={"recurrence_rrules": [requested_rule]},
+            idempotency_key="operation-reordered-recurrence",
+        )
+    )
+
+    assert updated.current.recurrence_rrules == (
+        "RRULE:FREQ=WEEKLY;COUNT=7;INTERVAL=2",
+    )
+    assert updated.already_applied is False
+
+
+def test_rrule_comparison_still_rejects_a_different_count():
+    event = timed_event(
+        recurrence_rrule="RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=7"
+    )
+    event_id = google_event_id("different-count", 0)
+    provider_event = stored_event(event_id, event)
+    provider_event["recurrence"] = [
+        "RRULE:FREQ=WEEKLY;COUNT=8;INTERVAL=2"
+    ]
+    provider_event["start"]["timeZone"] = "Europe/Moscow"
+    provider_event["end"]["timeZone"] = "Europe/Moscow"
+    session = FakeSession(
+        [result(error=True), result({"event": provider_event})]
+    )
+
+    with pytest.raises(CalendarMcpCollisionError):
+        asyncio.run(
+            client(session).create_events(
+                account="personal",
+                events=[event],
+                idempotency_key="different-count",
+            )
+        )
 
 
 def test_update_event_clears_series_recurrence_with_an_empty_array():

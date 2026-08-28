@@ -943,7 +943,7 @@ def test_planner_uses_compact_prompt_and_exact_same_command_history():
     assert payload["model"] == "gemini-3.7-flash"
     assert payload["store"] is False
     assert payload["system_instruction"] == CALENDAR_PLANNER_SYSTEM_INSTRUCTION
-    assert len(payload["system_instruction"].encode("utf-8")) < 7_500
+    assert len(payload["system_instruction"].encode("utf-8")) < 8_000
     assert "`display_index`" in payload["system_instruction"]
     assert "Не сортируй кандидатов" in payload["system_instruction"]
     assert "короткие непрозрачные" in payload["system_instruction"]
@@ -958,6 +958,9 @@ def test_planner_uses_compact_prompt_and_exact_same_command_history():
     assert "`series`" in payload["system_instruction"]
     assert "`occurrence`" in payload["system_instruction"]
     assert "выбирай его по умолчанию" in payload["system_instruction"]
+    assert "DTSTART обязан быть" in payload["system_instruction"]
+    assert "FREQ=DAILY;INTERVAL=2" in payload["system_instruction"]
+    assert "COUNT/UNTIL, а не INTERVAL" in payload["system_instruction"]
     assert payload["generation_config"] == {"thinking_level": "high"}
     assert payload["response_format"] == {
         "type": "text",

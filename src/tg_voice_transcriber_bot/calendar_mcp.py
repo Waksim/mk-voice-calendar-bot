@@ -923,10 +923,19 @@ def _snapshot_matches_patch(
                 return False
         elif actual != expected:
             return False
-    if "recurrence_rrules" in patch and snapshot.recurrence_rrules != tuple(
-        patch["recurrence_rrules"]
-    ):
-        return False
+    if "recurrence_rrules" in patch:
+        expected_recurrence = _canonical_recurrence_rules(
+            patch["recurrence_rrules"]
+        )
+        actual_recurrence = _canonical_recurrence_rules(
+            snapshot.recurrence_rrules
+        )
+        if (
+            expected_recurrence is None
+            or actual_recurrence is None
+            or actual_recurrence != expected_recurrence
+        ):
+            return False
     if "start_at" in patch:
         expected_start = patch["start_at"]
         expected_end = patch["end_at"]
@@ -955,6 +964,53 @@ def _snapshot_matches_patch(
             ):
                 return False
     return True
+
+
+def _canonical_recurrence_rules(value: Any) -> tuple[str, ...] | None:
+    """Canonicalize provider RRULE ordering without weakening comparison.
+
+    Google may return an equivalent RRULE with its ``KEY=VALUE`` components in
+    a different order.  Recurrence lines and RRULE components are unordered for
+    equality purposes, while every key and value must still match exactly.
+    Invalid or duplicate RRULE components remain a mismatch.
+    """
+
+    if value in (None, [], ()):
+        return ()
+    if not isinstance(value, Sequence) or isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return None
+
+    normalized: list[str] = []
+    for rule in value:
+        if not isinstance(rule, str) or not rule:
+            return None
+        if not rule.startswith("RRULE:"):
+            normalized.append(rule)
+            continue
+        components = rule[len("RRULE:") :].split(";")
+        parsed: list[tuple[str, str]] = []
+        seen_keys: set[str] = set()
+        for component in components:
+            key, separator, component_value = component.partition("=")
+            if (
+                separator != "="
+                or not key
+                or not component_value
+                or key in seen_keys
+            ):
+                return None
+            seen_keys.add(key)
+            parsed.append((key, component_value))
+        normalized.append(
+            "RRULE:"
+            + ";".join(
+                f"{key}={component_value}"
+                for key, component_value in sorted(parsed)
+            )
+        )
+    return tuple(sorted(normalized))
 
 
 def _snapshot_matches_precondition(
@@ -1736,10 +1792,17 @@ class GoogleCalendarMcpClient:
             return False
         if not _optional_text_matches(event.get("location"), arguments.get("location")):
             return False
-        actual_recurrence = event.get("recurrence")
-        if actual_recurrence in (None, []):
-            actual_recurrence = None
-        if actual_recurrence != arguments.get("recurrence"):
+        actual_recurrence = _canonical_recurrence_rules(
+            event.get("recurrence")
+        )
+        expected_recurrence = _canonical_recurrence_rules(
+            arguments.get("recurrence")
+        )
+        if (
+            actual_recurrence is None
+            or expected_recurrence is None
+            or actual_recurrence != expected_recurrence
+        ):
             return False
         if actual_recurrence and not all_day:
             expected_timezone = requested_event.get("timezone")
