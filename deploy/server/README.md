@@ -101,7 +101,7 @@ performs read-only capability checks for every configured stage. A permanently
 rejected earlier stage is disabled for that process; a stage that only timed
 out or hit a transient provider limit remains eligible and is retried first on
 the next command. Startup fails if no planner stage validates. Webhook mode also
-fails closed if the direct Gemini terminal stage fails credential/model checks;
+fails closed if the required direct Gemini stage fails credential/model checks;
 a transient Gemini validation failure remains eligible for the next request.
 
 Screenshot handling uses an independent observation-only chain before the

@@ -114,8 +114,6 @@ OpenRouter для `:free`-моделей не требуется, однако A
 
 - Codex: `CODEX_MODEL=gpt-5.6-luna`,
   `CODEX_REASONING_EFFORT=high`, `CODEX_TIMEOUT_SECONDS=55`;
-- GigaChat: `GIGACHAT_MODEL=GigaChat-2-Max`,
-  `GIGACHAT_SCOPE=GIGACHAT_API_CORP`, `GIGACHAT_TIMEOUT_SECONDS=45`;
 - Nemotron: `OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free`,
   `OPENROUTER_REASONING_EFFORT=medium`,
   `OPENROUTER_TIMEOUT_SECONDS=35`;
@@ -124,6 +122,8 @@ OpenRouter для `:free`-моделей не требуется, однако A
   `OPENROUTER_FALLBACK_TIMEOUT_SECONDS=15`;
 - Gemini: `GEMINI_MODEL=gemini-3.7-flash`,
   `GEMINI_TIMEOUT_SECONDS=25`;
+- GigaChat: `GIGACHAT_MODEL=GigaChat-2-Max`,
+  `GIGACHAT_SCOPE=GIGACHAT_API_CORP`, `GIGACHAT_TIMEOUT_SECONDS=45`;
 - общий предел одного planner-вызова:
   `CALENDAR_PLANNER_TIMEOUT_SECONDS=180`.
 
