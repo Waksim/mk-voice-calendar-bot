@@ -103,11 +103,12 @@ from .webhook import WebhookRuntime
 LOGGER = logging.getLogger("tg_voice_transcriber_bot")
 _PLANNER_STAGE_PRIORITIES = {
     "Codex Sol": 0,
-    "Nemotron 3 Super": 1,
-    "GLM 5.2 Free": 2,
-    "Gemini 3.7 Flash": 3,
-    "Gemini CLI": 3,
-    "GigaChat 2 Max": 4,
+    "Codex Luna": 1,
+    "Nemotron 3 Super": 2,
+    "GLM 5.2 Free": 3,
+    "Gemini 3.7 Flash": 4,
+    "Gemini CLI": 4,
+    "GigaChat 2 Max": 5,
 }
 
 START_TEXT = (
@@ -2754,6 +2755,58 @@ class VoiceBotService:
             self.state.save_job(update_id, job)
 
 
+def _build_codex_planner_stages(
+    config: Config,
+    bearer_token: str,
+) -> list[GeminiProviderStage]:
+    stages: list[GeminiProviderStage] = []
+    stage_settings = (
+        (
+            "Codex Sol",
+            config.codex_runner_url,
+            config.codex_model,
+            config.codex_reasoning_effort,
+            config.codex_timeout_seconds,
+        ),
+        (
+            "Codex Luna",
+            config.codex_fallback_runner_url,
+            config.codex_fallback_model,
+            config.codex_fallback_reasoning_effort,
+            config.codex_fallback_timeout_seconds,
+        ),
+    )
+    for stage_name, runner_url, model, reasoning_effort, timeout_seconds in (
+        stage_settings
+    ):
+        try:
+            provider = CodexCliRunnerApi(
+                base_url=runner_url,
+                bearer_token=bearer_token,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                timeout_seconds=timeout_seconds,
+                timezone=config.calendar_timezone,
+            )
+        except CodexCliError as exc:
+            LOGGER.warning(
+                "%s provider configuration unavailable; "
+                "error_type=%s error=%s; skipping stage",
+                stage_name,
+                type(exc).__name__,
+                str(exc),
+            )
+        else:
+            stages.append(
+                GeminiProviderStage(
+                    stage_name,
+                    provider,
+                    timeout_seconds,
+                )
+            )
+    return stages
+
+
 async def async_main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -2784,28 +2837,16 @@ async def async_main() -> None:
         codex_runner_token = read_secret(
             environment=config.codex_runner_token_environment,
         )
-        codex_provider = CodexCliRunnerApi(
-            base_url=config.codex_runner_url,
-            bearer_token=codex_runner_token,
-            model=config.codex_model,
-            reasoning_effort=config.codex_reasoning_effort,
-            timeout_seconds=config.codex_timeout_seconds,
-            timezone=config.calendar_timezone,
-        )
-    except (CodexCliError, RuntimeError) as exc:
+    except RuntimeError as exc:
         LOGGER.warning(
-            "Codex CLI provider configuration unavailable; "
-            "error_type=%s error=%s; skipping Codex CLI",
+            "Codex CLI runner token unavailable; "
+            "error_type=%s error=%s; skipping Codex CLI providers",
             type(exc).__name__,
             str(exc),
         )
     else:
-        planner_stages.append(
-            GeminiProviderStage(
-                "Codex Sol",
-                codex_provider,
-                config.codex_timeout_seconds,
-            )
+        planner_stages.extend(
+            _build_codex_planner_stages(config, codex_runner_token)
         )
     finally:
         codex_runner_token = None

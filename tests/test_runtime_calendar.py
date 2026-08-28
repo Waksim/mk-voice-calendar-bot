@@ -7,6 +7,49 @@ import tg_voice_transcriber_bot.service as service_module
 from tg_voice_transcriber_bot.config import Config
 
 
+@pytest.mark.parametrize(
+    "failed_model,expected_stage,expected_model",
+    (
+        ("gpt-5.6-sol", "Codex Luna", "gpt-5.6-luna"),
+        ("gpt-5.6-luna", "Codex Sol", "gpt-5.6-sol"),
+    ),
+)
+def test_codex_stage_configuration_failures_are_independent(
+    monkeypatch, failed_model, expected_stage, expected_model
+):
+    attempts = []
+    closed = []
+
+    class PartiallyRejectedCodexRunnerApi:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            attempts.append(self.model)
+            if self.model == failed_model:
+                raise service_module.CodexCliConfigurationError(
+                    "runner rejected test configuration"
+                )
+
+        async def aclose(self):
+            closed.append(self.model)
+
+    monkeypatch.setattr(
+        service_module,
+        "CodexCliRunnerApi",
+        PartiallyRejectedCodexRunnerApi,
+    )
+
+    stages = service_module._build_codex_planner_stages(
+        Config(),
+        "codex-runner-token-with-at-least-32-characters",
+    )
+
+    assert attempts == ["gpt-5.6-sol", "gpt-5.6-luna"]
+    assert [stage.name for stage in stages] == [expected_stage]
+    assert stages[0].provider.model == expected_model
+    asyncio.run(stages[0].provider.aclose())
+    assert closed == [expected_model]
+
+
 def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch):
     gateway_root = tmp_path / "gateway-cache"
     launcher = gateway_root / "1" / "scripts" / "telegram-gateway"
@@ -32,9 +75,10 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         gigachat_ca_bundle_file=tmp_path / "giga-root.pem",
         gigachat_timeout_seconds=45,
         codex_timeout_seconds=55,
+        codex_fallback_timeout_seconds=70,
         gemini_model="gemini-3.7-flash",
         gemini_timeout_seconds=25,
-        calendar_planner_timeout_seconds=180,
+        calendar_planner_timeout_seconds=250,
         calendar_mcp_working_directory=calendar_root,
         calendar_mcp_binary_path=binary,
         calendar_mcp_oauth_credentials_path=tmp_path / "oauth.json",
@@ -79,7 +123,7 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         def __init__(self, **kwargs):
             self.model = kwargs["model"]
             self.kwargs = kwargs
-            captured["codex_client"] = self
+            captured.setdefault("codex_clients", []).append(self)
 
         async def aclose(self):
             sequence.append(f"provider_close:{self.model}")
@@ -230,9 +274,10 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
     }
     planner = captured["planner"]
     assert isinstance(planner, service_module.GeminiProviderChain)
-    assert planner.timeout_seconds == 180
-    codex_client = captured["codex_client"]
-    assert codex_client.kwargs == {
+    assert planner.timeout_seconds == 250
+    codex_clients = captured["codex_clients"]
+    assert len(codex_clients) == 2
+    assert codex_clients[0].kwargs == {
         "base_url": "http://127.0.0.1:8091",
         "bearer_token": "codex-runner-token-with-at-least-32-characters",
         "model": "gpt-5.6-sol",
@@ -240,8 +285,17 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         "timeout_seconds": 55,
         "timezone": "Europe/Moscow",
     }
+    assert codex_clients[1].kwargs == {
+        "base_url": "http://127.0.0.1:8092",
+        "bearer_token": "codex-runner-token-with-at-least-32-characters",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "xhigh",
+        "timeout_seconds": 70,
+        "timezone": "Europe/Moscow",
+    }
     assert [stage.name for stage in planner.stages] == [
         "Codex Sol",
+        "Codex Luna",
         "Nemotron 3 Super",
         "GLM 5.2 Free",
         "Gemini 3.7 Flash",
@@ -249,13 +303,15 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
     ]
     assert [stage.timeout_seconds for stage in planner.stages] == [
         55,
+        70,
         35,
         15,
         25,
         45,
     ]
     assert [stage.provider for stage in planner.stages] == [
-        codex_client,
+        codex_clients[0],
+        codex_clients[1],
         openrouter_clients[0],
         openrouter_clients[1],
         gemini_client,
@@ -275,6 +331,7 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         "gateway_close",
         "bot_close",
         "provider_close:gpt-5.6-sol",
+        "provider_close:gpt-5.6-luna",
         "provider_close:nvidia/nemotron-3-super-120b-a12b:free",
         "provider_close:z-ai/glm-5.2:free",
         "provider_close:gemini-3.7-flash",
@@ -421,13 +478,14 @@ def test_webhook_listener_registration_ownership(
     assert planners[0].timeout_seconds == config.calendar_planner_timeout_seconds
     assert [stage.name for stage in planners[0].stages] == [
         "Codex Sol",
+        "Codex Luna",
         "Gemini 3.7 Flash",
     ]
     assert isinstance(
         planners[0].stages[0].provider, FakeCodexRunnerApi
     )
     assert (
-        planners[0].stages[1].timeout_seconds
+        planners[0].stages[2].timeout_seconds
         == config.gemini_timeout_seconds
     )
     assert len(gigachat_constructor_attempts) == int(register_with_telegram)

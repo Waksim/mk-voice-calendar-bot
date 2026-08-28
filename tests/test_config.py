@@ -11,6 +11,10 @@ def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     assert config.codex_model == "gpt-5.6-sol"
     assert config.codex_reasoning_effort == "medium"
     assert config.codex_timeout_seconds == 55
+    assert config.codex_fallback_runner_url == "http://127.0.0.1:8092"
+    assert config.codex_fallback_model == "gpt-5.6-luna"
+    assert config.codex_fallback_reasoning_effort == "xhigh"
+    assert config.codex_fallback_timeout_seconds == 70
     assert config.gigachat_credentials_environment == "GIGACHAT_CREDENTIALS"
     assert config.gigachat_scope == "GIGACHAT_API_CORP"
     assert config.gigachat_model == "GigaChat-2-Max"
@@ -57,7 +61,7 @@ def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
     assert config.vision_ocr_model_dir == (
         PROJECT_ROOT / ".runtime" / "rapidocr-models"
     )
-    assert config.calendar_planner_timeout_seconds == 180
+    assert config.calendar_planner_timeout_seconds == 250
     assert config.gemini_cli_model == "gemini-3.7-flash-high"
     assert config.calendar_mcp_package_version == "2.6.2"
     assert config.calendar_mcp_working_directory == PROJECT_ROOT / "calendar-mcp"
@@ -114,6 +118,10 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("CODEX_MODEL", "gpt-5.6-luna-test")
     monkeypatch.setenv("CODEX_REASONING_EFFORT", "xhigh")
     monkeypatch.setenv("CODEX_TIMEOUT_SECONDS", "40")
+    monkeypatch.setenv("CODEX_FALLBACK_RUNNER_URL", "http://localhost:18092")
+    monkeypatch.setenv("CODEX_FALLBACK_MODEL", "gpt-5.6-sol-test")
+    monkeypatch.setenv("CODEX_FALLBACK_REASONING_EFFORT", "high")
+    monkeypatch.setenv("CODEX_FALLBACK_TIMEOUT_SECONDS", "45")
     monkeypatch.setenv("GIGACHAT_SCOPE", "GIGACHAT_API_B2B")
     monkeypatch.setenv("GIGACHAT_MODEL", "GigaChat-test")
     monkeypatch.setenv("GIGACHAT_BASE_URL", "https://giga.example.test/v1")
@@ -143,7 +151,7 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     monkeypatch.setenv("VISION_MAX_DESCRIPTION_CHARS", "3900")
     monkeypatch.setenv("VISION_MAX_VISIBLE_TEXT_CHARS", "11000")
     monkeypatch.setenv("VISION_OCR_MODEL_DIR", str(tmp_path / "ocr-models"))
-    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "205")
+    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "250")
     monkeypatch.setenv("GEMINI_CLI_MODEL", "gemini-cli-test-model")
 
     config = Config()
@@ -159,6 +167,10 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.codex_model == "gpt-5.6-luna-test"
     assert config.codex_reasoning_effort == "xhigh"
     assert config.codex_timeout_seconds == 40
+    assert config.codex_fallback_runner_url == "http://localhost:18092"
+    assert config.codex_fallback_model == "gpt-5.6-sol-test"
+    assert config.codex_fallback_reasoning_effort == "high"
+    assert config.codex_fallback_timeout_seconds == 45
     assert config.gigachat_scope == "GIGACHAT_API_B2B"
     assert config.gigachat_model == "GigaChat-test"
     assert config.gigachat_base_url == "https://giga.example.test/v1"
@@ -186,7 +198,7 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
     assert config.vision_max_description_chars == 3_900
     assert config.vision_max_visible_text_chars == 11_000
     assert config.vision_ocr_model_dir == tmp_path / "ocr-models"
-    assert config.calendar_planner_timeout_seconds == 205
+    assert config.calendar_planner_timeout_seconds == 250
     assert config.gemini_cli_model == "gemini-cli-test-model"
 
 
@@ -199,6 +211,18 @@ def test_environment_overrides_gateway_webhook_and_linux_paths(tmp_path, monkeyp
         ("CODEX_MODEL", "", "CODEX_MODEL"),
         ("CODEX_REASONING_EFFORT", "ultra", "CODEX_REASONING"),
         ("CODEX_TIMEOUT_SECONDS", "0", "CODEX_TIMEOUT"),
+        (
+            "CODEX_FALLBACK_RUNNER_URL",
+            "https://runner.example.test",
+            "loopback HTTP",
+        ),
+        ("CODEX_FALLBACK_MODEL", "", "CODEX_FALLBACK_MODEL"),
+        (
+            "CODEX_FALLBACK_REASONING_EFFORT",
+            "ultra",
+            "CODEX_FALLBACK_REASONING",
+        ),
+        ("CODEX_FALLBACK_TIMEOUT_SECONDS", "0", "CODEX_FALLBACK_TIMEOUT"),
         ("GIGACHAT_SCOPE", "invalid", "GIGACHAT_SCOPE"),
         ("GIGACHAT_MODEL", "", "GIGACHAT_MODEL"),
         ("GIGACHAT_TIMEOUT_SECONDS", "0", "GIGACHAT_TIMEOUT"),
@@ -263,6 +287,22 @@ def test_primary_and_fallback_models_must_be_different(monkeypatch):
         Config()
 
 
+def test_codex_primary_and_fallback_models_must_be_different(monkeypatch):
+    monkeypatch.setenv("CODEX_MODEL", "gpt-5.6-same")
+    monkeypatch.setenv("CODEX_FALLBACK_MODEL", "gpt-5.6-same")
+
+    with pytest.raises(ValueError, match="Codex primary and fallback models"):
+        Config()
+
+
+def test_codex_primary_and_fallback_runners_need_distinct_ports(monkeypatch):
+    monkeypatch.setenv("CODEX_RUNNER_URL", "http://127.0.0.1:8091")
+    monkeypatch.setenv("CODEX_FALLBACK_RUNNER_URL", "http://localhost:8091")
+
+    with pytest.raises(ValueError, match="Codex primary and fallback runners"):
+        Config()
+
+
 def test_openrouter_vision_models_must_be_different(monkeypatch):
     monkeypatch.setenv("OPENROUTER_VISION_MODEL", "example/same:free")
     monkeypatch.setenv("OPENROUTER_VISION_FALLBACK_MODEL", "example/same:free")
@@ -272,7 +312,7 @@ def test_openrouter_vision_models_must_be_different(monkeypatch):
 
 
 def test_planner_deadline_must_cover_every_provider_stage(monkeypatch):
-    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "174")
+    monkeypatch.setenv("CALENDAR_PLANNER_TIMEOUT_SECONDS", "244")
 
     with pytest.raises(ValueError, match="must cover all provider stages"):
         Config()

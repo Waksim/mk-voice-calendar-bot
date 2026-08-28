@@ -92,6 +92,7 @@ verify_runtime() {
   local -a containers=(
     mk-voice-calendar-bot
     mk-voice-calendar-bot-codex-runner
+    mk-voice-calendar-bot-codex-runner-luna
     mk-voice-calendar-bot-warp
     mk-voice-calendar-bot-gemini-proxy
     mk-voice-calendar-bot-webhook-tunnel
@@ -118,9 +119,48 @@ verify_runtime() {
   done <<EOF
 mk-voice-calendar-bot mk-voice-calendar-bot ${image_tags[0]}
 mk-voice-calendar-bot-codex-runner mk-voice-calendar-bot ${codex_runner_image_tag}
+mk-voice-calendar-bot-codex-runner-luna mk-voice-calendar-bot ${codex_runner_image_tag}
 mk-voice-calendar-bot-warp mk-telegram-warp ${image_tags[1]}
 mk-voice-calendar-bot-webhook-tunnel mk-webhook-tunnel ${image_tags[2]}
 EOF
+
+  /usr/bin/docker exec mk-voice-calendar-bot /opt/venv/bin/python -c '
+import sys
+import httpx
+
+try:
+    token = open(
+        "/run/secrets/codex-runner-token", encoding="utf-8"
+    ).read().strip()
+    if not token:
+        raise RuntimeError("empty runner token")
+    expected = (
+        ("http://127.0.0.1:8091", "gpt-5.6-sol", "medium", 60),
+        ("http://127.0.0.1:8092", "gpt-5.6-luna", "xhigh", 75),
+    )
+    verified = []
+    for base_url, model, reasoning_effort, timeout in expected:
+        response = httpx.post(
+            base_url + "/v1/validate",
+            headers={"Authorization": "Bearer " + token},
+            json={},
+            timeout=timeout,
+        )
+        payload = response.json()
+        valid = (
+            response.status_code == 200
+            and payload.get("status") == "ok"
+            and payload.get("model") == model
+            and payload.get("reasoning_effort") == reasoning_effort
+        )
+        if not valid:
+            raise RuntimeError("runner settings or authentication mismatch")
+        verified.append(model + " · " + reasoning_effort)
+except Exception:
+    sys.exit("Codex runner validation failed")
+
+print("Codex runners are ready:", " -> ".join(verified))
+'
 
   /usr/bin/docker exec mk-voice-calendar-bot /opt/venv/bin/python -c '
 import sys
@@ -184,7 +224,7 @@ rollback_to() {
 
   log "rolling back containers to $(basename -- "$previous_release")"
   if ! compose_for "$previous_release" \
-    up -d --no-build --remove-orphans --wait --wait-timeout 300; then
+    up -d --no-build --remove-orphans --wait --wait-timeout 420; then
     printf 'ROLLBACK FAILED while restoring %s.\n' "$previous_release" >&2
     return 1
   fi
@@ -200,7 +240,7 @@ start_new_release() {
 
   for attempt in 1 2; do
     if compose_for "$target_release" \
-      up -d --no-build --remove-orphans --wait --wait-timeout 300; then
+      up -d --no-build --remove-orphans --wait --wait-timeout 420; then
       return 0
     fi
 
@@ -214,6 +254,7 @@ start_new_release() {
       for container in \
         mk-voice-calendar-bot \
         mk-voice-calendar-bot-codex-runner \
+        mk-voice-calendar-bot-codex-runner-luna \
         mk-voice-calendar-bot-warp \
         mk-voice-calendar-bot-gemini-proxy \
         mk-voice-calendar-bot-webhook-tunnel; do

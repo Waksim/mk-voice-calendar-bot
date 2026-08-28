@@ -322,6 +322,21 @@ def test_model_badge_is_escaped_and_precedes_timing_in_every_result_card():
         assert utf16_units(ui._visible_text(card)) <= 4096
 
 
+@pytest.mark.parametrize(
+    "model_name",
+    ("gpt-5.6-sol · medium", "gpt-5.6-luna · xhigh"),
+)
+def test_model_badge_shows_codex_reasoning_compactly(model_name):
+    card = format_create_card(
+        [event()],
+        transcript="Создай встречу",
+        elapsed_seconds=1,
+        model_name=model_name,
+    )
+
+    assert f"🤖 <code>{model_name}</code>" in card
+
+
 def test_empty_model_name_does_not_render_a_model_badge():
     card = format_create_card(
         [event()],

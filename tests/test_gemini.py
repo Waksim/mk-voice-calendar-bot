@@ -2028,6 +2028,7 @@ def test_provider_chain_labels_calendar_plan_with_actual_fallback_model():
 
     class WorkingFallback:
         model = "z-ai/glm-5.2:free"
+        reasoning_effort = "high"
 
         async def plan_calendar_actions(self, transcript, **kwargs):
             calls.append(self.model)
@@ -2073,6 +2074,98 @@ def test_provider_chain_labels_calendar_plan_with_actual_fallback_model():
         "nvidia/nemotron-3-super-120b-a12b:free",
         "z-ai/glm-5.2:free",
     ]
+
+
+def test_provider_chain_uses_opt_in_codex_model_label_after_fallback():
+    calls = []
+
+    class FailedSol:
+        model = "gpt-5.6-sol"
+        planner_model_label = "gpt-5.6-sol · medium"
+
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append(self.model)
+            raise GeminiError("Sol failed")
+
+    class WorkingLuna:
+        model = "gpt-5.6-luna"
+        planner_model_label = "gpt-5.6-luna · xhigh"
+
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append(self.model)
+            return CALENDAR_OPERATION_RESULT
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage("Codex Sol", FailedSol(), 0.1),
+                GeminiProviderStage("Codex Luna", WorkingLuna(), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        return await chain.plan_calendar_actions(
+            "Добавь место",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+            application_state={
+                "allowed_event_ids": [],
+                "candidate_events": [],
+            },
+            recent_conversation=[],
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result[PLANNER_MODEL_FIELD] == "gpt-5.6-luna · xhigh"
+    assert calls == ["gpt-5.6-sol", "gpt-5.6-luna"]
+
+
+def test_provider_chain_uses_opt_in_codex_model_label_on_primary():
+    calls = []
+
+    class WorkingSol:
+        model = "gpt-5.6-sol"
+        planner_model_label = "gpt-5.6-sol · medium"
+
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append(self.model)
+            return CALENDAR_OPERATION_RESULT
+
+    class UnexpectedLuna:
+        model = "gpt-5.6-luna"
+        planner_model_label = "gpt-5.6-luna · xhigh"
+
+        async def plan_calendar_actions(self, transcript, **kwargs):
+            calls.append(self.model)
+            raise AssertionError("Luna must not run after Sol succeeds")
+
+    async def scenario():
+        chain = GeminiProviderChain(
+            [
+                GeminiProviderStage("Codex Sol", WorkingSol(), 0.1),
+                GeminiProviderStage("Codex Luna", UnexpectedLuna(), 0.1),
+            ],
+            timeout_seconds=0.5,
+        )
+        return await chain.plan_calendar_actions(
+            "Добавь место",
+            reference_time=datetime(
+                2026, 8, 22, 15, 0, tzinfo=ZoneInfo("Europe/Moscow")
+            ),
+            account="personal",
+            application_state={
+                "allowed_event_ids": [],
+                "candidate_events": [],
+            },
+            recent_conversation=[],
+        )
+
+    result = asyncio.run(scenario())
+
+    assert result[PLANNER_MODEL_FIELD] == "gpt-5.6-sol · medium"
+    assert calls == ["gpt-5.6-sol"]
 
 
 def test_provider_chain_validation_succeeds_when_any_provider_is_available():

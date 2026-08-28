@@ -76,6 +76,25 @@ def _provider(client: httpx.AsyncClient) -> CodexCliRunnerApi:
     )
 
 
+def test_codex_planner_model_label_includes_reasoning_effort():
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(500))
+    )
+    provider = CodexCliRunnerApi(
+        base_url="http://127.0.0.1:8091",
+        bearer_token=RUNNER_TOKEN,
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        timeout_seconds=55,
+        timezone="Europe/Moscow",
+        client=client,
+    )
+
+    assert provider.planner_model_label == "gpt-5.6-sol · medium"
+
+    asyncio.run(client.aclose())
+
+
 @pytest.mark.parametrize(
     "url",
     ("http://localhost:abc", "http://localhost:65536", "http://[::1"),

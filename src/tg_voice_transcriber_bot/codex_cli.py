@@ -174,6 +174,10 @@ class CodexCliRunnerApi:
         )
         self._authorization_header = f"Bearer {bearer_token}"
 
+    @property
+    def planner_model_label(self) -> str:
+        return f"{self.model} · {self.reasoning_effort}"
+
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()

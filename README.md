@@ -7,7 +7,8 @@ Bot API. Голосовое
 расшифровывается вызовом Telegram MTProto `messages.transcribeAudio`; файл не
 скачивается, распознавание выполняется на серверах Telegram. Текст сразу
 переходит к планированию без Telegram user session. Planner вызывает провайдеров
-в фиксированном порядке: subscription-backed Codex CLI `gpt-5.6-sol`,
+в фиксированном порядке: subscription-backed Codex CLI `gpt-5.6-sol`, затем
+subscription-backed Codex CLI `gpt-5.6-luna`,
 бесплатный `nvidia/nemotron-3-super-120b-a12b:free` через OpenRouter,
 бесплатный `z-ai/glm-5.2:free` через OpenRouter, direct Gemini API и последним
 direct API `GigaChat-2-Max` с принудительным вызовом функции и строгой схемой
@@ -20,13 +21,14 @@ direct API `GigaChat-2-Max` с принудительным вызовом фу�
 основные календарные поля, но может не вернуть гостей, цвет, конференцию или
 нестандартные напоминания.
 
-Codex получает не более 55 секунд. GigaChat получает не более 45 секунд и
+Codex Sol получает не более 55 секунд, Codex Luna XHigh — 70 секунд. GigaChat
+получает не более 45 секунд и
 делает не более одного ограниченного
 повтора при `429`/`5xx`. У OpenRouter-ступеней нет внутренних повторов: тайм-аут,
 `408`, `429`, `5xx`, отказ маршрута или ответ вне схемы сразу передают тот же
 запрос следующей модели. Nemotron получает не более 35 секунд, GLM — 15 секунд,
 прямой Gemini — 25 секунд; весь один вызов planner дополнительно ограничен общим
-дедлайном 180 секунд, поэтому поздняя ступень получает только оставшееся время.
+дедлайном 250 секунд, поэтому поздняя ступень получает только оставшееся время.
 Ошибки авторизации и лимитов показываются как недоступность провайдера, а не как
 ошибка разбора календарной команды.
 
@@ -81,13 +83,16 @@ provider reject подтверждается чтением детерминир
 `personal` и `work` оба направляются в авторизованный MCP-аккаунт `owner` и
 календарь `primary`.
 
-Первый текстовый planner — Codex CLI с авторизацией ChatGPT-подписки и моделью
-`gpt-5.6-sol`. CLI работает в отдельном read-only sidecar без Telegram,
-Google Calendar и provider-секретов. Бот передаёт ему по защищённому локальному
-RPC только готовый prompt одного из двух фиксированных типов; модель, reasoning
-effort и JSON Schema задаются самим runner. Запуск сериализован, не использует
+Первые два текстовых planner — Codex CLI с общей авторизацией ChatGPT-подписки:
+`gpt-5.6-sol · medium`, затем `gpt-5.6-luna · xhigh`. Каждый CLI работает в
+своём read-only sidecar без Telegram, Google Calendar и provider-секретов. Бот
+передаёт им по защищённому локальному RPC только готовый prompt одного из двух
+фиксированных типов; модель, reasoning effort и JSON Schema задаются внутри
+соответствующего runner. Вызовы сериализованы, не используют
 постоянные треды, правила репозитория или инструменты. Сессия лежит вне Git и
-образа в отдельном writable `CODEX_HOME`. Детали официального входа и
+образов в общем writable `CODEX_HOME`. При текущем последовательном worker оба
+runner не запускают Codex одновременно; при будущем распараллеливании этому
+каталогу понадобится межпроцессная блокировка. Детали официального входа и
 non-interactive режима: [Codex authentication](https://developers.openai.com/codex/auth)
 и [Codex non-interactive mode](https://developers.openai.com/codex/noninteractive).
 
@@ -103,8 +108,8 @@ access token не сохраняются. Формат интеграции сл
 Резервные OpenRouter-модели используют бесплатные `:free`-маршруты. Бесплатность
 не означает гарантированную доступность: OpenRouter может применять низкие
 rate limits, возвращать `429`, временно не иметь подходящего upstream-провайдера
-или изменить доступность модели. Gemini API остаётся независимой четвёртой
-ступенью, а GigaChat — пятой; для полноценной production-цепочки нужны Codex ChatGPT-сессия и
+или изменить доступность модели. Gemini API остаётся независимой пятой
+ступенью, а GigaChat — шестой; для полноценной production-цепочки нужны Codex ChatGPT-сессия и
 секреты `CODEX_RUNNER_TOKEN`, `GIGACHAT_CREDENTIALS`, `OPENROUTER_API_KEY` и
 `GEMINI_API_KEY`. Положительный платный баланс
 OpenRouter для `:free`-моделей не требуется, однако API-ключ должен быть
@@ -114,6 +119,9 @@ OpenRouter для `:free`-моделей не требуется, однако A
 
 - Codex: `CODEX_MODEL=gpt-5.6-sol`,
   `CODEX_REASONING_EFFORT=medium`, `CODEX_TIMEOUT_SECONDS=55`;
+- Codex fallback: `CODEX_FALLBACK_MODEL=gpt-5.6-luna`,
+  `CODEX_FALLBACK_REASONING_EFFORT=xhigh`,
+  `CODEX_FALLBACK_TIMEOUT_SECONDS=70`;
 - Nemotron: `OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free`,
   `OPENROUTER_REASONING_EFFORT=medium`,
   `OPENROUTER_TIMEOUT_SECONDS=35`;
@@ -125,7 +133,7 @@ OpenRouter для `:free`-моделей не требуется, однако A
 - GigaChat: `GIGACHAT_MODEL=GigaChat-2-Max`,
   `GIGACHAT_SCOPE=GIGACHAT_API_CORP`, `GIGACHAT_TIMEOUT_SECONDS=45`;
 - общий предел одного planner-вызова:
-  `CALENDAR_PLANNER_TIMEOUT_SECONDS=180`.
+  `CALENDAR_PLANNER_TIMEOUT_SECONDS=250`.
 
 Для обеих OpenRouter-ступеней общий потолок ответа задаётся
 `OPENROUTER_MAX_TOKENS` (по умолчанию 8192). Stage timeout ограничивает один
@@ -139,7 +147,7 @@ OpenRouter для `:free`-моделей не требуется, однако A
 текста. Эти два поля передаются в уже существующий planner как недоверенное
 содержимое изображения вместе с подписью пользователя, если она есть. Решение о
 CRUD, датах, времени и намерении пользователя по-прежнему принимает текстовая
-цепочка Codex Sol → Nemotron → GLM → Gemini → GigaChat 2 Max.
+цепочка Codex Sol → Codex Luna → Nemotron → GLM → Gemini → GigaChat 2 Max.
 
 Vision-провайдеры вызываются по одному, без общего дедлайна между ступенями:
 
