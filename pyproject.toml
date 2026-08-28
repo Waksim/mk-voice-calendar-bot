@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 tg-voice-transcriber-bot = "tg_voice_transcriber_bot.service:main"
+tg-calendar-codex-runner = "tg_voice_transcriber_bot.codex_runner:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

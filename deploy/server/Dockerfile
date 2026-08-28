@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
+        bubblewrap \
         ca-certificates \
         libgl1 \
         libglib2.0-0 \
@@ -19,6 +20,12 @@ RUN apt-get update \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
 
 WORKDIR /app
+
+# Pin the Linux Codex CLI used by the isolated subscription-backed planner.
+# Authentication is injected only at runtime through a dedicated writable
+# CODEX_HOME volume; it is never copied into an image layer.
+RUN npm install --global --omit=dev --no-audit --no-fund @openai/codex@0.150.1 \
+    && codex --version
 
 COPY deploy/server/calendar-mcp/package.json deploy/server/calendar-mcp/package-lock.json /app/calendar-mcp/
 RUN cd /app/calendar-mcp && npm ci --omit=dev --no-audit --no-fund
@@ -64,7 +71,11 @@ RUN /opt/venv/bin/pip install --no-cache-dir --no-deps /app
 COPY deploy/server/telegram_gateway.py deploy/server/telegram-gateway /app/deploy/server/
 RUN chmod 0555 /app/deploy/server/telegram-gateway \
     && mkdir -p /app/.runtime /tmp/telegram-gateway-files \
-    && chown -R 1000:1000 /app/.runtime /tmp/telegram-gateway-files
+    && chown -R 1000:1000 /app/.runtime /tmp/telegram-gateway-files \
+    && groupadd --gid 10002 codex-rpc \
+    && groupadd --gid 10001 codex-runner \
+    && useradd --uid 10001 --gid 10001 --home-dir /var/lib/codex-runner \
+        --no-create-home --shell /usr/sbin/nologin codex-runner
 
 USER 1000:1000
 EXPOSE 8080
