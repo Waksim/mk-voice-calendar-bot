@@ -61,7 +61,7 @@ deploy-helper review plus a newly pinned image tag.
 
 Calendar planning uses a strict ordered provider chain:
 
-1. subscription-backed Codex CLI `gpt-5.6-luna`, reasoning effort `high`, stage
+1. subscription-backed Codex CLI `gpt-5.6-sol`, reasoning effort `medium`, stage
    timeout 55 seconds;
 2. OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`, reasoning effort
    `medium`, stage timeout 35 seconds;

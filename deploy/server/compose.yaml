@@ -36,8 +36,8 @@ services:
       GIGACHAT_TIMEOUT_SECONDS: "45"
       CODEX_RUNNER_URL: http://127.0.0.1:8091
       CODEX_RUNNER_TOKEN_FILE: /run/secrets/codex-runner-token
-      CODEX_MODEL: gpt-5.6-luna
-      CODEX_REASONING_EFFORT: high
+      CODEX_MODEL: gpt-5.6-sol
+      CODEX_REASONING_EFFORT: medium
       CODEX_TIMEOUT_SECONDS: "55"
       CALENDAR_PLANNER_TIMEOUT_SECONDS: "180"
       TELEGRAM_BOT_STATE_PATH: /app/.runtime/state.json
@@ -134,8 +134,8 @@ services:
       CODEX_RUNNER_LISTEN_PORT: "8091"
       CODEX_RUNNER_TIMEOUT_SECONDS: "50"
       CODEX_RUNNER_TOKEN_FILE: /run/secrets/codex-runner-token
-      CODEX_MODEL: gpt-5.6-luna
-      CODEX_REASONING_EFFORT: high
+      CODEX_MODEL: gpt-5.6-sol
+      CODEX_REASONING_EFFORT: medium
       HTTPS_PROXY: http://127.0.0.1:1080
       NO_PROXY: 127.0.0.1,localhost
       HOME: /tmp

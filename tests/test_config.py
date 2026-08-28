@@ -8,8 +8,8 @@ def test_calendar_mcp_runtime_paths_environment_and_mapping_are_exact():
 
     assert config.codex_runner_url == "http://127.0.0.1:8091"
     assert config.codex_runner_token_environment == "CODEX_RUNNER_TOKEN"
-    assert config.codex_model == "gpt-5.6-luna"
-    assert config.codex_reasoning_effort == "high"
+    assert config.codex_model == "gpt-5.6-sol"
+    assert config.codex_reasoning_effort == "medium"
     assert config.codex_timeout_seconds == 55
     assert config.gigachat_credentials_environment == "GIGACHAT_CREDENTIALS"
     assert config.gigachat_scope == "GIGACHAT_API_CORP"

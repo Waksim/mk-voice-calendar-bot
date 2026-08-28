@@ -7,7 +7,7 @@ Bot API. Голосовое
 расшифровывается вызовом Telegram MTProto `messages.transcribeAudio`; файл не
 скачивается, распознавание выполняется на серверах Telegram. Текст сразу
 переходит к планированию без Telegram user session. Planner вызывает провайдеров
-в фиксированном порядке: subscription-backed Codex CLI `gpt-5.6-luna`,
+в фиксированном порядке: subscription-backed Codex CLI `gpt-5.6-sol`,
 бесплатный `nvidia/nemotron-3-super-120b-a12b:free` через OpenRouter,
 бесплатный `z-ai/glm-5.2:free` через OpenRouter, direct Gemini API и последним
 direct API `GigaChat-2-Max` с принудительным вызовом функции и строгой схемой
@@ -82,7 +82,7 @@ provider reject подтверждается чтением детерминир
 календарь `primary`.
 
 Первый текстовый planner — Codex CLI с авторизацией ChatGPT-подписки и моделью
-`gpt-5.6-luna`. CLI работает в отдельном read-only sidecar без Telegram,
+`gpt-5.6-sol`. CLI работает в отдельном read-only sidecar без Telegram,
 Google Calendar и provider-секретов. Бот передаёт ему по защищённому локальному
 RPC только готовый prompt одного из двух фиксированных типов; модель, reasoning
 effort и JSON Schema задаются самим runner. Запуск сериализован, не использует
@@ -112,8 +112,8 @@ OpenRouter для `:free`-моделей не требуется, однако A
 
 Параметры цепочки по умолчанию:
 
-- Codex: `CODEX_MODEL=gpt-5.6-luna`,
-  `CODEX_REASONING_EFFORT=high`, `CODEX_TIMEOUT_SECONDS=55`;
+- Codex: `CODEX_MODEL=gpt-5.6-sol`,
+  `CODEX_REASONING_EFFORT=medium`, `CODEX_TIMEOUT_SECONDS=55`;
 - Nemotron: `OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free`,
   `OPENROUTER_REASONING_EFFORT=medium`,
   `OPENROUTER_TIMEOUT_SECONDS=35`;
@@ -139,7 +139,7 @@ OpenRouter для `:free`-моделей не требуется, однако A
 текста. Эти два поля передаются в уже существующий planner как недоверенное
 содержимое изображения вместе с подписью пользователя, если она есть. Решение о
 CRUD, датах, времени и намерении пользователя по-прежнему принимает текстовая
-цепочка Codex Luna → Nemotron → GLM → Gemini → GigaChat 2 Max.
+цепочка Codex Sol → Nemotron → GLM → Gemini → GigaChat 2 Max.
 
 Vision-провайдеры вызываются по одному, без общего дедлайна между ступенями:
 

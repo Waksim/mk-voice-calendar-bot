@@ -585,8 +585,8 @@ def main() -> None:
     codex_home = Path(os.environ.get("CODEX_HOME", "/var/lib/codex"))
     timeout_seconds = _environment_int("CODEX_RUNNER_TIMEOUT_SECONDS", 50)
     bearer_token = _read_runner_token()
-    model = os.environ.get("CODEX_MODEL", "gpt-5.6-luna").strip()
-    reasoning_effort = os.environ.get("CODEX_REASONING_EFFORT", "high").strip().lower()
+    model = os.environ.get("CODEX_MODEL", "gpt-5.6-sol").strip()
+    reasoning_effort = os.environ.get("CODEX_REASONING_EFFORT", "medium").strip().lower()
     port = _environment_int("CODEX_RUNNER_LISTEN_PORT", 8091)
     if port > 65535:
         raise RuntimeError("CODEX_RUNNER_LISTEN_PORT is invalid")

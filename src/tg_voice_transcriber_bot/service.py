@@ -102,7 +102,7 @@ from .webhook import WebhookRuntime
 
 LOGGER = logging.getLogger("tg_voice_transcriber_bot")
 _PLANNER_STAGE_PRIORITIES = {
-    "Codex Luna": 0,
+    "Codex Sol": 0,
     "Nemotron 3 Super": 1,
     "GLM 5.2 Free": 2,
     "Gemini 3.7 Flash": 3,
@@ -2802,7 +2802,7 @@ async def async_main() -> None:
     else:
         planner_stages.append(
             GeminiProviderStage(
-                "Codex Luna",
+                "Codex Sol",
                 codex_provider,
                 config.codex_timeout_seconds,
             )

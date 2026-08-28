@@ -235,13 +235,13 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
     assert codex_client.kwargs == {
         "base_url": "http://127.0.0.1:8091",
         "bearer_token": "codex-runner-token-with-at-least-32-characters",
-        "model": "gpt-5.6-luna",
-        "reasoning_effort": "high",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "medium",
         "timeout_seconds": 55,
         "timezone": "Europe/Moscow",
     }
     assert [stage.name for stage in planner.stages] == [
-        "Codex Luna",
+        "Codex Sol",
         "Nemotron 3 Super",
         "GLM 5.2 Free",
         "Gemini 3.7 Flash",
@@ -274,7 +274,7 @@ def test_async_main_opens_validates_and_wires_calendar_mcp(tmp_path, monkeypatch
         "calendar_close",
         "gateway_close",
         "bot_close",
-        "provider_close:gpt-5.6-luna",
+        "provider_close:gpt-5.6-sol",
         "provider_close:nvidia/nemotron-3-super-120b-a12b:free",
         "provider_close:z-ai/glm-5.2:free",
         "provider_close:gemini-3.7-flash",
@@ -420,7 +420,7 @@ def test_webhook_listener_registration_ownership(
     assert isinstance(planners[0], service_module.GeminiProviderChain)
     assert planners[0].timeout_seconds == config.calendar_planner_timeout_seconds
     assert [stage.name for stage in planners[0].stages] == [
-        "Codex Luna",
+        "Codex Sol",
         "Gemini 3.7 Flash",
     ]
     assert isinstance(

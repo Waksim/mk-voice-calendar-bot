@@ -136,12 +136,12 @@ class Config:
     codex_runner_token_environment: str = "CODEX_RUNNER_TOKEN"
     codex_model: str = field(
         default_factory=lambda: os.environ.get(
-            "CODEX_MODEL", "gpt-5.6-luna"
+            "CODEX_MODEL", "gpt-5.6-sol"
         ).strip()
     )
     codex_reasoning_effort: str = field(
         default_factory=lambda: os.environ.get(
-            "CODEX_REASONING_EFFORT", "high"
+            "CODEX_REASONING_EFFORT", "medium"
         ).strip().lower()
     )
     codex_timeout_seconds: int = field(
